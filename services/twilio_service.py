@@ -7,8 +7,14 @@ from twilio.twiml.voice_response import VoiceResponse, Connect
 
 class TwilioService:
     """
-    Service class for handling all Twilio-specific operations.
-    Follows SRP by being responsible only for Twilio integration logic.
+    Provides all Twilio integration logic for the application.
+    
+    - Generates TwiML responses for incoming calls, connecting callers to the media stream.
+    - Creates Twilio-compatible messages (media, mark, clear) for the WebSocket Media Streams API.
+    - Converts audio data formats between OpenAI and Twilio.
+    - Extracts and interprets Twilio event payloads.
+    
+    This class is the main entry point for all Twilio-related operations and is used by higher-level services to interact with Twilio Voice and Media Streams.
     """
     
     # Twilio voice configuration
@@ -183,8 +189,12 @@ class TwilioService:
 
 class TwilioAudioProcessor:
     """
-    Specialized class for handling Twilio audio processing operations.
-    Follows SRP by being responsible only for audio format conversions and processing.
+    Handles audio data preparation and conversion for Twilio and OpenAI.
+    
+    - Prepares Twilio audio payloads for OpenAI's Realtime API.
+    - Converts OpenAI audio deltas into Twilio-compatible media messages.
+    
+    This class is typically used internally by the TwilioService or audio pipeline to ensure audio data is in the correct format for each service.
     """
     
     @staticmethod

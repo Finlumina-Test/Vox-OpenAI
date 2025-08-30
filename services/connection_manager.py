@@ -10,9 +10,12 @@ from config import Config
 
 class ConnectionState:
     """
-    Manages the state of WebSocket connections.
-    Follows SRP by being responsible only for connection state management.
-    Note: Audio-related state is now managed by AudioService.
+    Tracks the current Twilio stream session and manages connection state.
+    
+    - Holds the current stream SID for the active Twilio media stream session.
+    - Provides methods to reset or clear state when a new stream starts or an interruption occurs.
+    
+    Audio-related state is now managed by AudioService, so this class focuses only on connection/session state.
     """
     
     def __init__(self):
@@ -31,8 +34,13 @@ class ConnectionState:
 
 class WebSocketConnectionManager:
     """
-    Manages WebSocket connections between Twilio and OpenAI.
-    Follows SRP by being responsible only for connection management and message routing.
+    Orchestrates all WebSocket communication between Twilio and OpenAI for the application.
+    
+    - Establishes, maintains, and closes WebSocket connections to both Twilio (FastAPI) and OpenAI (websockets).
+    - Routes incoming messages to appropriate event handlers for media, start, mark, audio delta, and speech events.
+    - Sends and receives messages, manages connection state, and coordinates with AudioService for mark/clear events.
+    
+    This is the main interface for real-time, bidirectional communication and event-driven processing between the two services.
     """
     
     def __init__(self, twilio_ws: WebSocket):

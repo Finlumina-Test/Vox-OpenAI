@@ -7,8 +7,8 @@ from config import Config
 @dataclass
 class AudioMetadata:
     """
-    Data class for audio metadata and timing information.
-    Follows SRP by being responsible only for audio metadata structure.
+    Represents metadata for a single audio chunk, including timing, item, and stream information.
+    Used to track and annotate audio data as it flows through the processing pipeline.
     """
     timestamp: Optional[int] = None
     item_id: Optional[str] = None
@@ -19,8 +19,8 @@ class AudioMetadata:
 
 class AudioFormatConverter:
     """
-    Handles audio format conversions between different services.
-    Follows SRP by being responsible only for audio format transformations.
+    Converts audio payloads between Twilio and OpenAI formats.
+    Ensures compatibility and provides a single place to update format logic if requirements change.
     """
     
     # Audio format constants
@@ -76,8 +76,8 @@ class AudioFormatConverter:
 
 class AudioTimingManager:
     """
-    Manages audio timing, synchronization, and interruption calculations.
-    Follows SRP by being responsible only for audio timing operations.
+    Tracks and manages audio timing for responses and interruptions.
+    Responsible for calculating durations, tracking the start of responses, and supporting precise interruption logic.
     """
     
     def __init__(self):
@@ -143,8 +143,8 @@ class AudioTimingManager:
 
 class AudioBufferManager:
     """
-    Manages audio buffering, queuing, and mark synchronization.
-    Follows SRP by being responsible only for audio buffer operations.
+    Handles buffering of audio chunks and synchronization marks.
+    Maintains queues for both audio data and marks, supporting smooth streaming and interruption handling.
     """
     
     def __init__(self):
@@ -202,8 +202,9 @@ class AudioBufferManager:
 
 class AudioService:
     """
-    Main service class for all audio processing operations.
-    Follows SRP by being responsible only for audio service coordination.
+    Coordinates all audio processing operations for the application.
+    Uses the format converter, timing manager, and buffer manager to process incoming and outgoing audio,
+    manage synchronization, and handle interruptions between Twilio and OpenAI.
     """
     
     def __init__(self):

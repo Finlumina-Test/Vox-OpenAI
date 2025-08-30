@@ -5,8 +5,12 @@ from config import Config
 
 class OpenAIEventHandler:
     """
-    Handles OpenAI-specific event processing and logging.
-    Follows SRP by being responsible only for OpenAI event interpretation.
+    Interprets and processes events received from the OpenAI Realtime API.
+    
+    - Determines which events should be logged.
+    - Identifies and extracts audio deltas, speech start events, and item IDs from event payloads.
+    
+    Used by higher-level services to make sense of incoming OpenAI events and route them appropriately.
     """
     
     @staticmethod
@@ -40,8 +44,12 @@ class OpenAIEventHandler:
 
 class OpenAISessionManager:
     """
-    Manages OpenAI session configuration and initialization.
-    Follows SRP by being responsible only for OpenAI session management.
+    Configures and initializes OpenAI Realtime API sessions.
+    
+    - Generates session update messages specifying model, audio formats, and system instructions.
+    - Creates the initial conversation item (for AI-first greetings) and triggers responses.
+    
+    Ensures consistent and correct session setup for all OpenAI interactions.
     """
     
     @staticmethod
@@ -106,8 +114,13 @@ class OpenAISessionManager:
 
 class OpenAIConversationManager:
     """
-    Manages OpenAI conversation operations and interruptions.
-    Follows SRP by being responsible only for conversation flow control.
+    Manages conversation flow and interruption logic for OpenAI sessions.
+    
+    - Creates truncation events to interrupt/cut off ongoing AI responses.
+    - Determines when interruptions should be processed based on marks and timing.
+    - Calculates elapsed time for precise truncation.
+    
+    Used by the main service to support real-time, interactive voice experiences.
     """
     
     @staticmethod
@@ -170,8 +183,12 @@ class OpenAIConversationManager:
 
 class OpenAIService:
     """
-    Main service class for OpenAI Realtime API operations.
-    Follows SRP by being responsible only for OpenAI service integration.
+    Main service layer for all OpenAI Realtime API operations in the application.
+    
+    - Composes the event handler, session manager, and conversation manager.
+    - Provides high-level methods to initialize sessions, send greetings, process/log events, extract audio, and handle interruptions.
+    
+    This is the primary interface for the rest of the application to interact with OpenAI, abstracting away lower-level event and session management details.
     """
     
     def __init__(self):
