@@ -14,6 +14,7 @@ A production-ready, cleanly-architected voice assistant that connects a Twilio p
 - Interruption handling (user can interrupt the AI mid-response)
 - Modular, testable services with clear boundaries
 - Simple local setup and Twilio webhook wiring
+- Graceful call termination: model triggers an end_call tool → assistant plays a short farewell → call hangs up automatically
 
 ## Project Structure
 
@@ -91,12 +92,19 @@ Call your number and start talking to the assistant.
 
 Configuration is centralized in `config.py` and loaded from environment variables.
 
-| Variable          | Description                                  | Default |
-|-------------------|----------------------------------------------|---------|
-| OPENAI_API_KEY    | OpenAI API key                                | —       |
-| PORT              | HTTP server port                              | 5050    |
-| TEMPERATURE       | Model temperature (0–1)                       | 0.8     |
-| SHOW_TIMING_MATH  | Verbose timing logs for interruption math     | false   |
+| Variable                    | Description                                         | Default |
+|-----------------------------|-----------------------------------------------------|---------|
+| OPENAI_API_KEY              | OpenAI API key                                      | —       |
+| PORT                        | HTTP server port                                    | 5050    |
+| TEMPERATURE                 | Model temperature (0–1)                             | 0.8     |
+| SHOW_TIMING_MATH            | Verbose timing logs for interruption math           | false   |
+| COMPANY_NAME                | Brand used in prompts                               | Acme Realty |
+| VOICE                       | OpenAI voice id (e.g., alloy)                       | alloy   |
+| END_CALL_GRACE_SECONDS      | Pause after farewell before hangup (seconds)        | 3       |
+| END_CALL_WATCHDOG_SECONDS   | Timeout if farewell audio doesn’t start (seconds)   | 4       |
+| REALTIME_SESSION_RENEW_SECONDS | Preemptive session renewal cadence (seconds)     | 3300    |
+| TWILIO_ACCOUNT_SID          | Optional: enable REST hangup                        | —       |
+| TWILIO_AUTH_TOKEN           | Optional: enable REST hangup                        | —       |
 
 `config.py` builds the OpenAI Realtime WS URL and headers dynamically using these values.
 
@@ -107,6 +115,14 @@ Configuration is centralized in `config.py` and loaded from environment variable
 - `AudioService` converts/labels audio, tracks timestamps, buffers, and manages “marks”.
 - `OpenAIService` initializes the session, processes events, and handles truncation when the caller speaks.
 - The system streams audio in both directions with minimal latency.
+- When the model calls the `end_call` tool, the app queues a brief farewell via `response.create`, ignores user interruptions during the goodbye, then ends the call using Twilio REST (if credentials are set) or by closing the Twilio media stream WebSocket.
+
+### Call hangup behavior
+
+- Trigger: the model issues a function call `end_call` when the user says goodbye or requests to end.
+- Farewell: the app sends a `response.create` with `response.instructions` to have the assistant speak one short goodbye.
+- Finalize: after a short grace period, the call ends via Twilio REST or, if not configured, by closing the Twilio WS stream.
+- Watchdog: if farewell audio doesn’t begin within `END_CALL_WATCHDOG_SECONDS`, the app finalizes anyway to avoid stalling.
 
 ## Customization Tips
 
@@ -119,6 +135,7 @@ Configuration is centralized in `config.py` and loaded from environment variable
 - WebSocket errors: verify `OPENAI_API_KEY`, network egress, and that Realtime API access is enabled for your key.
 - No audio: ensure your Twilio number is configured to call the correct tunnel URL and that the tunnel is active.
 - Interruption isn’t working: set `SHOW_TIMING_MATH=true` and watch server logs to confirm timestamps/marks.
+- Realtime schema errors (e.g., `unknown_parameter`): the app uses `{"type":"response.create","response":{"instructions":"..."}}` and sets modalities in the session. If you change session config, align payloads with the latest Realtime docs.
 
 ## License
 
