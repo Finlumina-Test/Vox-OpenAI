@@ -19,17 +19,21 @@ A production-ready, cleanly-architected voice assistant that connects a Twilio p
 ## Project Structure
 
 ```
-├── main.py                    # Application entrypoint (FastAPI + orchestration)
-├── config.py                  # Centralized configuration (env-driven)
-├── services/                  # SRP-aligned service modules
-│   ├── __init__.py            # Package exports
-│   ├── audio_service.py       # Audio conversion, timing, buffering, marks
-│   ├── twilio_service.py      # TwiML + Twilio payload helpers
-│   ├── openai_service.py      # Session + events + conversation control
-│   └── connection_manager.py  # WebSocket plumbing (Twilio ⇄ OpenAI)
-├── requirements.txt           # Dependencies
-├── .env.example               # Environment variables template
-└── README.md                  # This file
+├── main.py                      # Application entrypoint (FastAPI + orchestration)
+├── config.py                    # Centralized configuration (env/env vars)
+├── services/                    # SRP-aligned service modules
+│   ├── __init__.py              # Package exports
+│   ├── audio_service.py         # Audio conversion, timing, buffering, marks
+│   ├── connection_manager.py    # WebSocket plumbing (Twilio ⇄ OpenAI)
+│   ├── log_utils.py             # Structured logging helpers
+│   ├── openai_service.py        # Session + events + conversation control
+│   └── twilio_service.py        # TwiML + Twilio payload helpers
+├── requirements.txt             # Python dependencies
+├── .env.example                 # Environment variables template
+├── CODE_OF_CONDUCT.md           # Contribution/code of conduct
+├── LICENSE                      # MIT license
+├── Promptingrealtimemodels.md   # Realtime prompting notes
+└── README.md                    # This file
 ```
 
 ## Prerequisites
