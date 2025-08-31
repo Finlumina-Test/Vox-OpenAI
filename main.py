@@ -16,6 +16,7 @@ from services import (
     OpenAIService,
     AudioService
 )
+from services.log_utils import Log
 
 app = FastAPI()
 
@@ -31,7 +32,7 @@ async def handle_incoming_call(request: Request):
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
     """Handle WebSocket connections between Twilio and OpenAI."""
-    print("Client connected")
+    Log.header("Client connected")
     await websocket.accept()
 
     # Create connection manager and services
@@ -54,7 +55,7 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def handle_stream_start(stream_sid: str) -> None:
             """Handle stream start event."""
-            print(f"Incoming stream has started {stream_sid}")
+            Log.event("Twilio stream started", {"streamSid": stream_sid})
 
         async def handle_mark_event() -> None:
             """Handle mark event from Twilio."""
@@ -64,6 +65,9 @@ async def handle_media_stream(websocket: WebSocket):
             """Handle audio delta from OpenAI."""
             audio_data = openai_service.extract_audio_response_data(response)
             if audio_data and connection_manager.state.stream_sid:
+                # If we're in a goodbye flow, mark that farewell audio has started and capture its item_id
+                if openai_service.is_goodbye_pending():
+                    openai_service.mark_goodbye_audio_heard(audio_data.get('item_id'))
                 audio_message = audio_service.process_outgoing_audio(
                     response, 
                     connection_manager.state.stream_sid
@@ -77,24 +81,58 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def handle_speech_started() -> None:
             """Handle speech started event (interruption)."""
-            print("Speech started detected.")
+            Log.info("Speech started detected.")
+            # Do not interrupt the assistant's final goodbye
+            if openai_service.is_goodbye_pending():
+                Log.info("Ignoring interruption during goodbye flow")
+                return
             current_item_id = audio_service.get_current_item_id()
             if current_item_id:
-                print(f"Interrupting response with id: {current_item_id}")
+                Log.info(f"Interrupting response with id: {current_item_id}")
                 await handle_speech_started_event(connection_manager, openai_service, audio_service)
 
         async def handle_other_openai_event(response: dict) -> None:
             """Handle other OpenAI events."""
+            # Log events
             openai_service.process_event_for_logging(response)
+            # Handle tool calls (e.g., end_call)
+            if openai_service.is_tool_call(response):
+                tool_call = openai_service.accumulate_tool_call(response)
+                if tool_call:
+                    handled = await openai_service.maybe_handle_tool_call(connection_manager, tool_call)
+                    if handled:
+                        return
+            # If a goodbye was queued and we've heard its audio, finalize after the response completes
+            if openai_service.should_finalize_on_event(response):
+                await openai_service.finalize_goodbye(connection_manager)
 
-        # Run both connection handlers concurrently
+        # Run Twilio receiver and OpenAI receiver; plus a renewal loop for OpenAI session
+        async def openai_receiver():
+            await connection_manager.receive_from_openai(
+                handle_audio_delta, handle_speech_started, handle_other_openai_event
+            )
+
+        async def renew_openai_session():
+            # Preemptively reconnect before the 60-minute cap to avoid session_expired drops
+            while True:
+                await asyncio.sleep(Config.REALTIME_SESSION_RENEW_SECONDS)
+                try:
+                    print("Preemptive OpenAI session renewal starting…")
+                    await connection_manager.close_openai_connection()
+                    await connection_manager.connect_to_openai()
+                    await openai_service.initialize_session(connection_manager)
+                    print("OpenAI session renewed.")
+                except Exception as e:
+                    print(f"OpenAI session renewal failed: {e}")
+
         await asyncio.gather(
             connection_manager.receive_from_twilio(handle_media_event, handle_stream_start, handle_mark_event),
-            connection_manager.receive_from_openai(handle_audio_delta, handle_speech_started, handle_other_openai_event)
+            openai_receiver(),
+            renew_openai_session(),
         )
 
     except Exception as e:
-        print(f"Error in media stream handler: {e}")
+        Log.error(f"Error in media stream handler: {e}")
     finally:
         await connection_manager.close_openai_connection()
 
@@ -105,7 +143,7 @@ async def handle_speech_started_event(
     audio_service: AudioService
 ):
     """Handle interruption when the caller's speech starts."""
-    print("Handling speech started event.")
+    Log.subheader("Handling speech started event")
     
     if audio_service.should_handle_interruption():
         elapsed_time = audio_service.calculate_interruption_timing()

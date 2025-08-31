@@ -6,6 +6,7 @@ from fastapi import WebSocket
 from fastapi.websockets import WebSocketDisconnect
 
 from config import Config
+from services.log_utils import Log
 
 
 class ConnectionState:
@@ -20,6 +21,7 @@ class ConnectionState:
     
     def __init__(self):
         self.stream_sid: Optional[str] = None
+        self.call_sid: Optional[str] = None
     
     def reset_stream_state(self) -> None:
         """Reset state when a new stream starts."""
@@ -57,9 +59,11 @@ class WebSocketConnectionManager:
                 additional_headers=Config.get_openai_headers()
             )
             self._is_connected = True
-            print("Connected to OpenAI WebSocket API")
+            Log.event("OpenAI WebSocket Connected", {
+                "url": Config.get_openai_websocket_url()
+            })
         except Exception as e:
-            print(f"Failed to connect to OpenAI: {e}")
+            Log.error(f"Failed to connect to OpenAI: {e}")
             raise
     
     async def close_openai_connection(self) -> None:
@@ -67,7 +71,7 @@ class WebSocketConnectionManager:
         if self.openai_ws and self._is_connected:
             await self.openai_ws.close()
             self._is_connected = False
-            print("Closed OpenAI WebSocket connection")
+            Log.info("Closed OpenAI WebSocket connection")
     
     async def send_to_openai(self, message: dict) -> None:
         """Send a message to OpenAI WebSocket."""
@@ -101,15 +105,29 @@ class WebSocketConnectionManager:
                 if data['event'] == 'media':
                     await on_media(data)
                 elif data['event'] == 'start':
-                    stream_sid = data['start']['streamSid']
+                    start_info = data.get('start', {})
+                    stream_sid = start_info.get('streamSid')
+                    call_sid = start_info.get('callSid') or start_info.get('call_id')
                     self.state.stream_sid = stream_sid
+                    self.state.call_sid = call_sid
+                    # Log the callSid if available, otherwise log the incoming start payload for debugging
+                    if call_sid:
+                        Log.event("Twilio Start", {
+                            "streamSid": stream_sid,
+                            "callSid": call_sid
+                        })
+                    else:
+                        try:
+                            Log.event("Twilio Start (no callSid)", start_info)
+                        except Exception:
+                            Log.error("Twilio start payload (no callSid) and failed to serialize start_info.")
                     self.state.reset_stream_state()
                     await on_start(stream_sid)
                 elif data['event'] == 'mark':
                     await on_mark()
                     
         except WebSocketDisconnect:
-            print("Twilio WebSocket disconnected")
+            Log.info("Twilio WebSocket disconnected")
             await self.close_openai_connection()
             raise
     
@@ -145,7 +163,7 @@ class WebSocketConnectionManager:
                     await on_other_event(response)
                     
         except Exception as e:
-            print(f"Error receiving from OpenAI: {e}")
+            Log.error(f"Error receiving from OpenAI: {e}")
             raise
     
     async def send_mark_to_twilio(self) -> None:
@@ -171,3 +189,14 @@ class WebSocketConnectionManager:
         return (self.openai_ws is not None and 
                 self._is_connected and 
                 self.openai_ws.state.name == 'OPEN')
+
+    async def close_twilio_connection(self, code: int = 1000, reason: str | None = None) -> None:
+        """Close the Twilio WebSocket connection gracefully.
+        This ends the <Connect><Stream> on Twilio's side; with no more TwiML verbs,
+        Twilio will conclude the call. Useful when REST hangup is not configured.
+        """
+        try:
+            await self.twilio_ws.close(code=code, reason=reason or "normal closure")
+            Log.info("Closed Twilio WebSocket connection")
+        except Exception as e:
+            Log.error(f"Failed to close Twilio WebSocket: {e}")
