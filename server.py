@@ -260,22 +260,6 @@ async def handle_speech_started_event(
             clear_message = audio_service.create_clear_message(connection_manager.state.stream_sid)
             await connection_manager.send_to_twilio(clear_message)
             audio_service.reset_interruption_state()
-from fastapi.responses import StreamingResponse
-import asyncio
-import json
-
-@app.get("/dashboard-stream")
-async def dashboard_stream():
-    async def event_stream():
-        example_data = [
-            {"speaker": "User", "text": "Hello?", "timestamp": "12:00:01"},
-            {"speaker": "AI", "text": "Hi! How can I help you today?", "timestamp": "12:00:02"},
-        ]
-        for item in example_data:
-            yield f"data: {json.dumps(item)}\n\n"
-            await asyncio.sleep(2)
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
