@@ -2,6 +2,7 @@ import json
 import base64
 import asyncio
 import websockets
+from typing import Set
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
@@ -20,14 +21,31 @@ from services.log_utils import Log
 
 app = FastAPI()
 
+# Store all connected dashboard clients
+dashboard_clients: Set[WebSocket] = set()
+
+@app.websocket("/dashboard-stream")
+async def dashboard_stream(websocket: WebSocket):
+    """WebSocket endpoint for the dashboard to receive live transcript updates."""
+    await websocket.accept()
+    dashboard_clients.add(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # Keep alive
+    except WebSocketDisconnect:
+        dashboard_clients.remove(websocket)
+
+
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
+
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     return TwilioService.create_incoming_call_response(request)
+
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
@@ -53,6 +71,19 @@ async def handle_media_stream(websocket: WebSocket):
                 if audio_message:
                     await connection_manager.send_to_openai(audio_message)
 
+            # --- Optional: Broadcast caller transcript if speech-to-text added later ---
+            if "text" in data:
+                payload = json.dumps({
+                    "speaker": "User",
+                    "text": data["text"]
+                })
+                for client in list(dashboard_clients):
+                    try:
+                        await client.send_text(payload)
+                    except Exception:
+                        dashboard_clients.remove(client)
+            # ---------------------------------------------------------------------------
+
         async def handle_stream_start(stream_sid: str) -> None:
             """Handle stream start event."""
             Log.event("Twilio stream started", {"streamSid": stream_sid})
@@ -64,6 +95,21 @@ async def handle_media_stream(websocket: WebSocket):
         async def handle_audio_delta(response: dict) -> None:
             """Handle audio delta from OpenAI."""
             audio_data = openai_service.extract_audio_response_data(response)
+            
+            # --- Broadcast transcript updates to dashboard ---
+            transcript_text = openai_service.extract_transcript_text(response) if hasattr(openai_service, "extract_transcript_text") else None
+            if transcript_text:
+                payload = json.dumps({
+                    "speaker": "AI",
+                    "text": transcript_text
+                })
+                for client in list(dashboard_clients):
+                    try:
+                        await client.send_text(payload)
+                    except Exception:
+                        dashboard_clients.remove(client)
+            # -------------------------------------------------
+
             if audio_data and connection_manager.state.stream_sid:
                 # If we're in a goodbye flow, mark that farewell audio has started and capture its item_id
                 if openai_service.is_goodbye_pending():
@@ -161,6 +207,7 @@ async def handle_speech_started_event(
             clear_message = audio_service.create_clear_message(connection_manager.state.stream_sid)
             await connection_manager.send_to_twilio(clear_message)
             audio_service.reset_interruption_state()
+
 
 if __name__ == "__main__":
     import uvicorn
