@@ -315,47 +315,55 @@ class OpenAIService:
             'item_id': self.event_handler.extract_item_id(event)
         }
 
-    def extract_transcript_text(self, event: Dict[str, Any]) -> Optional[str]:
-        """
-        Extract textual transcript from OpenAI realtime events.
-        Handles streaming text deltas and final response payloads.
-        """
-        try:
-            etype = event.get("type", "")
+   def extract_transcript_text(self, event: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract textual transcript from OpenAI realtime events.
+    Handles streaming text deltas and final response payloads.
+    """
+    try:
+        etype = event.get("type", "")
+        # Log every event type for debugging
+        Log.debug(f"[openai] Received event type: {etype}")
 
-            # Streaming text delta (common)
-            if etype in ("response.output_text.delta", "response.output_text.delta.text", "response.output_text.delta"):
-                delta = event.get("delta")
-                if isinstance(delta, str):
-                    return delta
-                if isinstance(delta, dict):
-                    # some payloads put text under 'text' or 'value'
-                    return delta.get("text") or delta.get("value") or None
+        # Streaming text delta
+        if etype in ("response.output_text.delta", "response.output_text.delta.text", "response.output_text.delta"):
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                Log.debug(f"[openai] Extracted delta text: {delta}")
+                return delta
+            if isinstance(delta, dict):
+                return delta.get("text") or delta.get("value") or None
 
-            # Some events put text under 'response' -> 'output' -> message -> content -> output_text
-            if etype == "response.done":
-                resp = event.get("response") or {}
-                for item in (resp.get("output") or []):
-                    if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
-                        for c in (item.get("content") or []):
-                            if isinstance(c, dict) and c.get("type") == "output_text":
-                                txt = c.get("text") or c.get("value")
-                                if isinstance(txt, str):
-                                    return txt
-
-            # Generic fallback: top-level text keys
-            if isinstance(event.get("text"), str):
-                return event.get("text")
-
-            # Response may directly contain output_text items
+        # Some events put text under 'response' -> 'output' -> message -> content -> output_text
+        if etype == "response.done":
             resp = event.get("response") or {}
             for item in (resp.get("output") or []):
-                if isinstance(item, dict) and item.get("type") == "output_text":
-                    return item.get("text") or item.get("value")
+                if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
+                    for c in (item.get("content") or []):
+                        if isinstance(c, dict) and c.get("type") == "output_text":
+                            txt = c.get("text") or c.get("value")
+                            if isinstance(txt, str):
+                                Log.debug(f"[openai] Extracted final text: {txt}")
+                                return txt
 
-        except Exception as e:
-            Log.debug("[openai] transcript extract error", e)
-        return None
+        # Generic fallback: top-level text keys
+        if isinstance(event.get("text"), str):
+            Log.debug(f"[openai] Extracted top-level text: {event.get('text')}")
+            return event.get("text")
+
+        # Response may directly contain output_text items
+        resp = event.get("response") or {}
+        for item in (resp.get("output") or []):
+            if isinstance(item, dict) and item.get("type") == "output_text":
+                txt = item.get("text") or item.get("value")
+                if isinstance(txt, str):
+                    Log.debug(f"[openai] Extracted output_text item: {txt}")
+                    return txt
+
+    except Exception as e:
+        Log.debug("[openai] transcript extract error", e)
+    return None
+
     
     def is_speech_started(self, event: Dict[str, Any]) -> bool:
         return self.event_handler.is_speech_started_event(event)
