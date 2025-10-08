@@ -38,46 +38,34 @@ dashboard_clients: Set[WebSocket] = set()
 
 @app.websocket("/dashboard-stream")
 async def dashboard_stream(websocket: WebSocket):
-    """
-    WebSocket endpoint for the dashboard to receive live transcript updates.
-    Production-ready: keeps connection alive and broadcasts live transcript from media-stream.
-    """
-    DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN")
+    """WebSocket endpoint for the dashboard to receive live transcript updates."""
     await websocket.accept()
-
-    # Validate optional token
-    if DASHBOARD_TOKEN:
-        provided = websocket.query_params.get("token") or websocket.headers.get("x-dashboard-token")
-        if provided != DASHBOARD_TOKEN:
-            await websocket.close(code=4003)
-            return
-
     dashboard_clients.add(websocket)
-    print(f"Dashboard client connected. Total clients: {len(dashboard_clients)}")
+    call_id = None
 
     try:
         while True:
             try:
-                # keepalive: wait for client message, otherwise send ping
-                await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
-                # client message ignored, just keep connection alive
+                # Wait for any incoming client text
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
+                try:
+                    data = json.loads(msg)
+                    # Save callId if sent by frontend
+                    if "callId" in data:
+                        call_id = data["callId"]
+                        print(f"Dashboard subscribed to callId: {call_id}")
+                except Exception:
+                    pass  # ignore invalid JSON
             except asyncio.TimeoutError:
-                # send ping to avoid idle timeout
+                # send ping keepalive
                 try:
                     await websocket.send_text(json.dumps({"type": "ping"}))
                 except Exception:
-                    break  # client disconnected
-
-            # --- Broadcast new transcripts if any are queued ---
-            # This requires your media-stream handler to push to dashboard_clients
-            # No need to poll; the media-stream already pushes
-            await asyncio.sleep(0.01)  # small sleep to prevent busy-loop
-
+                    break
     except WebSocketDisconnect:
-        print("Dashboard client disconnected.")
+        pass
     finally:
         dashboard_clients.discard(websocket)
-        print(f"Dashboard client removed. Total clients: {len(dashboard_clients)}")
 
 
 
