@@ -107,6 +107,7 @@ async def handle_media_stream(websocket: WebSocket):
         await connection_manager.connect_to_openai()
         await openai_service.initialize_session(connection_manager)
 
+        # --- Event handlers ---
         async def handle_media_event(data: dict) -> None:
             if connection_manager.is_openai_connected():
                 audio_message = audio_service.process_incoming_audio(data)
@@ -173,11 +174,6 @@ async def handle_media_stream(websocket: WebSocket):
                     mark_message = audio_service.create_mark_message(connection_manager.state.stream_sid)
                     await connection_manager.send_to_twilio(mark_message)
 
-    except Exception as e:
-        Log.error(f"Error in media stream handler: {e}")
-    finally:
-        await connection_manager.close_openai_connection()
-
         async def handle_speech_started() -> None:
             Log.info("Speech started detected.")
             if openai_service.is_goodbye_pending():
@@ -216,6 +212,7 @@ async def handle_media_stream(websocket: WebSocket):
                 except Exception as e:
                     print(f"OpenAI session renewal failed: {e}")
 
+        # --- Run all concurrently ---
         await asyncio.gather(
             connection_manager.receive_from_twilio(handle_media_event, handle_stream_start, handle_mark_event),
             openai_receiver(),
@@ -255,3 +252,4 @@ async def handle_speech_started_event(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=Config.PORT)
+
