@@ -202,257 +202,13 @@ class OpenAIService:
     """
     Main service layer for all OpenAI Realtime API operations in the application.
     
-    - Composes the event handler, session manager, and conversation manager.
-    - Provides high-level methods to initialize sessions, send greetings, process/log events, extract audio, and handle interruptions.
-    
-    This is the primary interface for the rest of the application to interact with OpenAI, abstracting away lower-level event and session management details.
-    """
-    
-    def __init__(self):
-        self.session_manager = OpenAISessionManager()
-        self.conversation_manager = OpenAIConversationManager()
-        self.event_handler = OpenAIEventHandler()
-        self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
-        self._pending_goodbye: bool = False
-        self._goodbye_audio_heard: bool = False
-        self._goodbye_item_id: Optional[str] = None
-        self._goodbye_watchdog: Optional[asyncio.Task] = None
-    
-    async def initialize_session(self, connection_manager) -> None:
-        """
-        Initialize OpenAI session with proper configuration.
-        
-        Args:
-            connection_manager: WebSocket connection manager
-        """
-        session_update = self.session_manager.create_session_update()
-        Log.json('Sending session update', session_update)
-        await connection_manager.send_to_openai(session_update)
-    
-    async def send_initial_greeting(self, connection_manager) -> None:
-        """
-        Send initial conversation item to make AI greet first.
-        
-        Args:
-            connection_manager: WebSocket connection manager
-        """
-        initial_item = self.session_manager.create_initial_conversation_item()
-        response_trigger = self.session_manager.create_response_trigger()
-        
-        await connection_manager.send_to_openai(initial_item)
-        await connection_manager.send_to_openai(response_trigger)
-    
-    def process_event_for_logging(self, event: Dict[str, Any]) -> None:
-        """
-        Process OpenAI event for logging if needed.
-        
-        Args:
-            event: OpenAI event data
-        """
-        if self.event_handler.should_log_event(event.get('type', '')):
-            Log.event(f"Received event: {event['type']}", event)
-
-    def is_tool_call(self, event: Dict[str, Any]) -> bool:
-        """Return True if the event is a tool call from the model."""
-        etype = event.get('type')
-        if etype in ('response.function_call.arguments.delta', 'response.function_call.completed'):
-            return True
-        # Also detect tool/function calls embedded in response.done payloads
-        if etype == 'response.done':
-            resp = event.get('response') or {}
-            output = resp.get('output') or []
-            for item in output:
-                if isinstance(item, dict) and item.get('type') == 'function_call':
-                    return True
-        return False
-
-    def accumulate_tool_call(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Accumulate streamed tool call arguments until completion.
-        Returns the completed call payload when finished.
-        """
-        etype = event.get('type')
-        if etype == 'response.function_call.arguments.delta':
-            call_id = event.get('call_id') or event.get('id') or 'default'
-            delta = event.get('delta', '')
-            buf = self._pending_tool_calls.setdefault(call_id, {"args": "", "name": event.get('name')})
-            buf["args"] += delta
-            return None
-        if etype == 'response.function_call.completed':
-            call_id = event.get('call_id') or event.get('id') or 'default'
-            payload = self._pending_tool_calls.pop(call_id, None)
-            if payload is None:
-                return None
-            try:
-                args = json.loads(payload["args"]) if payload["args"] else {}
-            except Exception:
-                args = {"_raw": payload["args"]}
-            return {"name": payload.get('name') or event.get('name'), "arguments": args}
-        # Handle non-streamed function calls embedded in response.done
-        if etype == 'response.done':
-            resp = event.get('response') or {}
-            output = resp.get('output') or []
-            for item in output:
-                if isinstance(item, dict) and item.get('type') == 'function_call':
-                    name = item.get('name')
-                    raw_args = item.get('arguments')
-                    args: Dict[str, Any]
-                    try:
-                        args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-                    except Exception:
-                        args = {"_raw": raw_args}
-                    return {"name": name, "arguments": args}
-        return None
-
-    async def maybe_handle_tool_call(self, connection_manager, tool_call: Dict[str, Any]) -> bool:
-        """
-        Handle supported tool calls. Returns True if a tool was handled.
-        Currently supports: end_call
-        """
-        if not tool_call:
-            return False
-        name = tool_call.get('name')
-        if name != 'end_call':
-            return False
-
-        # 1) Ask the assistant to speak a short farewell before ending.
-        args = tool_call.get('arguments') or {}
-        reason = args.get('reason') if isinstance(args, dict) else None
-        farewell = Config.build_end_call_farewell(reason)
-
-        # Ignore duplicate end_call requests while a goodbye is pending
-        if self._pending_goodbye:
-            Log.info("End-call already pending; ignoring duplicate request")
-            # Return False so other handlers (e.g., finalize check) can proceed on this event
-            return False
-
-        Log.info("Queueing farewell response before hangup")
-        await self._send_goodbye_response(connection_manager, farewell)
-        self._pending_goodbye = True
-        self._goodbye_audio_heard = False
-        # Clear any previous tracked item id; it will be set when we first hear the goodbye audio
-        self._goodbye_item_id = None
-        # Start a watchdog to avoid stalling if no audio arrives
-        self._start_goodbye_watchdog(connection_manager)
-        return True
-
-    async def _send_goodbye_response(self, connection_manager, text: str) -> None:
-        """Send a final assistant response (audio) with the provided text before hangup.
-        Uses response.create with inline instructions so the model speaks immediately without tool calls.
-        """
-        try:
-            # Note: Recent Realtime API versions expect instructions at the top level
-            # of the response.create event. Modalities are already defined in the
-            # session (output_modalities=["audio"]). Sending a nested
-            # response.modalities triggers an 'unknown_parameter' error.
-            await connection_manager.send_to_openai({
-                "type": "response.create",
-                "response": {
-                    "instructions": text
-                }
-            })
-        except Exception as e:
-            # If we fail to queue a goodbye, fall back to immediate hangup on next finalize
-            Log.error(f"Failed to queue goodbye response: {e}")
-            self._pending_goodbye = True
-            self._goodbye_audio_heard = False
-
-    def should_finalize_on_event(self, event: Dict[str, Any]) -> bool:
-        """Return True if we should finalize hangup after the goodbye audio has completed."""
-        if not (self._pending_goodbye and self._goodbye_audio_heard):
-            return False
-        etype = event.get('type')
-        # Primary: finalize when the output_audio stream indicates done (most reliable)
-        if etype == 'response.output_audio.done':
-            return True
-        # Secondary: finalize on response.done for the goodbye message if we can match IDs
-        if etype == 'response.done':
-            if not self._goodbye_item_id:
-                # Fallback: if we can't match IDs, but the response contains an assistant message with audio, allow finalize
-                resp = event.get('response') or {}
-                for item in (resp.get('output') or []):
-                    if isinstance(item, dict) and item.get('type') == 'message' and item.get('role') == 'assistant':
-                        for c in (item.get('content') or []):
-                            if isinstance(c, dict) and c.get('type') == 'output_audio':
-                                return True
-                return False
-            # If we do have a tracked item id, try to match it to the output item id
-            resp = event.get('response') or {}
-            for item in (resp.get('output') or []):
-                if isinstance(item, dict) and item.get('id') == self._goodbye_item_id:
-                    return True
-        return False
-
-    async def finalize_goodbye(self, connection_manager) -> None:
-        """After goodbye audio is finished, clear/close and optionally complete the call via REST."""
-        self._pending_goodbye = False
-        self._goodbye_audio_heard = False
-        self._goodbye_item_id = None
-        self._cancel_goodbye_watchdog()
-        # Small grace to allow final frames to play to the caller
-        try:
-            Log.info(f"Grace sleep before hangup: {getattr(Config, 'END_CALL_GRACE_SECONDS', 0.5)}s")
-            await asyncio.sleep(getattr(Config, 'END_CALL_GRACE_SECONDS', 0.5))
-        except Exception:
-            pass
-        if Config.has_twilio_credentials():
-            try:
-                from twilio.rest import Client
-                client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
-                call_sid = getattr(connection_manager.state, 'call_sid', None)
-                if call_sid:
-                    Log.event("Completing call via Twilio REST", {"callSid": call_sid})
-                    client.calls(call_sid).update(status='completed')
-            except Exception as e:
-                Log.error(f"Optional Twilio REST hangup failed: {e}")
-        # Always attempt to close the Twilio WS as a fallback; this ends the stream
-        try:
-            await connection_manager.close_twilio_connection(reason="assistant completed")
-        except Exception:
-            pass
-
-    def is_goodbye_pending(self) -> bool:
-        """Return True if a farewell has been queued and we await its completion."""
-        return self._pending_goodbye
-
-    def mark_goodbye_audio_heard(self, item_id: Optional[str]) -> None:
-        """Mark that we've begun receiving audio for the goodbye message and capture its item_id."""
-        if self._pending_goodbye:
-            self._goodbye_audio_heard = True
-            if item_id and not self._goodbye_item_id:
-                self._goodbye_item_id = item_id
-            # Once audio is heard, watchdog is no longer needed
-            self._cancel_goodbye_watchdog()
-
-    def _start_goodbye_watchdog(self, connection_manager) -> None:
-        """Start a watchdog that finalizes the call if no goodbye audio starts in time."""
-        self._cancel_goodbye_watchdog()
-        try:
-            timeout = getattr(Config, 'END_CALL_WATCHDOG_SECONDS', 4)
-
-            async def _watch():
-                try:
-                    await asyncio.sleep(timeout)
-                    if self._pending_goodbye and not self._goodbye_audio_heard:
-                        Log.info("Goodbye audio not detected in time; finalizing call")
-                        await self.finalize_goodbye(connection_manager)
-                except Exception:
-                    pass
-
-            self._goodbye_watchdog = asyncio.create_task(_watch())
-        except Exception:
-            self._goodbye_watchdog = None
-
-    def _cancel_goodbye_watchdog(self) -> None:
-        if self._goodbye_watchdog and not self._goodbye_watchdog.done():
-            self._goodbye_watchdog.cancel()
-        self._goodbye_watchdog = None
-    
-class OpenAIService:
-    """
-    Main service layer for all OpenAI Realtime API operations.
-    Handles session initialization, greetings, event processing, transcripts,
-    audio responses, tool calls, interruptions, and goodbyes.
+    Handles:
+    - Session initialization and initial greetings
+    - Event processing and logging
+    - Tool calls
+    - Audio & transcript extraction
+    - Interruption handling
+    - Goodbye/farewell handling
     """
 
     def __init__(self):
@@ -653,48 +409,48 @@ class OpenAIService:
     def is_speech_started(self, event: Dict[str, Any]) -> bool:
         return self.event_handler.is_speech_started_event(event)
 
-def extract_transcript_text(self, event: Dict[str, Any]) -> Optional[str]:
-    """
-    Extract textual transcript from OpenAI realtime events.
-    Supports streamed deltas, final assistant messages, and audio transcripts.
-    """
-    try:
-        etype = event.get("type", "")
-        Log.debug(f"[openai] Received event type for transcript extraction: {etype}")
+    def extract_transcript_text(self, event: Dict[str, Any]) -> Optional[str]:
+        """
+        Extract textual transcript from OpenAI realtime events.
+        Supports streamed deltas, final assistant messages, and audio transcripts.
+        """
+        try:
+            etype = event.get("type", "")
+            Log.debug(f"[openai] Received event type for transcript extraction: {etype}")
 
-        # Streamed text delta
-        if etype in ("response.output_text.delta", "response.output_text.delta.text"):
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                return delta
-            if isinstance(delta, dict):
-                return delta.get("text") or delta.get("value") or None
+            # Streamed text delta
+            if etype in ("response.output_text.delta", "response.output_text.delta.text"):
+                delta = event.get("delta")
+                if isinstance(delta, str):
+                    return delta
+                if isinstance(delta, dict):
+                    return delta.get("text") or delta.get("value") or None
 
-        # Completed assistant message
-        if etype == "response.done":
-            resp = event.get("response") or {}
-            for item in (resp.get("output") or []):
-                if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
-                    for c in (item.get("content") or []):
-                        if isinstance(c, dict):
-                            # 1) Standard text output
-                            if c.get("type") == "output_text":
-                                txt = c.get("text") or c.get("value")
-                                if isinstance(txt, str):
-                                    return txt
-                            # 2) Audio transcript
-                            if c.get("type") == "output_audio":
-                                txt = c.get("transcript")
-                                if isinstance(txt, str):
-                                    return txt
+            # Completed assistant message
+            if etype == "response.done":
+                resp = event.get("response") or {}
+                for item in (resp.get("output") or []):
+                    if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
+                        for c in (item.get("content") or []):
+                            if isinstance(c, dict):
+                                # 1) Standard text output
+                                if c.get("type") == "output_text":
+                                    txt = c.get("text") or c.get("value")
+                                    if isinstance(txt, str):
+                                        return txt
+                                # 2) Audio transcript
+                                if c.get("type") == "output_audio":
+                                    txt = c.get("transcript")
+                                    if isinstance(txt, str):
+                                        return txt
 
-        # Fallback if text is at the top level
-        if isinstance(event.get("text"), str):
-            return event.get("text")
+            # Fallback if text is at the top level
+            if isinstance(event.get("text"), str):
+                return event.get("text")
 
-    except Exception as e:
-        Log.debug("[openai] transcript extract error", e)
-    return None
+        except Exception as e:
+            Log.debug("[openai] transcript extract error", e)
+        return None
 
     # --- INTERRUPTION HANDLING ---
 
