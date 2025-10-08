@@ -200,15 +200,10 @@ class OpenAIConversationManager:
 
 class OpenAIService:
     """
-    Main service layer for all OpenAI Realtime API operations in the application.
-    
-    Handles:
-    - Session initialization and initial greetings
-    - Event processing and logging
-    - Tool calls
-    - Audio & transcript extraction
-    - Interruption handling
-    - Goodbye/farewell handling
+    Unified service for OpenAI Realtime API:
+    - Manages sessions, greetings, event logging
+    - Extracts assistant & caller transcripts
+    - Handles tool calls, interruptions, and goodbyes
     """
 
     def __init__(self):
@@ -222,22 +217,18 @@ class OpenAIService:
         self._goodbye_watchdog: Optional[asyncio.Task] = None
 
     # --- SESSION & GREETING ---
-
     async def initialize_session(self, connection_manager) -> None:
-        """Initialize OpenAI session with proper configuration."""
         session_update = self.session_manager.create_session_update()
         Log.json('Sending session update', session_update)
         await connection_manager.send_to_openai(session_update)
 
     async def send_initial_greeting(self, connection_manager) -> None:
-        """Send initial greeting conversation item."""
         initial_item = self.session_manager.create_initial_conversation_item()
         response_trigger = self.session_manager.create_response_trigger()
         await connection_manager.send_to_openai(initial_item)
         await connection_manager.send_to_openai(response_trigger)
 
     # --- EVENT LOGGING & TOOL CALLS ---
-
     def process_event_for_logging(self, event: Dict[str, Any]) -> None:
         if self.event_handler.should_log_event(event.get('type', '')):
             Log.event(f"Received event: {event['type']}", event)
@@ -321,7 +312,6 @@ class OpenAIService:
             self._goodbye_audio_heard = False
 
     # --- GOODBYE HANDLING ---
-
     def should_finalize_on_event(self, event: Dict[str, Any]) -> bool:
         if not (self._pending_goodbye and self._goodbye_audio_heard):
             return False
@@ -398,21 +388,10 @@ class OpenAIService:
             self._goodbye_watchdog.cancel()
         self._goodbye_watchdog = None
 
-    # --- AUDIO & TRANSCRIPT ---
-
-    def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if not self.event_handler.is_audio_delta_event(event):
-            return None
-        return {'delta': self.event_handler.extract_audio_delta(event),
-                'item_id': self.event_handler.extract_item_id(event)}
-
-    def is_speech_started(self, event: Dict[str, Any]) -> bool:
-        return self.event_handler.is_speech_started_event(event)
-
+    # --- TRANSCRIPT EXTRACTION ---
     def extract_transcript_text(self, event: Dict[str, Any]) -> Optional[str]:
         """
-        Extract textual transcript from OpenAI realtime events.
-        Supports streamed deltas, final assistant messages, and audio transcripts.
+        Extract assistant (bot) transcript from events.
         """
         try:
             etype = event.get("type", "")
@@ -433,51 +412,53 @@ class OpenAIService:
                     if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
                         for c in (item.get("content") or []):
                             if isinstance(c, dict):
-                                # 1) Standard text output
                                 if c.get("type") == "output_text":
                                     txt = c.get("text") or c.get("value")
                                     if isinstance(txt, str):
                                         return txt
-                                # 2) Audio transcript
                                 if c.get("type") == "output_audio":
                                     txt = c.get("transcript")
                                     if isinstance(txt, str):
                                         return txt
 
-            # Fallback if text is at the top level
             if isinstance(event.get("text"), str):
                 return event.get("text")
 
         except Exception as e:
-            Log.debug("[openai] transcript extract error", e)
+            Log.debug("[openai] assistant transcript extract error", e)
         return None
 
-    # --- INTERRUPTION HANDLING ---
+    def extract_caller_transcript(self, event: Dict[str, Any]) -> Optional[str]:
+        """
+        Extract caller transcript from real-time events.
+        """
+        try:
+            etype = event.get("type", "")
+            if etype in ("input_audio.transcript", "input_audio.delta"):
+                txt = event.get("text") or event.get("transcript")
+                if isinstance(txt, str) and txt.strip():
+                    return txt
+        except Exception as e:
+            Log.debug("[openai] caller transcript extract error", e)
+        return None
 
-    async def handle_interruption(
-        self,
-        connection_manager,
-        current_timestamp: int,
-        response_start_timestamp: int,
-        last_assistant_item: str
-    ) -> None:
-        elapsed_time = self.conversation_manager.calculate_truncation_time(
-            current_timestamp, response_start_timestamp
-        )
+    # --- AUDIO EVENTS ---
+    def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.event_handler.is_audio_delta_event(event):
+            return None
+        return {'delta': self.event_handler.extract_audio_delta(event),
+                'item_id': self.event_handler.extract_item_id(event)}
+
+    def is_speech_started(self, event: Dict[str, Any]) -> bool:
+        return self.event_handler.is_speech_started_event(event)
+
+    # --- INTERRUPTION HANDLING ---
+    async def handle_interruption(self, connection_manager, current_timestamp: int, response_start_timestamp: int, last_assistant_item: str) -> None:
+        elapsed_time = self.conversation_manager.calculate_truncation_time(current_timestamp, response_start_timestamp)
         if Config.SHOW_TIMING_MATH:
-            print(f"Calculating elapsed time for truncation: {current_timestamp} - {response_start_timestamp} = {elapsed_time}ms")
-            print(f"Truncating item with ID: {last_assistant_item}, Truncated at: {elapsed_time}ms")
-        truncate_event = self.conversation_manager.create_truncate_event(
-            last_assistant_item, elapsed_time
-        )
+            print(f"Truncating item {last_assistant_item} at {elapsed_time}ms")
+        truncate_event = self.conversation_manager.create_truncate_event(last_assistant_item, elapsed_time)
         await connection_manager.send_to_openai(truncate_event)
 
-    def should_process_interruption(
-        self,
-        last_assistant_item: Optional[str],
-        mark_queue: list,
-        response_start_timestamp: Optional[int]
-    ) -> bool:
-        return self.conversation_manager.should_handle_interruption(
-            last_assistant_item, mark_queue, response_start_timestamp
-        )
+    def should_process_interruption(self, last_assistant_item: Optional[str], mark_queue: list, response_start_timestamp: Optional[int]) -> bool:
+        return self.conversation_manager.should_handle_interruption(last_assistant_item, mark_queue, response_start_timestamp)
