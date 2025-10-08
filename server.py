@@ -33,31 +33,44 @@ app.add_middleware(
 )
 
 
-# Store all connected dashboard clients
+# Store connected dashboard clients
 dashboard_clients: Set[WebSocket] = set()
 
 @app.websocket("/dashboard-stream")
 async def dashboard_stream(websocket: WebSocket):
-    """WebSocket endpoint for the dashboard to receive live transcript updates."""
+    """
+    WebSocket endpoint for dashboards to receive live transcripts.
+    Supports optional callId filtering via query param or first message from client.
+    """
     await websocket.accept()
+    
+    DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN")
+    client_call_id = None  # optional filter per dashboard client
+
+    # Token validation
+    if DASHBOARD_TOKEN:
+        provided = websocket.query_params.get("token") or websocket.headers.get("x-dashboard-token")
+        if provided != DASHBOARD_TOKEN:
+            await websocket.close(code=4003)
+            return
+
     dashboard_clients.add(websocket)
-    call_id = None
 
     try:
+        # Optional: wait for first message to get callId
+        try:
+            msg = await asyncio.wait_for(websocket.receive_text(), timeout=5)
+            data = json.loads(msg)
+            client_call_id = data.get("callId")  # filter transcripts for this callId only
+        except (asyncio.TimeoutError, json.JSONDecodeError, KeyError):
+            client_call_id = None
+
         while True:
+            # Keep the connection alive; receive dummy messages or ping every 20s
             try:
-                # Wait for any incoming client text
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
-                try:
-                    data = json.loads(msg)
-                    # Save callId if sent by frontend
-                    if "callId" in data:
-                        call_id = data["callId"]
-                        print(f"Dashboard subscribed to callId: {call_id}")
-                except Exception:
-                    pass  # ignore invalid JSON
+                await asyncio.wait_for(websocket.receive_text(), timeout=20)
             except asyncio.TimeoutError:
-                # send ping keepalive
+                # send ping
                 try:
                     await websocket.send_text(json.dumps({"type": "ping"}))
                 except Exception:
@@ -66,6 +79,28 @@ async def dashboard_stream(websocket: WebSocket):
         pass
     finally:
         dashboard_clients.discard(websocket)
+
+
+async def broadcast_transcript(transcript_obj: dict):
+    """
+    Broadcast a new transcript to all connected dashboard clients.
+    transcript_obj: {
+        "callSid": "...",
+        "speaker": "User" | "AI",
+        "text": "...",
+        "timestamp": "..."
+    }
+    """
+    payload = json.dumps(transcript_obj)
+    for client in list(dashboard_clients):
+        try:
+            # If client has filtered by callId, skip unrelated messages
+            if hasattr(client, "call_id") and client.call_id:
+                if transcript_obj.get("callSid") != client.call_id:
+                    continue
+            await client.send_text(payload)
+        except Exception:
+            dashboard_clients.discard(client)
 
 
 
