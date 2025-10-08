@@ -1,3 +1,4 @@
+import os
 import json
 import base64
 import asyncio
@@ -27,13 +28,37 @@ dashboard_clients: Set[WebSocket] = set()
 @app.websocket("/dashboard-stream")
 async def dashboard_stream(websocket: WebSocket):
     """WebSocket endpoint for the dashboard to receive live transcript updates."""
+    # Optional token protection: set DASHBOARD_TOKEN env var to enable
+    DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN")
+
     await websocket.accept()
+
+    # if token is configured, validate query param or header
+    if DASHBOARD_TOKEN:
+        provided = websocket.query_params.get("token") or websocket.headers.get("x-dashboard-token")
+        if provided != DASHBOARD_TOKEN:
+            # 4003 = policy violation / unauthorized for our use
+            await websocket.close(code=4003)
+            return
+
     dashboard_clients.add(websocket)
     try:
         while True:
-            await websocket.receive_text()  # Keep alive
+            try:
+                # Wait for any incoming client text for 20s; if none, send ping
+                await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
+                # if client sends something we ignore it (keepalive or UI pings)
+            except asyncio.TimeoutError:
+                # send a ping keepalive to avoid idle proxy timeouts
+                try:
+                    await websocket.send_text(json.dumps({"type": "ping"}))
+                except Exception:
+                    # if sending fails, break and cleanup
+                    break
     except WebSocketDisconnect:
-        dashboard_clients.remove(websocket)
+        pass
+    finally:
+        dashboard_clients.discard(websocket)
 
 
 @app.get("/", response_class=JSONResponse)
@@ -73,15 +98,20 @@ async def handle_media_stream(websocket: WebSocket):
 
             # --- Optional: Broadcast caller transcript if speech-to-text added later ---
             if "text" in data:
-                payload = json.dumps({
+                payload_obj = {
+                    "id": data.get("id") or str(int(asyncio.get_event_loop().time() * 1000)),
+                    "callSid": getattr(connection_manager.state, "call_sid", None),
+                    "streamSid": getattr(connection_manager.state, "stream_sid", None),
                     "speaker": "User",
-                    "text": data["text"]
-                })
+                    "text": data["text"],
+                    "timestamp": data.get("timestamp") or (asyncio.get_event_loop().time())
+                }
+                payload = json.dumps(payload_obj)
                 for client in list(dashboard_clients):
                     try:
                         await client.send_text(payload)
                     except Exception:
-                        dashboard_clients.remove(client)
+                        dashboard_clients.discard(client)
             # ---------------------------------------------------------------------------
 
         async def handle_stream_start(stream_sid: str) -> None:
@@ -97,17 +127,29 @@ async def handle_media_stream(websocket: WebSocket):
             audio_data = openai_service.extract_audio_response_data(response)
             
             # --- Broadcast transcript updates to dashboard ---
-            transcript_text = openai_service.extract_transcript_text(response) if hasattr(openai_service, "extract_transcript_text") else None
+            transcript_text = None
+            # use extractor if provided by OpenAI service
+            if hasattr(openai_service, "extract_transcript_text"):
+                try:
+                    transcript_text = openai_service.extract_transcript_text(response)
+                except Exception:
+                    transcript_text = None
+
             if transcript_text:
-                payload = json.dumps({
+                payload_obj = {
+                    "id": response.get("id") or str(int(asyncio.get_event_loop().time() * 1000)),
+                    "callSid": getattr(connection_manager.state, "call_sid", None),
+                    "streamSid": getattr(connection_manager.state, "stream_sid", None),
                     "speaker": "AI",
-                    "text": transcript_text
-                })
+                    "text": transcript_text,
+                    "timestamp": response.get("timestamp") or (asyncio.get_event_loop().time())
+                }
+                payload = json.dumps(payload_obj)
                 for client in list(dashboard_clients):
                     try:
                         await client.send_text(payload)
                     except Exception:
-                        dashboard_clients.remove(client)
+                        dashboard_clients.discard(client)
             # -------------------------------------------------
 
             if audio_data and connection_manager.state.stream_sid:
