@@ -249,26 +249,22 @@ async def handle_speech_started_event(
             clear_message = audio_service.create_clear_message(connection_manager.state.stream_sid)
             await connection_manager.send_to_twilio(clear_message)
             audio_service.reset_interruption_state()
-from flask import Response, stream_with_context
+from fastapi.responses import StreamingResponse
+import asyncio
 import json
-import time
 
-@app.route("/dashboard-stream")
-def dashboard_stream():
-    def event_stream():
-        # Example simulation: replace this part with real-time transcript updates
+@app.get("/dashboard-stream")
+async def dashboard_stream():
+    async def event_stream():
         example_data = [
             {"speaker": "User", "text": "Hello?", "timestamp": "12:00:01"},
             {"speaker": "AI", "text": "Hi! How can I help you today?", "timestamp": "12:00:02"},
         ]
         for item in example_data:
             yield f"data: {json.dumps(item)}\n\n"
-            time.sleep(2)
+            await asyncio.sleep(2)
 
-        # If you want a continuous live stream, remove the loop ending
-        # and yield messages as they come in from your real process.
-    
-    return Response(stream_with_context(event_stream()), mimetype="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
