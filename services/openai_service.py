@@ -130,6 +130,19 @@ class OpenAIService:
         if self.event_handler.should_log_event(event.get('type', '')):
             Log.event(f"Received event: {event['type']}", event)
 
+    def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract audio delta info from OpenAI realtime events."""
+    try:
+        if not self.event_handler.is_audio_delta_event(event):
+            return None
+        return {
+            "delta": self.event_handler.extract_audio_delta(event),
+            "item_id": self.event_handler.extract_item_id(event)
+        }
+    except Exception as e:
+        Log.debug(f"[openai] extract_audio_response_data error: {e}")
+        return None
+
     def is_tool_call(self, event: Dict[str, Any]) -> bool:
         etype = event.get('type')
         if etype in ('response.function_call.arguments.delta', 'response.function_call.completed'):
