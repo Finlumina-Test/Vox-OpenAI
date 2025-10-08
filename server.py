@@ -38,13 +38,10 @@ dashboard_clients: Set[WebSocket] = set()
 
 @app.websocket("/dashboard-stream")
 async def dashboard_stream(websocket: WebSocket):
-    """WebSocket endpoint for the dashboard to receive live transcript updates."""
     await websocket.accept()
-
     DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN")
     client_call_id = None
 
-    # Token validation
     if DASHBOARD_TOKEN:
         provided = websocket.query_params.get("token") or websocket.headers.get("x-dashboard-token")
         if provided != DASHBOARD_TOKEN:
@@ -54,7 +51,6 @@ async def dashboard_stream(websocket: WebSocket):
     dashboard_clients.add(websocket)
 
     try:
-        # Optional: wait for first message to get callId
         try:
             msg = await asyncio.wait_for(websocket.receive_text(), timeout=5)
             data = json.loads(msg)
@@ -77,19 +73,9 @@ async def dashboard_stream(websocket: WebSocket):
 
 
 async def broadcast_transcript(transcript_obj: dict):
-    """
-    Broadcast a new transcript to all connected dashboard clients.
-    transcript_obj: {
-        "callSid": "...",
-        "speaker": "User" | "AI",
-        "text": "...",
-        "timestamp": "..."
-    }
-    """
     payload = json.dumps(transcript_obj)
     for client in list(dashboard_clients):
         try:
-            # Optional: skip messages if client filters by callId
             if hasattr(client, "call_id") and client.call_id:
                 if transcript_obj.get("callSid") != client.call_id:
                     continue
@@ -105,35 +91,28 @@ async def index_page():
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
-    """Handle incoming call and return TwiML response to connect to Media Stream."""
     return TwilioService.create_incoming_call_response(request)
 
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
-    """Handle WebSocket connections between Twilio and OpenAI."""
     Log.header("Client connected")
     await websocket.accept()
 
-    # Create connection manager and services
     connection_manager = WebSocketConnectionManager(websocket)
     openai_service = OpenAIService()
     audio_service = AudioService()
 
     try:
-        # Connect to OpenAI and initialize session
         await connection_manager.connect_to_openai()
         await openai_service.initialize_session(connection_manager)
 
-        # --- Nested event handlers ---
         async def handle_media_event(data: dict) -> None:
-            """Handle incoming media data from Twilio."""
             if connection_manager.is_openai_connected():
                 audio_message = audio_service.process_incoming_audio(data)
                 if audio_message:
                     await connection_manager.send_to_openai(audio_message)
 
-            # Broadcast caller transcript if speech-to-text added later
             if "text" in data:
                 payload_obj = {
                     "id": data.get("id") or str(int(asyncio.get_event_loop().time() * 1000)),
@@ -151,58 +130,52 @@ async def handle_media_stream(websocket: WebSocket):
                         dashboard_clients.discard(client)
 
         async def handle_stream_start(stream_sid: str) -> None:
-            """Handle stream start event."""
             Log.event("Twilio stream started", {"streamSid": stream_sid})
 
         async def handle_mark_event() -> None:
-            """Handle mark event from Twilio."""
             audio_service.handle_mark_event()
 
- async def handle_audio_delta(response: dict) -> None:
-    """Handle audio delta from OpenAI."""
-    audio_data = openai_service.extract_audio_response_data(response)
+        async def handle_audio_delta(response: dict) -> None:
+            audio_data = openai_service.extract_audio_response_data(response)
 
-    transcript_text = None
-    if hasattr(openai_service, "extract_transcript_text"):
-        try:
-            transcript_text = openai_service.extract_transcript_text(response)
-        except Exception:
             transcript_text = None
+            if hasattr(openai_service, "extract_transcript_text"):
+                try:
+                    transcript_text = openai_service.extract_transcript_text(response)
+                except Exception:
+                    transcript_text = None
 
-    if transcript_text:
-        payload_obj = {
-            "id": response.get("id") or str(int(asyncio.get_event_loop().time() * 1000)),
-            "callSid": getattr(connection_manager.state, "call_sid", None),
-            "streamSid": getattr(connection_manager.state, "stream_sid", None),
-            "speaker": "AI",
-            "text": transcript_text,
-            "timestamp": response.get("timestamp") or (asyncio.get_event_loop().time())
-        }
-        payload = json.dumps(payload_obj)
-        # ✅ Added logging for debugging
-        print(f"[dashboard] Broadcasting transcript: {payload}")
-        print(f"[dashboard] Connected clients: {len(dashboard_clients)}")
-        for client in list(dashboard_clients):
-            try:
-                await client.send_text(payload)
-            except Exception:
-                dashboard_clients.discard(client)
+            if transcript_text:
+                payload_obj = {
+                    "id": response.get("id") or str(int(asyncio.get_event_loop().time() * 1000)),
+                    "callSid": getattr(connection_manager.state, "call_sid", None),
+                    "streamSid": getattr(connection_manager.state, "stream_sid", None),
+                    "speaker": "AI",
+                    "text": transcript_text,
+                    "timestamp": response.get("timestamp") or (asyncio.get_event_loop().time())
+                }
+                payload = json.dumps(payload_obj)
+                print(f"[dashboard] Broadcasting transcript: {payload}")
+                print(f"[dashboard] Connected clients: {len(dashboard_clients)}")
+                for client in list(dashboard_clients):
+                    try:
+                        await client.send_text(payload)
+                    except Exception:
+                        dashboard_clients.discard(client)
 
-    if audio_data and connection_manager.state.stream_sid:
-        if openai_service.is_goodbye_pending():
-            openai_service.mark_goodbye_audio_heard(audio_data.get('item_id'))
-        audio_message = audio_service.process_outgoing_audio(
-            response,
-            connection_manager.state.stream_sid
-        )
-        if audio_message:
-            await connection_manager.send_to_twilio(audio_message)
-            mark_message = audio_service.create_mark_message(connection_manager.state.stream_sid)
-            await connection_manager.send_to_twilio(mark_message)
-
+            if audio_data and connection_manager.state.stream_sid:
+                if openai_service.is_goodbye_pending():
+                    openai_service.mark_goodbye_audio_heard(audio_data.get('item_id'))
+                audio_message = audio_service.process_outgoing_audio(
+                    response,
+                    connection_manager.state.stream_sid
+                )
+                if audio_message:
+                    await connection_manager.send_to_twilio(audio_message)
+                    mark_message = audio_service.create_mark_message(connection_manager.state.stream_sid)
+                    await connection_manager.send_to_twilio(mark_message)
 
         async def handle_speech_started() -> None:
-            """Handle speech started event (interruption)."""
             Log.info("Speech started detected.")
             if openai_service.is_goodbye_pending():
                 Log.info("Ignoring interruption during goodbye flow")
@@ -213,7 +186,6 @@ async def handle_media_stream(websocket: WebSocket):
                 await handle_speech_started_event(connection_manager, openai_service, audio_service)
 
         async def handle_other_openai_event(response: dict) -> None:
-            """Handle other OpenAI events."""
             openai_service.process_event_for_logging(response)
             if openai_service.is_tool_call(response):
                 tool_call = openai_service.accumulate_tool_call(response)
@@ -258,7 +230,6 @@ async def handle_speech_started_event(
     openai_service: OpenAIService,
     audio_service: AudioService
 ):
-    """Handle interruption when the caller's speech starts."""
     Log.subheader("Handling speech started event")
 
     if audio_service.should_handle_interruption():
