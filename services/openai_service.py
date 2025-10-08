@@ -1,11 +1,8 @@
-from typing import Dict, Any, Optional
-import asyncio
 import json
-from services.log_utils import Log
-from services.openai_session_manager import OpenAISessionManager
-from services.openai_conversation_manager import OpenAIConversationManager
-from services.openai_event_handler import OpenAIEventHandler
+import asyncio
+from typing import Optional, Dict, Any
 from config import Config
+from services.log_utils import Log
 
 class OpenAIEventHandler:
     """Interprets and processes events received from the OpenAI Realtime API."""
