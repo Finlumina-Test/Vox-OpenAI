@@ -158,44 +158,48 @@ async def handle_media_stream(websocket: WebSocket):
             """Handle mark event from Twilio."""
             audio_service.handle_mark_event()
 
-        async def handle_audio_delta(response: dict) -> None:
-            """Handle audio delta from OpenAI."""
-            audio_data = openai_service.extract_audio_response_data(response)
+ async def handle_audio_delta(response: dict) -> None:
+    """Handle audio delta from OpenAI."""
+    audio_data = openai_service.extract_audio_response_data(response)
 
+    transcript_text = None
+    if hasattr(openai_service, "extract_transcript_text"):
+        try:
+            transcript_text = openai_service.extract_transcript_text(response)
+        except Exception:
             transcript_text = None
-            if hasattr(openai_service, "extract_transcript_text"):
-                try:
-                    transcript_text = openai_service.extract_transcript_text(response)
-                except Exception:
-                    transcript_text = None
 
-            if transcript_text:
-                payload_obj = {
-                    "id": response.get("id") or str(int(asyncio.get_event_loop().time() * 1000)),
-                    "callSid": getattr(connection_manager.state, "call_sid", None),
-                    "streamSid": getattr(connection_manager.state, "stream_sid", None),
-                    "speaker": "AI",
-                    "text": transcript_text,
-                    "timestamp": response.get("timestamp") or (asyncio.get_event_loop().time())
-                }
-                payload = json.dumps(payload_obj)
-                for client in list(dashboard_clients):
-                    try:
-                        await client.send_text(payload)
-                    except Exception:
-                        dashboard_clients.discard(client)
+    if transcript_text:
+        payload_obj = {
+            "id": response.get("id") or str(int(asyncio.get_event_loop().time() * 1000)),
+            "callSid": getattr(connection_manager.state, "call_sid", None),
+            "streamSid": getattr(connection_manager.state, "stream_sid", None),
+            "speaker": "AI",
+            "text": transcript_text,
+            "timestamp": response.get("timestamp") or (asyncio.get_event_loop().time())
+        }
+        payload = json.dumps(payload_obj)
+        # ✅ Added logging for debugging
+        print(f"[dashboard] Broadcasting transcript: {payload}")
+        print(f"[dashboard] Connected clients: {len(dashboard_clients)}")
+        for client in list(dashboard_clients):
+            try:
+                await client.send_text(payload)
+            except Exception:
+                dashboard_clients.discard(client)
 
-            if audio_data and connection_manager.state.stream_sid:
-                if openai_service.is_goodbye_pending():
-                    openai_service.mark_goodbye_audio_heard(audio_data.get('item_id'))
-                audio_message = audio_service.process_outgoing_audio(
-                    response,
-                    connection_manager.state.stream_sid
-                )
-                if audio_message:
-                    await connection_manager.send_to_twilio(audio_message)
-                    mark_message = audio_service.create_mark_message(connection_manager.state.stream_sid)
-                    await connection_manager.send_to_twilio(mark_message)
+    if audio_data and connection_manager.state.stream_sid:
+        if openai_service.is_goodbye_pending():
+            openai_service.mark_goodbye_audio_heard(audio_data.get('item_id'))
+        audio_message = audio_service.process_outgoing_audio(
+            response,
+            connection_manager.state.stream_sid
+        )
+        if audio_message:
+            await connection_manager.send_to_twilio(audio_message)
+            mark_message = audio_service.create_mark_message(connection_manager.state.stream_sid)
+            await connection_manager.send_to_twilio(mark_message)
+
 
         async def handle_speech_started() -> None:
             """Handle speech started event (interruption)."""
