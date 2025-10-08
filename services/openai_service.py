@@ -448,6 +448,19 @@ class OpenAIService:
             self._goodbye_watchdog.cancel()
         self._goodbye_watchdog = None
     
+class OpenAIService:
+    def __init__(self):
+        self.session_manager = OpenAISessionManager()
+        self.conversation_manager = OpenAIConversationManager()
+        self.event_handler = OpenAIEventHandler()
+        self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
+        self._pending_goodbye: bool = False
+        self._goodbye_audio_heard: bool = False
+        self._goodbye_item_id: Optional[str] = None
+        self._goodbye_watchdog: Optional[asyncio.Task] = None
+
+    # --- AUDIO RESPONSE METHODS ---
+
     def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Extract relevant data from OpenAI audio response.
@@ -466,43 +479,6 @@ class OpenAIService:
             'item_id': self.event_handler.extract_item_id(event)
         }
 
-    def extract_transcript_text(self, event: Dict[str, Any]) -> Optional[str]:
-    """
-    Extract textual transcript from OpenAI realtime events.
-    Supports streamed deltas and final assistant messages.
-    """
-    try:
-        etype = event.get("type", "")
-        Log.debug(f"[openai] Received event type for transcript extraction: {etype}")
-
-        # Streamed text delta
-        if etype in ("response.output_text.delta", "response.output_text.delta.text"):
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                return delta
-            if isinstance(delta, dict):
-                return delta.get("text") or delta.get("value") or None
-
-        # Completed assistant message
-        if etype == "response.done":
-            resp = event.get("response") or {}
-            for item in (resp.get("output") or []):
-                if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
-                    for c in (item.get("content") or []):
-                        if isinstance(c, dict) and c.get("type") == "output_text":
-                            txt = c.get("text") or c.get("value")
-                            if isinstance(txt, str):
-                                return txt
-
-        # Fallback for direct text
-        if isinstance(event.get("text"), str):
-            return event.get("text")
-
-    except Exception as e:
-        Log.debug("[openai] transcript extract error", e)
-
-    return None
-    
     def is_speech_started(self, event: Dict[str, Any]) -> bool:
         """
         Check if event indicates user speech started (interruption).
@@ -514,6 +490,44 @@ class OpenAIService:
             True if speech started
         """
         return self.event_handler.is_speech_started_event(event)
+
+    # --- TRANSCRIPT METHODS ---
+
+    def extract_transcript_text(self, event: Dict[str, Any]) -> Optional[str]:
+        """
+        Extract textual transcript from OpenAI realtime events.
+        Supports streamed deltas and final assistant messages.
+        """
+        try:
+            etype = event.get("type", "")
+            Log.debug(f"[openai] Received event type for transcript extraction: {etype}")
+
+            # Streamed text delta
+            if etype in ("response.output_text.delta", "response.output_text.delta.text"):
+                delta = event.get("delta")
+                if isinstance(delta, str):
+                    return delta
+                if isinstance(delta, dict):
+                    return delta.get("text") or delta.get("value") or None
+
+            # Completed assistant message
+            if etype == "response.done":
+                resp = event.get("response") or {}
+                for item in (resp.get("output") or []):
+                    if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
+                        for c in (item.get("content") or []):
+                            if isinstance(c, dict) and c.get("type") == "output_text":
+                                txt = c.get("text") or c.get("value")
+                                if isinstance(txt, str):
+                                    return txt
+
+            # Fallback if text is at the top level
+            if isinstance(event.get("text"), str):
+                return event.get("text")
+
+        except Exception as e:
+            Log.debug("[openai] transcript extract error", e)
+        return None
     
     async def handle_interruption(
         self,
