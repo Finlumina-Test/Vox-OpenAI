@@ -22,6 +22,17 @@ from services.log_utils import Log
 
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or replace * with your dashboard domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 # Store all connected dashboard clients
 dashboard_clients: Set[WebSocket] = set()
 
