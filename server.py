@@ -72,41 +72,17 @@ async def dashboard_stream(websocket: WebSocket):
         dashboard_clients.discard(websocket)
 
 
-class Log:
-    @staticmethod
-    def header(msg):
-        print(f"\n=== {msg} ===")
-
-    @staticmethod
-    def subheader(msg):
-        print(f"\n--- {msg} ---")
-
-    @staticmethod
-    def event(msg, data=None):
-        print(f"[EVENT] {msg}: {data if data else ''}")
-
-    @staticmethod
-    def info(msg):
-        print(f"[INFO] {msg}")
-
-    @staticmethod
-    def error(msg):
-        print(f"[ERROR] {msg}")
-
-    @staticmethod
-    def debug(msg):
-        print(f"[DEBUG] {msg}")
-
-
-async def broadcast_transcript(payload_obj: dict):
-    """Send transcript data to all connected dashboard clients."""
-    payload = json.dumps(payload_obj)
+async def broadcast_transcript(transcript_obj: dict):
+    payload = json.dumps(transcript_obj)
     for client in list(dashboard_clients):
         try:
+            if hasattr(client, "call_id") and client.call_id:
+                if transcript_obj.get("callSid") != client.call_id:
+                    continue
             await client.send_text(payload)
         except Exception:
             dashboard_clients.discard(client)
-            
+
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -131,7 +107,6 @@ async def handle_media_stream(websocket: WebSocket):
         await connection_manager.connect_to_openai()
         await openai_service.initialize_session(connection_manager)
 
-        # --- Event handlers ---
         async def handle_media_event(data: dict) -> None:
             if connection_manager.is_openai_connected():
                 audio_message = audio_service.process_incoming_audio(data)
@@ -145,7 +120,7 @@ async def handle_media_stream(websocket: WebSocket):
                     "streamSid": getattr(connection_manager.state, "stream_sid", None),
                     "speaker": "User",
                     "text": data["text"],
-                    "timestamp": data.get("timestamp") or asyncio.get_event_loop().time()
+                    "timestamp": data.get("timestamp") or (asyncio.get_event_loop().time())
                 }
                 payload = json.dumps(payload_obj)
                 for client in list(dashboard_clients):
@@ -161,8 +136,15 @@ async def handle_media_stream(websocket: WebSocket):
             audio_service.handle_mark_event()
 
         async def handle_audio_delta(response: dict) -> None:
-            # Assistant transcript
-            transcript_text = openai_service.extract_transcript_text(response)
+            audio_data = openai_service.extract_audio_response_data(response)
+
+            transcript_text = None
+            if hasattr(openai_service, "extract_transcript_text"):
+                try:
+                    transcript_text = openai_service.extract_transcript_text(response)
+                except Exception:
+                    transcript_text = None
+
             if transcript_text:
                 payload_obj = {
                     "id": response.get("id") or str(int(asyncio.get_event_loop().time() * 1000)),
@@ -170,29 +152,24 @@ async def handle_media_stream(websocket: WebSocket):
                     "streamSid": getattr(connection_manager.state, "stream_sid", None),
                     "speaker": "AI",
                     "text": transcript_text,
-                    "timestamp": response.get("timestamp") or asyncio.get_event_loop().time()
+                    "timestamp": response.get("timestamp") or (asyncio.get_event_loop().time())
                 }
-                await broadcast_transcript(payload_obj)
+                payload = json.dumps(payload_obj)
+                print(f"[dashboard] Broadcasting transcript: {payload}")
+                print(f"[dashboard] Connected clients: {len(dashboard_clients)}")
+                for client in list(dashboard_clients):
+                    try:
+                        await client.send_text(payload)
+                    except Exception:
+                        dashboard_clients.discard(client)
 
-            # Caller transcript
-            caller_text = openai_service.extract_caller_transcript(response)
-            if caller_text:
-                payload_obj = {
-                    "id": response.get("id") or str(int(asyncio.get_event_loop().time() * 1000)),
-                    "callSid": getattr(connection_manager.state, "call_sid", None),
-                    "streamSid": getattr(connection_manager.state, "stream_sid", None),
-                    "speaker": "User",
-                    "text": caller_text,
-                    "timestamp": response.get("timestamp") or asyncio.get_event_loop().time()
-                }
-                await broadcast_transcript(payload_obj)
-
-            # Outgoing audio to Twilio
-            audio_data = openai_service.extract_audio_response_data(response)
             if audio_data and connection_manager.state.stream_sid:
                 if openai_service.is_goodbye_pending():
                     openai_service.mark_goodbye_audio_heard(audio_data.get('item_id'))
-                audio_message = audio_service.process_outgoing_audio(response, connection_manager.state.stream_sid)
+                audio_message = audio_service.process_outgoing_audio(
+                    response,
+                    connection_manager.state.stream_sid
+                )
                 if audio_message:
                     await connection_manager.send_to_twilio(audio_message)
                     mark_message = audio_service.create_mark_message(connection_manager.state.stream_sid)
@@ -236,7 +213,6 @@ async def handle_media_stream(websocket: WebSocket):
                 except Exception as e:
                     print(f"OpenAI session renewal failed: {e}")
 
-        # --- Run all concurrently ---
         await asyncio.gather(
             connection_manager.receive_from_twilio(handle_media_event, handle_stream_start, handle_mark_event),
             openai_receiver(),
@@ -276,4 +252,3 @@ async def handle_speech_started_event(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=Config.PORT)
-
