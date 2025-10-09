@@ -72,17 +72,41 @@ async def dashboard_stream(websocket: WebSocket):
         dashboard_clients.discard(websocket)
 
 
-async def broadcast_transcript(transcript_obj: dict):
-    payload = json.dumps(transcript_obj)
+class Log:
+    @staticmethod
+    def header(msg):
+        print(f"\n=== {msg} ===")
+
+    @staticmethod
+    def subheader(msg):
+        print(f"\n--- {msg} ---")
+
+    @staticmethod
+    def event(msg, data=None):
+        print(f"[EVENT] {msg}: {data if data else ''}")
+
+    @staticmethod
+    def info(msg):
+        print(f"[INFO] {msg}")
+
+    @staticmethod
+    def error(msg):
+        print(f"[ERROR] {msg}")
+
+    @staticmethod
+    def debug(msg):
+        print(f"[DEBUG] {msg}")
+
+
+async def broadcast_transcript(payload_obj: dict):
+    """Send transcript data to all connected dashboard clients."""
+    payload = json.dumps(payload_obj)
     for client in list(dashboard_clients):
         try:
-            if hasattr(client, "call_id") and client.call_id:
-                if transcript_obj.get("callSid") != client.call_id:
-                    continue
             await client.send_text(payload)
         except Exception:
             dashboard_clients.discard(client)
-
+            
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
