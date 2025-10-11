@@ -35,7 +35,7 @@ class TwilioService:
         
         # Add greeting with punctuation for better text-to-speech flow
         response.say(
-            "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API",
+            "Testing Finlumina-Vox",
             voice=cls.TWILIO_VOICE
         )
         response.pause(length=1)
