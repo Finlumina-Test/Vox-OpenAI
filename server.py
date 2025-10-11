@@ -2,7 +2,6 @@ import os
 import json
 import base64
 import asyncio
-import time
 import websockets
 from typing import Set
 from fastapi import FastAPI, WebSocket, Request
@@ -14,7 +13,7 @@ from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from config import Config
 from services import (
     WebSocketConnectionManager,
-    TwilioService,
+    TwilioService, 
     TwilioAudioProcessor,
     OpenAIService,
     AudioService
@@ -74,18 +73,16 @@ async def dashboard_stream(websocket: WebSocket):
 
 
 async def broadcast_transcript(transcript_obj: dict):
-    """Broadcast a transcript object to all connected dashboard clients."""
     payload = json.dumps(transcript_obj)
     for client in list(dashboard_clients):
         try:
-            # optional per-client filtering if client has call_id set
             if hasattr(client, "call_id") and client.call_id:
                 if transcript_obj.get("callSid") != client.call_id:
                     continue
             await client.send_text(payload)
         except Exception:
             dashboard_clients.discard(client)
-
+            
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -94,7 +91,6 @@ async def index_page():
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
-    # Delegate to TwilioService for building the TwiML response
     return TwilioService.create_incoming_call_response(request)
 
 
@@ -112,20 +108,23 @@ async def handle_media_stream(websocket: WebSocket):
         await openai_service.initialize_session(connection_manager)
 
         # ---------------------------
-        # Broadcast Helper (local to this handler)
+        # Broadcast Helper
         # ---------------------------
         async def broadcast_to_dashboards(payload_obj: dict):
             """Send transcript updates to all connected dashboards."""
-            # Normalize timestamp to integer epoch seconds
-            try:
-                if "timestamp" not in payload_obj or payload_obj["timestamp"] is None:
-                    payload_obj["timestamp"] = int(time.time())
-                else:
-                    ts = float(payload_obj["timestamp"])
-                    # if ts is already epoch seconds, keep; otherwise coerce
-                    payload_obj["timestamp"] = int(ts)
-            except Exception:
+            # Normalize timestamp to epoch seconds (int)
+            if "timestamp" not in payload_obj or payload_obj["timestamp"] is None:
                 payload_obj["timestamp"] = int(time.time())
+            else:
+                # if float like asyncio loop time, convert to epoch seconds
+                try:
+                    ts = float(payload_obj["timestamp"])
+                    if ts > 1e9:  # it's already epoch ms or epoch sec? handle common cases
+                        payload_obj["timestamp"] = int(ts)
+                    else:
+                        payload_obj["timestamp"] = int(ts)
+                except Exception:
+                    payload_obj["timestamp"] = int(time.time())
 
             payload = json.dumps(payload_obj)
             for client in list(dashboard_clients):
@@ -295,34 +294,3 @@ async def handle_media_stream(websocket: WebSocket):
         Log.error(f"Error in media stream handler: {e}")
     finally:
         await connection_manager.close_openai_connection()
-
-
-async def handle_speech_started_event(
-    connection_manager: WebSocketConnectionManager,
-    openai_service: OpenAIService,
-    audio_service: AudioService
-):
-    Log.subheader("Handling speech started event")
-
-    if audio_service.should_handle_interruption():
-        elapsed_time = audio_service.calculate_interruption_timing()
-        current_item_id = audio_service.get_current_item_id()
-
-        if elapsed_time is not None and current_item_id:
-            await openai_service.handle_interruption(
-                connection_manager,
-                audio_service.timing_manager.current_timestamp,
-                audio_service.timing_manager.response_start_timestamp,
-                current_item_id
-            )
-
-            clear_message = audio_service.create_clear_message(connection_manager.state.stream_sid)
-            await connection_manager.send_to_twilio(clear_message)
-            audio_service.reset_interruption_state()
-
-
-# Ensure we start uvicorn if this file is run directly (Render's default runs `python server.py`)
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", getattr(Config, "PORT", 8000)))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
