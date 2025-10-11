@@ -141,145 +141,158 @@ async def handle_media_stream(websocket: WebSocket):
     audio_service = AudioService()
 
     try:
-        # Connect to OpenAI
+        # --- Connect to OpenAI ---
         try:
             await connection_manager.connect_to_openai()
-        except Exception as e:
-            Log.error(f"OpenAI connection failed: {e}")
-            await connection_manager.close_openai_connection()
-            return
-
-        try:
             await openai_service.initialize_session(connection_manager)
         except Exception as e:
-            Log.error(f"OpenAI session initialization failed: {e}")
-            await connection_manager.close_openai_connection()
+            Log.error(f"OpenAI setup failed: {e}")
             return
 
         # ---------------------------
-        # Twilio -> Server handler
+        # Dashboard Broadcast Helper (non-blocking)
+        # ---------------------------
+        async def dashboard_broadcast(payload: dict):
+            asyncio.create_task(broadcast_to_dashboards(payload))
+
+        # ---------------------------
+        # Twilio Media Input Handler (Caller side)
         # ---------------------------
         async def handle_media_event(data: dict):
+            # Handle Twilio audio packets
             if data.get("event") == "media":
-                media = data.get("media") or {}
-                payload_b64 = media.get("payload")
+                payload_b64 = (data.get("media") or {}).get("payload")
                 if payload_b64:
-                    aud = {
+                    asyncio.create_task(broadcast_to_dashboards({
                         "messageType": "audio",
                         "speaker": "Caller",
                         "audio": payload_b64,
                         "encoding": "base64",
-                        "timestamp": data.get("timestamp") or int(time.time()),
-                    }
-                    broadcast_to_dashboards_nonblocking(aud)
+                        "timestamp": data.get("timestamp") or int(time.time())
+                    }))
 
+            # Handle Twilio text (if any)
+            if "text" in data and isinstance(data["text"], str) and data["text"].strip():
+                asyncio.create_task(broadcast_to_dashboards({
+                    "messageType": "text",
+                    "speaker": "Caller",
+                    "text": data["text"].strip(),
+                    "timestamp": data.get("timestamp") or int(time.time())
+                }))
+
+            # Forward caller audio to OpenAI
             if connection_manager.is_openai_connected():
                 try:
                     audio_message = audio_service.process_incoming_audio(data)
                     if audio_message:
                         await connection_manager.send_to_openai(audio_message)
                 except Exception as e:
-                    log_nonblocking(Log.error, f"[media] failed to send incoming audio: {e}")
-
-            if "text" in data and isinstance(data["text"], str) and data["text"].strip():
-                txt_obj = {
-                    "messageType": "text",
-                    "speaker": "Caller",
-                    "text": data["text"].strip(),
-                    "timestamp": data.get("timestamp") or int(time.time()),
-                }
-                broadcast_to_dashboards_nonblocking(txt_obj)
+                    Log.debug(f"[media] incoming audio processing failed: {e}")
 
         # ---------------------------
-        # OpenAI -> Twilio handler
+        # OpenAI Stream Event Handler (AI side)
         # ---------------------------
         async def handle_audio_delta(response: dict):
+            # --- Extract Caller Text (if any) ---
             try:
                 caller_txt = openai_service.extract_caller_transcript(response)
                 if caller_txt:
-                    broadcast_to_dashboards_nonblocking({
+                    asyncio.create_task(broadcast_to_dashboards({
                         "messageType": "text",
                         "speaker": "Caller",
                         "text": caller_txt,
-                        "timestamp": response.get("timestamp") or int(time.time()),
-                    })
+                        "timestamp": int(time.time())
+                    }))
             except Exception:
                 pass
 
+            # --- Extract Assistant Text (if any) ---
+            try:
+                transcript_text = openai_service.extract_transcript_text(response)
+                if transcript_text:
+                    asyncio.create_task(broadcast_to_dashboards({
+                        "messageType": "text",
+                        "speaker": "AI",
+                        "text": transcript_text,
+                        "timestamp": int(time.time())
+                    }))
+            except Exception:
+                pass
+
+            # --- Handle Audio Response ---
             audio_data = openai_service.extract_audio_response_data(response) or {}
             delta = audio_data.get("delta")
-            if delta is not None:
+
+            if delta:
                 try:
                     delta_b64 = (
                         base64.b64encode(delta).decode("ascii")
                         if isinstance(delta, (bytes, bytearray))
                         else delta
                     )
-                    broadcast_to_dashboards_nonblocking({
+                    # Send to dashboard (non-blocking)
+                    asyncio.create_task(broadcast_to_dashboards({
                         "messageType": "audio",
                         "speaker": "AI",
                         "audio": delta_b64,
                         "encoding": "base64",
-                        "timestamp": response.get("timestamp") or int(time.time()),
-                    })
+                        "timestamp": response.get("timestamp") or int(time.time())
+                    }))
+                    # Send to Twilio
+                    if connection_manager.state.stream_sid:
+                        audio_message = audio_service.process_outgoing_audio(response, connection_manager.state.stream_sid)
+                        if audio_message:
+                            await connection_manager.send_to_twilio(audio_message)
+                            mark_msg = audio_service.create_mark_message(connection_manager.state.stream_sid)
+                            await connection_manager.send_to_twilio(mark_msg)
                 except Exception as e:
-                    log_nonblocking(Log.error, f"[dashboard] failed to broadcast AI audio: {e}")
+                    Log.error(f"[audio->twilio] AI audio send failed: {e}")
 
-            transcript_text = None
-            if hasattr(openai_service, "extract_transcript_text"):
-                try:
-                    transcript_text = openai_service.extract_transcript_text(response)
-                except Exception:
-                    pass
-
-            if transcript_text:
-                broadcast_to_dashboards_nonblocking({
-                    "messageType": "text",
-                    "speaker": "AI",
-                    "text": transcript_text,
-                    "timestamp": response.get("timestamp") or int(time.time()),
-                })
-
-            # send back to Twilio (realtime)
-            if audio_data and getattr(connection_manager.state, "stream_sid", None):
-                try:
-                    audio_message = audio_service.process_outgoing_audio(
-                        response, connection_manager.state.stream_sid
-                    )
-                    if audio_message:
-                        await connection_manager.send_to_twilio(audio_message)
-                        mark_msg = audio_service.create_mark_message(connection_manager.state.stream_sid)
-                        await connection_manager.send_to_twilio(mark_msg)
-                except Exception as e:
-                    Log.error(f"[audio->twilio] failed to send audio: {e}")
-
+        # ---------------------------
+        # Speech Start Handler
+        # ---------------------------
         async def handle_speech_started():
+            Log.info("Speech started detected (OpenAI)")
+            if openai_service.is_goodbye_pending():
+                return
             try:
                 await connection_manager.send_mark_to_twilio()
             except Exception:
                 pass
 
+        # ---------------------------
+        # Other OpenAI Event Handler
+        # ---------------------------
         async def handle_other_openai_event(response: dict):
             openai_service.process_event_for_logging(response)
 
-        # background receivers
+        # ---------------------------
+        # Receivers
+        # ---------------------------
         async def openai_receiver():
             await connection_manager.receive_from_openai(
-                handle_audio_delta, handle_speech_started, handle_other_openai_event
+                handle_audio_delta,
+                handle_speech_started,
+                handle_other_openai_event,
             )
 
         async def renew_openai_session():
             while True:
                 await asyncio.sleep(getattr(Config, "REALTIME_SESSION_RENEW_SECONDS", 1200))
                 try:
+                    Log.info("Renewing OpenAI session…")
                     await connection_manager.close_openai_connection()
                     await connection_manager.connect_to_openai()
                     await openai_service.initialize_session(connection_manager)
+                    Log.info("Session renewed successfully.")
                 except Exception as e:
                     Log.error(f"Session renewal failed: {e}")
 
+        # ---------------------------
+        # Start concurrent tasks
+        # ---------------------------
         async def on_start_cb(stream_sid: str):
-            Log.event("Twilio Start", {"streamSid": stream_sid})
+            Log.event("Twilio Stream Start", {"streamSid": stream_sid})
 
         async def on_mark_cb():
             try:
@@ -288,7 +301,11 @@ async def handle_media_stream(websocket: WebSocket):
                 pass
 
         await asyncio.gather(
-            connection_manager.receive_from_twilio(handle_media_event, on_start_cb, on_mark_cb),
+            connection_manager.receive_from_twilio(
+                handle_media_event,
+                on_start_cb,
+                on_mark_cb,
+            ),
             openai_receiver(),
             renew_openai_session(),
         )
@@ -301,12 +318,3 @@ async def handle_media_stream(websocket: WebSocket):
         except Exception:
             pass
 
-
-# ---------------------------
-# Run
-# ---------------------------
-if __name__ == "__main__":
-    import uvicorn
-    print("🚀 Starting Finlumina server...")
-    port = int(os.getenv("PORT", getattr(Config, "PORT", 8000)))
-    uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info")
