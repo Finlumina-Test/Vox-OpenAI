@@ -39,44 +39,50 @@ dashboard_clients: Set[WebSocket] = set()
 @app.websocket("/dashboard-stream")
 async def dashboard_stream(websocket: WebSocket):
     await websocket.accept()
-    print("✅ Dashboard connected")
+    DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN")
+    client_call_id = None
 
-    # Send fake caller and AI messages
-    fake_transcripts = [
-        {
-            "speaker": "Caller",
-            "text": "Hello, I’d like to know more about Finlumina Vox.",
-            "timestamp": "2025-10-11T21:00:05Z"
-        },
-        {
-            "speaker": "AI",
-            "text": "Of course! Finlumina Vox is an AI-powered voice agent designed to help automate client interactions and calls.",
-            "timestamp": "2025-10-11T21:00:07Z"
-        },
-        {
-            "speaker": "Caller",
-            "text": "That sounds great. How does it handle real-time transcription?",
-            "timestamp": "2025-10-11T21:00:10Z"
-        },
-        {
-            "speaker": "AI",
-            "text": "It streams your call audio to Whisper for transcription and GPT for intelligent responses — all in real time.",
-            "timestamp": "2025-10-11T21:00:13Z"
-        }
-    ]
+    if DASHBOARD_TOKEN:
+        provided = websocket.query_params.get("token") or websocket.headers.get("x-dashboard-token")
+        if provided != DASHBOARD_TOKEN:
+            await websocket.close(code=4003)
+            return
 
-    # Send them sequentially to simulate a real conversation
-    for msg in fake_transcripts:
-        await websocket.send_json(msg)
-        await asyncio.sleep(2)
+    dashboard_clients.add(websocket)
 
-    # Keep the connection alive (so client doesn't auto-close)
     try:
-        while True:
-            await asyncio.sleep(30)
-    except WebSocketDisconnect:
-        print("❌ Dashboard disconnected")
+        try:
+            msg = await asyncio.wait_for(websocket.receive_text(), timeout=5)
+            data = json.loads(msg)
+            client_call_id = data.get("callId")
+        except (asyncio.TimeoutError, json.JSONDecodeError, KeyError):
+            client_call_id = None
 
+        while True:
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
+            except asyncio.TimeoutError:
+                try:
+                    await websocket.send_text(json.dumps({"type": "ping"}))
+                except Exception:
+                    break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        dashboard_clients.discard(websocket)
+
+
+async def broadcast_transcript(transcript_obj: dict):
+    payload = json.dumps(transcript_obj)
+    for client in list(dashboard_clients):
+        try:
+            if hasattr(client, "call_id") and client.call_id:
+                if transcript_obj.get("callSid") != client.call_id:
+                    continue
+            await client.send_text(payload)
+        except Exception:
+            dashboard_clients.discard(client)
+            
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -101,27 +107,38 @@ async def handle_media_stream(websocket: WebSocket):
         await connection_manager.connect_to_openai()
         await openai_service.initialize_session(connection_manager)
 
+        # ---------------------------
+        # Broadcast Helper
+        # ---------------------------
+        async def broadcast_to_dashboards(payload_obj: dict):
+            """Send transcript updates to all connected dashboards."""
+            payload = json.dumps(payload_obj)
+            for client in list(dashboard_clients):
+                try:
+                    await client.send_text(payload)
+                except Exception:
+                    dashboard_clients.discard(client)
+
+        # ---------------------------
+        # Handle incoming audio/media events from Twilio (Caller side)
+        # ---------------------------
         async def handle_media_event(data: dict) -> None:
             if connection_manager.is_openai_connected():
                 audio_message = audio_service.process_incoming_audio(data)
                 if audio_message:
                     await connection_manager.send_to_openai(audio_message)
 
+            # Handle caller text transcription (if Whisper/GPT produces it)
             if "text" in data:
-                payload_obj = {
-                    "id": data.get("id") or str(int(asyncio.get_event_loop().time() * 1000)),
+                transcript_obj = {
                     "callSid": getattr(connection_manager.state, "call_sid", None),
                     "streamSid": getattr(connection_manager.state, "stream_sid", None),
-                    "speaker": "User",
+                    "speaker": "Caller",
                     "text": data["text"],
                     "timestamp": data.get("timestamp") or (asyncio.get_event_loop().time())
                 }
-                payload = json.dumps(payload_obj)
-                for client in list(dashboard_clients):
-                    try:
-                        await client.send_text(payload)
-                    except Exception:
-                        dashboard_clients.discard(client)
+                print(f"[dashboard] Caller says: {transcript_obj['text']}")
+                await broadcast_to_dashboards(transcript_obj)
 
         async def handle_stream_start(stream_sid: str) -> None:
             Log.event("Twilio stream started", {"streamSid": stream_sid})
@@ -129,34 +146,32 @@ async def handle_media_stream(websocket: WebSocket):
         async def handle_mark_event() -> None:
             audio_service.handle_mark_event()
 
+        # ---------------------------
+        # Handle AI responses (OpenAI output)
+        # ---------------------------
         async def handle_audio_delta(response: dict) -> None:
             audio_data = openai_service.extract_audio_response_data(response)
-
             transcript_text = None
+
             if hasattr(openai_service, "extract_transcript_text"):
                 try:
                     transcript_text = openai_service.extract_transcript_text(response)
                 except Exception:
                     transcript_text = None
 
+            # Broadcast AI transcript updates
             if transcript_text:
-                payload_obj = {
-                    "id": response.get("id") or str(int(asyncio.get_event_loop().time() * 1000)),
+                transcript_obj = {
                     "callSid": getattr(connection_manager.state, "call_sid", None),
                     "streamSid": getattr(connection_manager.state, "stream_sid", None),
                     "speaker": "AI",
                     "text": transcript_text,
                     "timestamp": response.get("timestamp") or (asyncio.get_event_loop().time())
                 }
-                payload = json.dumps(payload_obj)
-                print(f"[dashboard] Broadcasting transcript: {payload}")
-                print(f"[dashboard] Connected clients: {len(dashboard_clients)}")
-                for client in list(dashboard_clients):
-                    try:
-                        await client.send_text(payload)
-                    except Exception:
-                        dashboard_clients.discard(client)
+                print(f"[dashboard] AI says: {transcript_obj['text']}")
+                await broadcast_to_dashboards(transcript_obj)
 
+            # Handle sending audio back to Twilio
             if audio_data and connection_manager.state.stream_sid:
                 if openai_service.is_goodbye_pending():
                     openai_service.mark_goodbye_audio_heard(audio_data.get('item_id'))
@@ -190,6 +205,9 @@ async def handle_media_stream(websocket: WebSocket):
             if openai_service.should_finalize_on_event(response):
                 await openai_service.finalize_goodbye(connection_manager)
 
+        # ---------------------------
+        # OpenAI & Twilio listeners
+        # ---------------------------
         async def openai_receiver():
             await connection_manager.receive_from_openai(
                 handle_audio_delta, handle_speech_started, handle_other_openai_event
@@ -207,6 +225,7 @@ async def handle_media_stream(websocket: WebSocket):
                 except Exception as e:
                     print(f"OpenAI session renewal failed: {e}")
 
+        # Run all background coroutines
         await asyncio.gather(
             connection_manager.receive_from_twilio(handle_media_event, handle_stream_start, handle_mark_event),
             openai_receiver(),
