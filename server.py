@@ -153,7 +153,7 @@ async def handle_media_stream(websocket: WebSocket):
         # Dashboard Broadcast Helper (non-blocking)
         # ---------------------------
         async def dashboard_broadcast(payload: dict):
-            asyncio.create_task(broadcast_to_dashboards(payload))
+            asyncio.create_task(broadcast_to_dashboards_nonblocking(payload))
 
         # ---------------------------
         # Twilio Media Input Handler (Caller side)
@@ -163,7 +163,7 @@ async def handle_media_stream(websocket: WebSocket):
             if data.get("event") == "media":
                 payload_b64 = (data.get("media") or {}).get("payload")
                 if payload_b64:
-                    asyncio.create_task(broadcast_to_dashboards({
+                    asyncio.create_task(broadcast_to_dashboards_nonblocking({
                         "messageType": "audio",
                         "speaker": "Caller",
                         "audio": payload_b64,
@@ -173,7 +173,7 @@ async def handle_media_stream(websocket: WebSocket):
 
             # Handle Twilio text (if any)
             if "text" in data and isinstance(data["text"], str) and data["text"].strip():
-                asyncio.create_task(broadcast_to_dashboards({
+                asyncio.create_task(broadcast_to_dashboards_nonblocking({
                     "messageType": "text",
                     "speaker": "Caller",
                     "text": data["text"].strip(),
@@ -197,7 +197,7 @@ async def handle_media_stream(websocket: WebSocket):
             try:
                 caller_txt = openai_service.extract_caller_transcript(response)
                 if caller_txt:
-                    asyncio.create_task(broadcast_to_dashboards({
+                    asyncio.create_task(broadcast_to_dashboards_nonblocking({
                         "messageType": "text",
                         "speaker": "Caller",
                         "text": caller_txt,
@@ -210,7 +210,7 @@ async def handle_media_stream(websocket: WebSocket):
             try:
                 transcript_text = openai_service.extract_transcript_text(response)
                 if transcript_text:
-                    asyncio.create_task(broadcast_to_dashboards({
+                    asyncio.create_task(broadcast_to_dashboards_nonblocking({
                         "messageType": "text",
                         "speaker": "AI",
                         "text": transcript_text,
@@ -231,7 +231,7 @@ async def handle_media_stream(websocket: WebSocket):
                         else delta
                     )
                     # Send to dashboard (non-blocking)
-                    asyncio.create_task(broadcast_to_dashboards({
+                    asyncio.create_task(broadcast_to_dashboards_nonblocking({
                         "messageType": "audio",
                         "speaker": "AI",
                         "audio": delta_b64,
@@ -318,3 +318,17 @@ async def handle_media_stream(websocket: WebSocket):
         except Exception:
             pass
 
+
+# ---------------------------
+# Proper entry point for Render + production
+# ---------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        log_level="info",
+        reload=False,  # Set True only for dev
+    )
