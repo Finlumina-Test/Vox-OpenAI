@@ -132,9 +132,20 @@ async def handle_media_stream(websocket: WebSocket):
     audio_service = AudioService()
 
     try:
-        await connection_manager.connect_to_openai()
-        await openai_service.initialize_session(connection_manager)
+        # --- Connect to OpenAI safely ---
+        connected = await connection_manager.connect_to_openai()
+        if not connected:
+            Log.error("OpenAI connection failed — cannot start media stream.")
+            return
 
+        initialized = await openai_service.initialize_session(connection_manager)
+        if initialized is None:
+            Log.error("OpenAI session initialization failed — aborting stream.")
+            return
+
+        # ---------------------------
+        # Twilio incoming media/audio
+        # ---------------------------
         async def handle_media_event(data: dict):
             if data.get("event") == "media":
                 media = data.get("media") or {}
@@ -163,11 +174,15 @@ async def handle_media_stream(websocket: WebSocket):
                 }
                 await broadcast_to_dashboards(txt_obj)
 
+        # ---------------------------
+        # OpenAI Audio + Text output
+        # ---------------------------
         async def handle_audio_delta(response: dict):
             audio_data = openai_service.extract_audio_response_data(response) or {}
             delta = audio_data.get("delta")
             transcript_text = None
 
+            # Try extracting assistant transcript text
             if hasattr(openai_service, "extract_transcript_text"):
                 try:
                     transcript_text = openai_service.extract_transcript_text(response)
@@ -183,12 +198,10 @@ async def handle_media_stream(websocket: WebSocket):
                 }
                 await broadcast_to_dashboards(bot_text_obj)
 
+            # Send AI audio to dashboard + Twilio
             if delta:
                 try:
-                    if isinstance(delta, bytes):
-                        delta_b64 = base64.b64encode(delta).decode("ascii")
-                    else:
-                        delta_b64 = delta
+                    delta_b64 = base64.b64encode(delta).decode("ascii") if isinstance(delta, bytes) else delta
                     ai_audio = {
                         "messageType": "audio",
                         "speaker": "AI",
@@ -230,13 +243,21 @@ async def handle_media_stream(websocket: WebSocket):
                 try:
                     Log.info("Renewing OpenAI session…")
                     await connection_manager.close_openai_connection()
-                    await connection_manager.connect_to_openai()
-                    await openai_service.initialize_session(connection_manager)
+                    ok = await connection_manager.connect_to_openai()
+                    if ok:
+                        await openai_service.initialize_session(connection_manager)
+                        Log.info("Session renewed successfully.")
+                    else:
+                        Log.error("Session renewal failed: unable to reconnect.")
                 except Exception as e:
                     Log.error(f"Session renewal failed: {e}")
 
         await asyncio.gather(
-            connection_manager.receive_from_twilio(handle_media_event, lambda sid: Log.event("Twilio stream start", {"sid": sid}), lambda: audio_service.handle_mark_event()),
+            connection_manager.receive_from_twilio(
+                handle_media_event,
+                lambda sid: Log.event("Twilio stream start", {"sid": sid}),
+                lambda: audio_service.handle_mark_event()
+            ),
             openai_receiver(),
             renew_openai_session(),
         )
@@ -245,12 +266,3 @@ async def handle_media_stream(websocket: WebSocket):
         Log.error(f"Error in media stream handler: {e}")
     finally:
         await connection_manager.close_openai_connection()
-
-
-# ---------------------------
-# Entry point for Render
-# ---------------------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", getattr(Config, "PORT", 10000)))
-    uvicorn.run(app, host="0.0.0.0", port=port)
