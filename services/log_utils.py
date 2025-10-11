@@ -48,3 +48,7 @@ class Log:
         except Exception:
             print(str(data))
         Log.line()
+
+    @staticmethod
+    def debug(msg: str) -> None:
+        print(f"[{Log._ts()}] DEBUG: {msg}")
