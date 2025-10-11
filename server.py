@@ -39,49 +39,43 @@ dashboard_clients: Set[WebSocket] = set()
 @app.websocket("/dashboard-stream")
 async def dashboard_stream(websocket: WebSocket):
     await websocket.accept()
-    DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN")
-    client_call_id = None
+    print("✅ Dashboard connected")
 
-    if DASHBOARD_TOKEN:
-        provided = websocket.query_params.get("token") or websocket.headers.get("x-dashboard-token")
-        if provided != DASHBOARD_TOKEN:
-            await websocket.close(code=4003)
-            return
+    # Send fake caller and AI messages
+    fake_transcripts = [
+        {
+            "speaker": "Caller",
+            "text": "Hello, I’d like to know more about Finlumina Vox.",
+            "timestamp": "2025-10-11T21:00:05Z"
+        },
+        {
+            "speaker": "AI",
+            "text": "Of course! Finlumina Vox is an AI-powered voice agent designed to help automate client interactions and calls.",
+            "timestamp": "2025-10-11T21:00:07Z"
+        },
+        {
+            "speaker": "Caller",
+            "text": "That sounds great. How does it handle real-time transcription?",
+            "timestamp": "2025-10-11T21:00:10Z"
+        },
+        {
+            "speaker": "AI",
+            "text": "It streams your call audio to Whisper for transcription and GPT for intelligent responses — all in real time.",
+            "timestamp": "2025-10-11T21:00:13Z"
+        }
+    ]
 
-    dashboard_clients.add(websocket)
+    # Send them sequentially to simulate a real conversation
+    for msg in fake_transcripts:
+        await websocket.send_json(msg)
+        await asyncio.sleep(2)
 
+    # Keep the connection alive (so client doesn't auto-close)
     try:
-        try:
-            msg = await asyncio.wait_for(websocket.receive_text(), timeout=5)
-            data = json.loads(msg)
-            client_call_id = data.get("callId")
-        except (asyncio.TimeoutError, json.JSONDecodeError, KeyError):
-            client_call_id = None
-
         while True:
-            try:
-                await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
-            except asyncio.TimeoutError:
-                try:
-                    await websocket.send_text(json.dumps({"type": "ping"}))
-                except Exception:
-                    break
+            await asyncio.sleep(30)
     except WebSocketDisconnect:
-        pass
-    finally:
-        dashboard_clients.discard(websocket)
-
-
-async def broadcast_transcript(transcript_obj: dict):
-    payload = json.dumps(transcript_obj)
-    for client in list(dashboard_clients):
-        try:
-            if hasattr(client, "call_id") and client.call_id:
-                if transcript_obj.get("callSid") != client.call_id:
-                    continue
-            await client.send_text(payload)
-        except Exception:
-            dashboard_clients.discard(client)
+        print("❌ Dashboard disconnected")
 
 
 @app.get("/", response_class=JSONResponse)
