@@ -67,7 +67,7 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime",
-                "output_modalities": ["audio"],
+                "output_modalities": ["audio", "text"], 
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
