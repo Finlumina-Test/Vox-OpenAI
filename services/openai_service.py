@@ -3,6 +3,10 @@ import asyncio
 from typing import Optional, Dict, Any
 from config import Config
 from services.log_utils import Log
+import base64
+from openai import OpenAI
+
+client = OpenAI()
 
 
 class OpenAIEventHandler:
@@ -198,6 +202,31 @@ class OpenAIConversationManager:
         return current_timestamp - response_start_timestamp
 
 
+# -------------------
+# --- WHISPER SERVICE ---
+# -------------------
+class WhisperService:
+    """
+    Handles asynchronous parallel transcription with Whisper-1.
+    """
+    async def transcribe_chunk(self, audio_b64: str, speaker: str = "Caller"):
+        audio_bytes = base64.b64decode(audio_b64)
+        try:
+            resp = await client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_bytes
+            )
+            text = resp.text
+            broadcast_to_dashboards_nonblocking({
+                "messageType": "text",
+                "speaker": speaker,
+                "text": text,
+                "timestamp": int(asyncio.get_event_loop().time()),
+            })
+        except Exception as e:
+            Log.error(f"Whisper transcription failed: {e}")
+
+
 class OpenAIService:
     """
     Unified service for OpenAI Realtime API:
@@ -215,6 +244,9 @@ class OpenAIService:
         self._goodbye_audio_heard: bool = False
         self._goodbye_item_id: Optional[str] = None
         self._goodbye_watchdog: Optional[asyncio.Task] = None
+
+        # --- NEW WHISPER SERVICE ---
+        self.whisper_service = WhisperService()
 
     # --- SESSION & GREETING ---
     async def initialize_session(self, connection_manager) -> None:
@@ -390,14 +422,10 @@ class OpenAIService:
 
     # --- TRANSCRIPT EXTRACTION ---
     def extract_transcript_text(self, event: Dict[str, Any]) -> Optional[str]:
-        """
-        Extract assistant (bot) transcript from events.
-        """
         try:
             etype = event.get("type", "")
             Log.debug(f"[openai] Received event type for transcript extraction: {etype}")
 
-            # Streamed text delta
             if etype in ("response.output_text.delta", "response.output_text.delta.text"):
                 delta = event.get("delta")
                 if isinstance(delta, str):
@@ -405,7 +433,6 @@ class OpenAIService:
                 if isinstance(delta, dict):
                     return delta.get("text") or delta.get("value") or None
 
-            # Completed assistant message
             if etype == "response.done":
                 resp = event.get("response") or {}
                 for item in (resp.get("output") or []):
@@ -429,9 +456,6 @@ class OpenAIService:
         return None
 
     def extract_caller_transcript(self, event: Dict[str, Any]) -> Optional[str]:
-        """
-        Extract caller transcript from real-time events.
-        """
         try:
             etype = event.get("type", "")
             if etype in ("input_audio.transcript", "input_audio.delta"):
