@@ -212,7 +212,7 @@ class OpenAIService:
         self.session_manager = OpenAISessionManager()
         self.conversation_manager = OpenAIConversationManager()
         self.event_handler = OpenAIEventHandler()
-        self.transcription_service = TranscriptionService()
+        self.whisper_service = TranscriptionService()
         self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
         self._pending_goodbye: bool = False
         self._goodbye_audio_heard: bool = False
