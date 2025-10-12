@@ -174,7 +174,7 @@ async def handle_media_stream(websocket: WebSocket):
                     broadcast_to_dashboards_nonblocking(aud)
 
                     # --- Parallel Whisper transcription ---
-                    asyncio.create_task(openai_service.whisper_service.transcribe_chunk(payload_b64, speaker="Caller"))
+                    asyncio.create_task(openai_service.handle_transcription(base64.b64decode(payload_b64), source="Caller"))
 
                 if connection_manager.is_openai_connected():
                     try:
@@ -228,7 +228,7 @@ async def handle_media_stream(websocket: WebSocket):
                     })
 
                     # --- Parallel Whisper transcription ---
-                    asyncio.create_task(openai_service.whisper_service.transcribe_chunk(delta_b64, speaker="AI"))
+                   asyncio.create_task(openai_service.handle_transcription(base64.b64decode(delta_b64), source="AI"))
 
                     if audio_data and getattr(connection_manager.state, "stream_sid", None):
                         audio_message = audio_service.process_outgoing_audio(
