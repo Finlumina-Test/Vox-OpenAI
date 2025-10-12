@@ -3,8 +3,6 @@ import asyncio
 from typing import Optional, Dict, Any
 from config import Config
 from services.log_utils import Log
-import base64
-from openai import OpenAI
 
 client = OpenAI()
 
