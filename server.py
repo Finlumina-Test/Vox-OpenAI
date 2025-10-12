@@ -174,61 +174,62 @@ async def handle_media_stream(websocket: WebSocket):
                     broadcast_to_dashboards_nonblocking(aud)
 
                     # --- Parallel Whisper transcription ---
-                    asyncio.create_task(openai_service.handle_transcription(base64.b64decode(payload_b64), source="Caller"))
+asyncio.create_task(openai_service.handle_transcription(base64.b64decode(payload_b64), source="Caller"))
 
-                if connection_manager.is_openai_connected():
-                    try:
-                        audio_message = audio_service.process_incoming_audio(data)
-                        if audio_message:
-                            await connection_manager.send_to_openai(audio_message)
-                    except Exception as e:
-                        log_nonblocking(Log.error, f"[media] failed to send incoming audio: {e}")
+if connection_manager.is_openai_connected():
+    try:
+        audio_message = audio_service.process_incoming_audio(data)
+        if audio_message:
+            await connection_manager.send_to_openai(audio_message)
+    except Exception as e:
+        log_nonblocking(Log.error, f"[media] failed to send incoming audio: {e}")
 
-            if "text" in data and isinstance(data["text"], str) and data["text"].strip():
-                txt_obj = {
-                    "messageType": "text",
-                    "speaker": "Caller",
-                    "text": data["text"].strip(),
-                    "timestamp": data.get("timestamp") or int(time.time()),
-                }
-                broadcast_to_dashboards_nonblocking(txt_obj)
+if "text" in data and isinstance(data["text"], str) and data["text"].strip():
+    txt_obj = {
+        "messageType": "text",
+        "speaker": "Caller",
+        "text": data["text"].strip(),
+        "timestamp": data.get("timestamp") or int(time.time()),
+    }
+    broadcast_to_dashboards_nonblocking(txt_obj)
 
-        # ---------------------------
-        # OpenAI -> Twilio handler
-        # ---------------------------
-        async def handle_audio_delta(response: dict):
-            try:
-                caller_txt = openai_service.extract_caller_transcript(response)
-                if caller_txt:
-                    broadcast_to_dashboards_nonblocking({
-                        "messageType": "text",
-                        "speaker": "Caller",
-                        "text": caller_txt,
-                        "timestamp": response.get("timestamp") or int(time.time()),
-                    })
-            except Exception:
-                pass
+# ---------------------------
+# OpenAI -> Twilio handler
+# ---------------------------
+async def handle_audio_delta(response: dict):
+    try:
+        caller_txt = openai_service.extract_caller_transcript(response)
+        if caller_txt:
+            broadcast_to_dashboards_nonblocking({
+                "messageType": "text",
+                "speaker": "Caller",
+                "text": caller_txt,
+                "timestamp": response.get("timestamp") or int(time.time()),
+            })
+    except Exception:
+        pass
 
-            audio_data = openai_service.extract_audio_response_data(response) or {}
-            delta = audio_data.get("delta")
+    audio_data = openai_service.extract_audio_response_data(response) or {}
+    delta = audio_data.get("delta")
 
-            if delta is not None:
-                try:
-                    delta_b64 = (
-                        base64.b64encode(delta).decode("ascii")
-                        if isinstance(delta, (bytes, bytearray))
-                        else delta
-                    )
-                    broadcast_to_dashboards_nonblocking({
-                        "messageType": "audio",
-                        "speaker": "AI",
-                        "audio": delta_b64,
-                        "encoding": "base64",
-                        "timestamp": response.get("timestamp") or int(time.time()),
-                    })
+    if delta is not None:
+        try:
+            delta_b64 = (
+                base64.b64encode(delta).decode("ascii")
+                if isinstance(delta, (bytes, bytearray))
+                else delta
+            )
+            broadcast_to_dashboards_nonblocking({
+                "messageType": "audio",
+                "speaker": "AI",
+                "audio": delta_b64,
+                "encoding": "base64",
+                "timestamp": response.get("timestamp") or int(time.time()),
+            })
 
-                    # --- Parallel Whisper transcription ---
-                   asyncio.create_task(openai_service.handle_transcription(base64.b64decode(delta_b64), source="AI"))
+            # --- Parallel Whisper transcription ---
+            asyncio.create_task(openai_service.handle_transcription(base64.b64decode(delta_b64), source="AI"))
+
 
                     if audio_data and getattr(connection_manager.state, "stream_sid", None):
                         audio_message = audio_service.process_outgoing_audio(
