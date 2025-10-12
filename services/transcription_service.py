@@ -1,7 +1,6 @@
 import io
 import wave
 import aiohttp
-import audioop
 from config import Config
 from services.log_utils import Log
 
