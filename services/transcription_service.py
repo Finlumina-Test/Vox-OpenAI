@@ -1,6 +1,7 @@
 import io
 import wave
 import aiohttp
+import audioop
 from config import Config
 from services.log_utils import Log
 
@@ -8,25 +9,32 @@ from services.log_utils import Log
 class TranscriptionService:
     """
     Handles real-time audio transcription.
-    Converts audio chunks to proper WAV format before sending.
+    Converts Twilio μ-law audio chunks to proper 16kHz PCM16 WAV before sending.
     """
 
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
 
     async def transcribe_realtime(self, audio_chunk: bytes) -> str:
         """
-        Sends a short audio chunk to transcription model.
+        Sends a short audio chunk to OpenAI's transcription model.
         """
         try:
-            # Convert raw audio bytes to WAV (mono, 16kHz, PCM16)
+            # --- Convert Twilio μ-law (default) to PCM16 mono 16kHz ---
+            try:
+                pcm_audio = audioop.ulaw2lin(audio_chunk, 2)
+            except Exception:
+                pcm_audio = audio_chunk  # if it's already PCM16, skip conversion
+
+            # --- Wrap PCM into WAV ---
             wav_io = io.BytesIO()
             with wave.open(wav_io, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(16000)
-                wf.writeframes(audio_chunk)
+                wf.writeframes(pcm_audio)
             wav_io.seek(0)
 
+            # --- Send to OpenAI ---
             headers = {
                 "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
             }
@@ -34,7 +42,6 @@ class TranscriptionService:
             async with aiohttp.ClientSession() as session:
                 form = aiohttp.FormData()
                 form.add_field("file", wav_io, filename="chunk.wav", content_type="audio/wav")
-                # Use the transcription model you want
                 form.add_field("model", "gpt-4o-mini-transcribe")
 
                 async with session.post(self.OPENAI_API_URL, headers=headers, data=form) as resp:
