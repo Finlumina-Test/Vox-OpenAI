@@ -13,7 +13,7 @@ class TranscriptionService:
 
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
 
-    async def transcribe_chunk(self, audio_chunk: bytes) -> str:
+    async def transcribe_realtime(self, audio_chunk: bytes) -> str:
         """
         Sends a short audio chunk to Whisper for transcription.
         """
