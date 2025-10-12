@@ -171,66 +171,94 @@ async def handle_media_stream(websocket: WebSocket):
                         "encoding": "base64",
                         "timestamp": data.get("timestamp") or int(time.time()),
                     }
+                    # Non-blocking dashboard push
                     broadcast_to_dashboards_nonblocking(aud)
 
-                    # --- Parallel Whisper transcription ---
-asyncio.create_task(openai_service.handle_transcription(base64.b64decode(payload_b64), source="Caller"))
+                    # --- Parallel Whisper transcription (non-blocking, safe) ---
+                    try:
+                        # decode then call transcription in background
+                        audio_bytes = base64.b64decode(payload_b64)
+                        asyncio.create_task(
+                            openai_service.handle_transcription(audio_bytes, source="Caller")
+                        )
+                    except Exception as e:
+                        log_nonblocking(Log.error, f"[media] transcription task scheduling failed: {e}")
 
-if connection_manager.is_openai_connected():
-    try:
-        audio_message = audio_service.process_incoming_audio(data)
-        if audio_message:
-            await connection_manager.send_to_openai(audio_message)
-    except Exception as e:
-        log_nonblocking(Log.error, f"[media] failed to send incoming audio: {e}")
+                if connection_manager.is_openai_connected():
+                    try:
+                        audio_message = audio_service.process_incoming_audio(data)
+                        if audio_message:
+                            await connection_manager.send_to_openai(audio_message)
+                    except Exception as e:
+                        log_nonblocking(Log.error, f"[media] failed to send incoming audio: {e}")
 
-if "text" in data and isinstance(data["text"], str) and data["text"].strip():
-    txt_obj = {
-        "messageType": "text",
-        "speaker": "Caller",
-        "text": data["text"].strip(),
-        "timestamp": data.get("timestamp") or int(time.time()),
-    }
-    broadcast_to_dashboards_nonblocking(txt_obj)
+            # Twilio may include text directly
+            if "text" in data and isinstance(data["text"], str) and data["text"].strip():
+                txt_obj = {
+                    "messageType": "text",
+                    "speaker": "Caller",
+                    "text": data["text"].strip(),
+                    "timestamp": data.get("timestamp") or int(time.time()),
+                }
+                broadcast_to_dashboards_nonblocking(txt_obj)
 
-# ---------------------------
-# OpenAI -> Twilio handler
-# ---------------------------
-async def handle_audio_delta(response: dict):
-    try:
-        caller_txt = openai_service.extract_caller_transcript(response)
-        if caller_txt:
-            broadcast_to_dashboards_nonblocking({
-                "messageType": "text",
-                "speaker": "Caller",
-                "text": caller_txt,
-                "timestamp": response.get("timestamp") or int(time.time()),
-            })
-    except Exception:
-        pass
+        # ---------------------------
+        # OpenAI -> Twilio handler
+        # ---------------------------
+        async def handle_audio_delta(response: dict):
+            try:
+                # first, if OpenAI produced caller transcript events, send them to dashboard
+                caller_txt = openai_service.extract_caller_transcript(response)
+                if caller_txt:
+                    broadcast_to_dashboards_nonblocking({
+                        "messageType": "text",
+                        "speaker": "Caller",
+                        "text": caller_txt,
+                        "timestamp": response.get("timestamp") or int(time.time()),
+                    })
+            except Exception:
+                # ignore transcript extraction errors to keep main flow running
+                pass
 
-    audio_data = openai_service.extract_audio_response_data(response) or {}
-    delta = audio_data.get("delta")
+            audio_data = openai_service.extract_audio_response_data(response) or {}
+            delta = audio_data.get("delta")
 
-    if delta is not None:
-        try:
-            delta_b64 = (
-                base64.b64encode(delta).decode("ascii")
-                if isinstance(delta, (bytes, bytearray))
-                else delta
-            )
-            broadcast_to_dashboards_nonblocking({
-                "messageType": "audio",
-                "speaker": "AI",
-                "audio": delta_b64,
-                "encoding": "base64",
-                "timestamp": response.get("timestamp") or int(time.time()),
-            })
+            if delta is not None:
+                try:
+                    # ensure base64 for dashboard (OpenAI might send bytes or base64)
+                    if isinstance(delta, (bytes, bytearray)):
+                        delta_b64 = base64.b64encode(delta).decode("ascii")
+                        delta_bytes = bytes(delta)
+                    elif isinstance(delta, str):
+                        delta_b64 = delta
+                        try:
+                            delta_bytes = base64.b64decode(delta)
+                        except Exception:
+                            delta_bytes = None
+                    else:
+                        # fallback: stringify then base64
+                        raw = json.dumps(delta).encode("utf-8")
+                        delta_b64 = base64.b64encode(raw).decode("ascii")
+                        delta_bytes = raw
 
-            # --- Parallel Whisper transcription ---
-            asyncio.create_task(openai_service.handle_transcription(base64.b64decode(delta_b64), source="AI"))
+                    broadcast_to_dashboards_nonblocking({
+                        "messageType": "audio",
+                        "speaker": "AI",
+                        "audio": delta_b64,
+                        "encoding": "base64",
+                        "timestamp": response.get("timestamp") or int(time.time()),
+                    })
 
+                    # --- Parallel Whisper transcription for AI audio (non-blocking) ---
+                    try:
+                        if delta_bytes:
+                            asyncio.create_task(
+                                openai_service.handle_transcription(delta_bytes, source="AI")
+                            )
+                    except Exception as e:
+                        log_nonblocking(Log.error, f"[audio->whisper] transcription task scheduling failed: {e}")
 
+                    # send audio to Twilio so caller hears AI
                     if audio_data and getattr(connection_manager.state, "stream_sid", None):
                         audio_message = audio_service.process_outgoing_audio(
                             response, connection_manager.state.stream_sid
@@ -242,12 +270,14 @@ async def handle_audio_delta(response: dict):
                 except Exception as e:
                     log_nonblocking(Log.error, f"[audio->twilio] failed to send audio: {e}")
 
+            # assistant transcript text (if OpenAI sent it already)
             transcript_text = None
             if hasattr(openai_service, "extract_transcript_text"):
                 try:
                     transcript_text = openai_service.extract_transcript_text(response)
                 except Exception:
-                    pass
+                    transcript_text = None
+
             if transcript_text:
                 broadcast_to_dashboards_nonblocking({
                     "messageType": "text",
@@ -310,17 +340,3 @@ async def handle_audio_delta(response: dict):
         except Exception:
             pass
 
-
-# ---------------------------
-# Proper entry point for Render + production
-# ---------------------------
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "server:app",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", getattr(Config, "PORT", 8000))),
-        log_level="info",
-        reload=False,  # True only for dev
-    )
