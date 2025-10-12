@@ -340,3 +340,16 @@ async def handle_media_stream(websocket: WebSocket):
         except Exception:
             pass
 
+# ---------------------------
+# Proper entry point for Render + production
+# ---------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", getattr(Config, "PORT", 8000))),
+        log_level="info",
+        reload=False,  # True only for dev
+    )
