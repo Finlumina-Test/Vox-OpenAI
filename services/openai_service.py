@@ -445,7 +445,7 @@ class OpenAIService:
             Log.debug("[openai] caller transcript extract error", e)
         return None
 
-     async def handle_transcription(self, audio_chunk: bytes, source: str):
+    async def handle_transcription(self, audio_chunk: bytes, source: str):
         """
         Send audio chunk to Whisper (4o-mini-transcribe) and return text transcript.
         source: 'caller' or 'assistant'
