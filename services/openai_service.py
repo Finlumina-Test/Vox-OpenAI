@@ -445,20 +445,6 @@ class OpenAIService:
             Log.debug("[openai] caller transcript extract error", e)
         return None
 
-    async def handle_transcription(self, audio_chunk: bytes, source: str):
-        """
-        Send audio chunk to Whisper for real-time transcription.
-        source: 'Caller' or 'AI'
-        """
-        try:
-            transcript_text = await self.whisper_service.transcribe_realtime(audio_chunk)
-            if transcript_text:
-                Log.event(f"[Transcription] {source} said:", {"text": transcript_text})
-            return transcript_text
-        except Exception as e:
-            Log.error(f"Realtime transcription failed for {source}: {e}")
-            return None
-
     # --- AUDIO EVENTS ---
     def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not self.event_handler.is_audio_delta_event(event):
