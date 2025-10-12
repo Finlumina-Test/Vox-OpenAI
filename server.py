@@ -112,6 +112,18 @@ async def _run_log(func, msg):
         pass
 
 
+async def send_transcription_to_dashboard(text: str, speaker: str, timestamp: int):
+    """Send transcription text to dashboard."""
+    if text and text.strip():
+        payload = {
+            "messageType": "transcription",
+            "speaker": speaker,
+            "text": text.strip(),
+            "timestamp": timestamp,
+        }
+        broadcast_to_dashboards_nonblocking(payload)
+
+
 # ---------------------------
 # Simple health endpoint
 # ---------------------------
@@ -164,33 +176,40 @@ async def handle_media_stream(websocket: WebSocket):
                 media = data.get("media") or {}
                 payload_b64 = media.get("payload")
                 if payload_b64:
+                    timestamp = data.get("timestamp") or int(time.time())
+                    
+                    # Send audio to dashboard
                     aud = {
                         "messageType": "audio",
                         "speaker": "Caller",
                         "audio": payload_b64,
                         "encoding": "base64",
-                        "timestamp": data.get("timestamp") or int(time.time()),
+                        "timestamp": timestamp,
                     }
-                    # Non-blocking dashboard push
                     broadcast_to_dashboards_nonblocking(aud)
 
                     # --- Parallel Whisper transcription (non-blocking, safe) ---
-                    try:
-                        # decode then call transcription in background
-                        audio_bytes = base64.b64decode(payload_b64)
-                        asyncio.create_task(
-                            openai_service.handle_transcription(audio_bytes, source="Caller")
-                        )
-                    except Exception as e:
-                        log_nonblocking(Log.error, f"[media] transcription task scheduling failed: {e}")
+                    async def transcribe_caller():
+                        try:
+                            transcript = await openai_service.whisper_service.transcribe_realtime(
+                                payload_b64, 
+                                source="Caller"
+                            )
+                            if transcript:
+                                await send_transcription_to_dashboard(transcript, "Caller", timestamp)
+                        except Exception as e:
+                            log_nonblocking(Log.error, f"[Caller transcription] failed: {e}")
+                    
+                    asyncio.create_task(transcribe_caller())
 
-                if connection_manager.is_openai_connected():
-                    try:
-                        audio_message = audio_service.process_incoming_audio(data)
-                        if audio_message:
-                            await connection_manager.send_to_openai(audio_message)
-                    except Exception as e:
-                        log_nonblocking(Log.error, f"[media] failed to send incoming audio: {e}")
+                    # Send to OpenAI for conversation
+                    if connection_manager.is_openai_connected():
+                        try:
+                            audio_message = audio_service.process_incoming_audio(data)
+                            if audio_message:
+                                await connection_manager.send_to_openai(audio_message)
+                        except Exception as e:
+                            log_nonblocking(Log.error, f"[media] failed to send incoming audio: {e}")
 
             # Twilio may include text directly
             if "text" in data and isinstance(data["text"], str) and data["text"].strip():
@@ -225,6 +244,8 @@ async def handle_media_stream(websocket: WebSocket):
 
             if delta is not None:
                 try:
+                    timestamp = response.get("timestamp") or int(time.time())
+                    
                     # ensure base64 for dashboard (OpenAI might send bytes or base64)
                     if isinstance(delta, (bytes, bytearray)):
                         delta_b64 = base64.b64encode(delta).decode("ascii")
@@ -241,22 +262,29 @@ async def handle_media_stream(websocket: WebSocket):
                         delta_b64 = base64.b64encode(raw).decode("ascii")
                         delta_bytes = raw
 
+                    # Send audio to dashboard
                     broadcast_to_dashboards_nonblocking({
                         "messageType": "audio",
                         "speaker": "AI",
                         "audio": delta_b64,
                         "encoding": "base64",
-                        "timestamp": response.get("timestamp") or int(time.time()),
+                        "timestamp": timestamp,
                     })
 
                     # --- Parallel Whisper transcription for AI audio (non-blocking) ---
-                    try:
-                        if delta_bytes:
-                            asyncio.create_task(
-                                openai_service.handle_transcription(delta_bytes, source="AI")
-                            )
-                    except Exception as e:
-                        log_nonblocking(Log.error, f"[audio->whisper] transcription task scheduling failed: {e}")
+                    if delta_bytes:
+                        async def transcribe_ai():
+                            try:
+                                transcript = await openai_service.whisper_service.transcribe_realtime(
+                                    delta_bytes,
+                                    source="AI"
+                                )
+                                if transcript:
+                                    await send_transcription_to_dashboard(transcript, "AI", timestamp)
+                            except Exception as e:
+                                log_nonblocking(Log.error, f"[AI transcription] failed: {e}")
+                        
+                        asyncio.create_task(transcribe_ai())
 
                     # send audio to Twilio so caller hears AI
                     if audio_data and getattr(connection_manager.state, "stream_sid", None):
