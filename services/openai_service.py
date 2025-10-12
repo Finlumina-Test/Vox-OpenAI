@@ -447,11 +447,11 @@ class OpenAIService:
 
     async def handle_transcription(self, audio_chunk: bytes, source: str):
         """
-        Send audio chunk to Whisper (4o-mini-transcribe) and return text transcript.
-        source: 'caller' or 'assistant'
+        Send audio chunk to Whisper for real-time transcription.
+        source: 'Caller' or 'AI'
         """
         try:
-            transcript_text = await self.transcription_service.transcribe_realtime(audio_chunk)
+            transcript_text = await self.whisper_service.transcribe_realtime(audio_chunk)
             if transcript_text:
                 Log.event(f"[Transcription] {source} said:", {"text": transcript_text})
             return transcript_text
