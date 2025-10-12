@@ -10,25 +10,39 @@ from services.log_utils import Log
 
 class TranscriptionService:
     """
-    Converts Twilio µ-law (PCMU, 8 kHz, base64) audio chunks → 16-bit PCM WAV → OpenAI transcription.
+    Converts Twilio µ-law (PCMU, 8 kHz) audio chunks → 16-bit PCM WAV → OpenAI transcription.
+    Supports both base64 strings and raw bytes input.
     """
-
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
-
-    async def transcribe_realtime(self, twilio_payload_b64: str) -> str:
+    
+    async def transcribe_realtime(self, audio_input, source: str = "Unknown") -> str:
         """
-        Takes a base64 µ-law audio payload from Twilio, converts and sends it to OpenAI.
+        Takes audio (base64 string or raw bytes), converts and sends to OpenAI.
+        
+        Args:
+            audio_input: Either base64-encoded string or raw bytes
+            source: Label for logging (e.g., "Caller" or "AI")
         """
         try:
-            # 1️⃣ Decode base64 payload
-            mulaw_bytes = base64.b64decode(twilio_payload_b64)
-
-            # 2️⃣ Convert µ-law → PCM16 (manual decode)
+            # 1️⃣ Handle both base64 and raw bytes input
+            if isinstance(audio_input, str):
+                mulaw_bytes = base64.b64decode(audio_input)
+            elif isinstance(audio_input, (bytes, bytearray)):
+                mulaw_bytes = bytes(audio_input)
+            else:
+                Log.error(f"Invalid audio input type: {type(audio_input)}")
+                return ""
+            
+            # Skip if chunk is too small (avoid API errors)
+            if len(mulaw_bytes) < 100:
+                return ""
+            
+            # 2️⃣ Convert µ-law → PCM16
             pcm16 = self._mulaw_to_pcm16(mulaw_bytes)
-
+            
             # 3️⃣ Resample from 8 kHz → 16 kHz
             pcm16_16k = self._resample_pcm16(pcm16, 8000, 16000)
-
+            
             # 4️⃣ Write to in-memory WAV
             wav_io = io.BytesIO()
             with wave.open(wav_io, "wb") as wf:
@@ -37,43 +51,46 @@ class TranscriptionService:
                 wf.setframerate(16000)
                 wf.writeframes(pcm16_16k.tobytes())
             wav_io.seek(0)
-
-            # 5️⃣ Send to OpenAI
+            
+            # 5️⃣ Send to OpenAI Whisper
             headers = {"Authorization": f"Bearer {Config.OPENAI_API_KEY}"}
             form = aiohttp.FormData()
             form.add_field("file", wav_io, filename="chunk.wav", content_type="audio/wav")
             form.add_field("model", "gpt-4o-mini-transcribe")
-
+            form.add_field("language", "en")  # Optional: specify language for better accuracy
+            
             async with aiohttp.ClientSession() as session:
                 async with session.post(self.OPENAI_API_URL, headers=headers, data=form) as resp:
                     if resp.status != 200:
                         text = await resp.text()
-                        Log.error(f"Transcription request failed with {resp.status}: {text}")
+                        Log.error(f"[{source}] Transcription failed ({resp.status}): {text}")
                         return ""
-
+                    
                     data = await resp.json()
-                    return (data.get("text") or data.get("transcript") or "").strip()
-
+                    transcript = (data.get("text") or "").strip()
+                    
+                    if transcript:
+                        Log.info(f"[{source}] Transcribed: {transcript}")
+                    
+                    return transcript
+                    
         except Exception as e:
-            Log.error(f"Transcription error: {e}")
+            Log.error(f"[{source}] Transcription error: {e}")
             return ""
-
+    
     # --- Internal conversion helpers ---
-
     def _mulaw_to_pcm16(self, mulaw_bytes: bytes) -> np.ndarray:
         """Convert µ-law 8-bit audio bytes to PCM16 (NumPy)."""
-        MULAW_MAX = 0x1FFF
-        MULAW_BIAS = 0x84
-
         mu = np.frombuffer(mulaw_bytes, dtype=np.uint8)
         mu = ~mu
         sign = (mu & 0x80)
         exponent = (mu >> 4) & 0x07
         mantissa = mu & 0x0F
-        magnitude = ((mantissa << 4) + MULAW_BIAS) << (exponent + 3)
-        pcm16 = (magnitude if sign == 0 else -magnitude)
+        magnitude = ((mantissa << 3) + 0x84) << exponent
+        magnitude = np.clip(magnitude, 0, 0x7FFF)
+        pcm16 = np.where(sign == 0, magnitude, -magnitude)
         return pcm16.astype(np.int16)
-
+    
     def _resample_pcm16(self, pcm_data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
         """Resample PCM16 audio from src_rate → dst_rate."""
         if src_rate == dst_rate:
