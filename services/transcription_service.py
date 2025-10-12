@@ -80,15 +80,26 @@ class TranscriptionService:
     
     # --- Internal conversion helpers ---
     def _mulaw_to_pcm16(self, mulaw_bytes: bytes) -> np.ndarray:
-        """Convert µ-law 8-bit audio bytes to PCM16 (NumPy)."""
+        """Convert µ-law 8-bit audio bytes to PCM16 (NumPy 2.x compatible)."""
+        # Convert bytes to uint8 array
         mu = np.frombuffer(mulaw_bytes, dtype=np.uint8)
+        
+        # Invert bits
         mu = ~mu
-        sign = (mu & 0x80)
-        exponent = (mu >> 4) & 0x07
-        mantissa = mu & 0x0F
+        
+        # Extract sign, exponent, and mantissa
+        sign = (mu & 0x80).astype(np.int32)
+        exponent = ((mu >> 4) & 0x07).astype(np.int32)
+        mantissa = (mu & 0x0F).astype(np.int32)
+        
+        # Calculate magnitude using int32 to avoid overflow
         magnitude = ((mantissa << 3) + 0x84) << exponent
         magnitude = np.clip(magnitude, 0, 0x7FFF)
+        
+        # Apply sign
         pcm16 = np.where(sign == 0, magnitude, -magnitude)
+        
+        # Convert to int16
         return pcm16.astype(np.int16)
     
     def _resample_pcm16(self, pcm_data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
