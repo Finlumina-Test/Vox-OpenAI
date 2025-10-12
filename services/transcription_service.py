@@ -6,12 +6,6 @@ from services.log_utils import Log
 
 # For Python 3.13+, install audioop-lts:
 # pip install audioop-lts
-try:
-    import audioop
-except ImportError:
-    import audioop_lts as audioop
-
-
 class TranscriptionService:
     """Handles Twilio audio chunks → WAV → OpenAI transcription."""
 
