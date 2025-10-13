@@ -5,29 +5,73 @@ import asyncio
 import aiohttp
 import numpy as np
 from scipy.signal import resample
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 from config import Config
 from services.log_utils import Log
 
 
+class WordBoundaryDetector:
+    """Detects word boundaries in transcribed text stream."""
+    
+    def __init__(self):
+        self.current_transcript = ""
+        self.last_words = []
+        
+    def detect_new_words(self, new_transcript: str) -> List[str]:
+        """
+        Detect newly completed words by comparing transcripts.
+        Returns list of new complete words.
+        """
+        if not new_transcript:
+            return []
+            
+        # Clean and split into words
+        new_words = new_transcript.strip().split()
+        
+        # Find new words by comparing with last known state
+        if len(new_words) > len(self.last_words):
+            # New words added
+            new_complete = new_words[len(self.last_words):]
+            self.last_words = new_words
+            return new_complete
+        elif new_words != self.last_words:
+            # Transcript changed (possibly correction)
+            self.last_words = new_words
+            return new_words[-1:] if new_words else []
+            
+        return []
+    
+    def reset(self):
+        """Reset detector state."""
+        self.current_transcript = ""
+        self.last_words = []
+
+
 class TranscriptionService:
     """
-    Accumulates audio chunks and transcribes complete sentences.
-    Waits for silence or timeout before sending to Whisper.
+    Accumulates audio chunks and transcribes with word-level granularity.
+    Sends both audio and text for each word to maintain voice fidelity.
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
     
-    # Accumulation settings
-    MIN_AUDIO_DURATION = 1.0  # At least 1 second of audio
-    SILENCE_TIMEOUT = 0.8  # Send after 0.8s of silence
-    MAX_BUFFER_DURATION = 10.0  # Force send after 10 seconds
+    # Accumulation settings for word detection
+    MIN_AUDIO_DURATION = 0.3  # Minimum audio for a word (300ms)
+    SILENCE_TIMEOUT = 0.2  # Quick timeout for word boundaries (200ms)
+    MAX_BUFFER_DURATION = 2.0  # Force transcribe after 2 seconds
+    WORD_CHECK_INTERVAL = 0.1  # Check for words every 100ms
     
     def __init__(self):
-        # Separate buffers for caller and AI
+        # Separate buffers and detectors for each speaker
         self._caller_buffer: bytearray = bytearray()
         self._ai_buffer: bytearray = bytearray()
         
-        # Timers for each speaker
+        self._caller_audio_accumulator: List[bytes] = []  # Store original audio chunks
+        self._ai_audio_accumulator: List[bytes] = []
+        
+        self._caller_word_detector = WordBoundaryDetector()
+        self._ai_word_detector = WordBoundaryDetector()
+        
+        # Timing tracking
         self._caller_last_chunk_time: float = 0
         self._ai_last_chunk_time: float = 0
         
@@ -38,32 +82,38 @@ class TranscriptionService:
         self._caller_processing: bool = False
         self._ai_processing: bool = False
         
-        # Silence detection tasks
-        self._caller_silence_task: Optional[asyncio.Task] = None
-        self._ai_silence_task: Optional[asyncio.Task] = None
+        # Word detection tasks
+        self._caller_word_task: Optional[asyncio.Task] = None
+        self._ai_word_task: Optional[asyncio.Task] = None
+        
+        # Callback for word-level updates
+        self.word_callback = None
+    
+    def set_word_callback(self, callback):
+        """Set callback function for word-level updates."""
+        self.word_callback = callback
     
     async def transcribe_realtime(self, audio_input, source: str = "Unknown") -> str:
         """
-        Accumulates audio chunks and transcribes when silence detected or buffer full.
-        
-        Args:
-            audio_input: Either base64-encoded string or raw bytes
-            source: "Caller" or "AI"
+        Accumulates audio chunks and detects word boundaries.
+        Returns full transcript for backward compatibility.
         """
         try:
             # Convert input to bytes
             if isinstance(audio_input, str):
                 audio_bytes = base64.b64decode(audio_input)
+                original_base64 = audio_input
             elif isinstance(audio_input, (bytes, bytearray)):
                 audio_bytes = bytes(audio_input)
+                original_base64 = base64.b64encode(audio_bytes).decode('ascii')
             else:
                 return ""
             
-            # Choose the right buffer
+            # Process based on speaker
             if source == "Caller":
-                return await self._process_caller_chunk(audio_bytes)
+                return await self._process_caller_chunk(audio_bytes, original_base64)
             elif source == "AI":
-                return await self._process_ai_chunk(audio_bytes)
+                return await self._process_ai_chunk(audio_bytes, original_base64)
             
             return ""
             
@@ -71,8 +121,8 @@ class TranscriptionService:
             Log.error(f"[{source}] Transcription error: {e}")
             return ""
     
-    async def _process_caller_chunk(self, audio_bytes: bytes) -> str:
-        """Process caller audio chunk."""
+    async def _process_caller_chunk(self, audio_bytes: bytes, original_base64: str) -> str:
+        """Process caller audio chunk with word detection."""
         import time
         current_time = time.time()
         
@@ -80,30 +130,21 @@ class TranscriptionService:
         if len(self._caller_buffer) == 0:
             self._caller_first_chunk_time = current_time
         
-        # Add to buffer
+        # Add to buffers
         self._caller_buffer.extend(audio_bytes)
+        self._caller_audio_accumulator.append(original_base64)
         self._caller_last_chunk_time = current_time
         
-        # Calculate buffer duration (8kHz, 1 byte per sample)
-        buffer_duration = len(self._caller_buffer) / 8000.0
-        
-        # Force send if buffer is too large
-        if buffer_duration >= self.MAX_BUFFER_DURATION:
-            return await self._flush_caller_buffer()
-        
-        # Cancel existing silence task
-        if self._caller_silence_task:
-            self._caller_silence_task.cancel()
-        
-        # Start new silence detection task
-        self._caller_silence_task = asyncio.create_task(
-            self._wait_for_caller_silence()
-        )
+        # Start word detection task if not running
+        if not self._caller_word_task or self._caller_word_task.done():
+            self._caller_word_task = asyncio.create_task(
+                self._detect_caller_words()
+            )
         
         return ""
     
-    async def _process_ai_chunk(self, audio_bytes: bytes) -> str:
-        """Process AI audio chunk."""
+    async def _process_ai_chunk(self, audio_bytes: bytes, original_base64: str) -> str:
+        """Process AI audio chunk with word detection."""
         import time
         current_time = time.time()
         
@@ -111,91 +152,165 @@ class TranscriptionService:
         if len(self._ai_buffer) == 0:
             self._ai_first_chunk_time = current_time
         
-        # Add to buffer
+        # Add to buffers
         self._ai_buffer.extend(audio_bytes)
+        self._ai_audio_accumulator.append(original_base64)
         self._ai_last_chunk_time = current_time
         
-        # Calculate buffer duration
-        buffer_duration = len(self._ai_buffer) / 8000.0
-        
-        # Force send if buffer is too large
-        if buffer_duration >= self.MAX_BUFFER_DURATION:
-            return await self._flush_ai_buffer()
-        
-        # Cancel existing silence task
-        if self._ai_silence_task:
-            self._ai_silence_task.cancel()
-        
-        # Start new silence detection task
-        self._ai_silence_task = asyncio.create_task(
-            self._wait_for_ai_silence()
-        )
+        # Start word detection task if not running
+        if not self._ai_word_task or self._ai_word_task.done():
+            self._ai_word_task = asyncio.create_task(
+                self._detect_ai_words()
+            )
         
         return ""
     
-    async def _wait_for_caller_silence(self):
-        """Wait for silence period, then transcribe caller buffer."""
-        try:
-            await asyncio.sleep(self.SILENCE_TIMEOUT)
+    async def _detect_caller_words(self):
+        """Continuously detect word boundaries for caller."""
+        while True:
+            try:
+                await asyncio.sleep(self.WORD_CHECK_INTERVAL)
+                
+                # Check if we have enough audio
+                buffer_duration = len(self._caller_buffer) / 8000.0
+                if buffer_duration < self.MIN_AUDIO_DURATION:
+                    continue
+                
+                # Check for silence or max duration
+                import time
+                time_since_last = time.time() - self._caller_last_chunk_time
+                
+                should_transcribe = (
+                    time_since_last >= self.SILENCE_TIMEOUT or
+                    buffer_duration >= self.MAX_BUFFER_DURATION
+                )
+                
+                if should_transcribe and not self._caller_processing:
+                    await self._transcribe_and_detect_words("Caller")
+                    
+            except Exception as e:
+                Log.error(f"[Caller word detection] error: {e}")
+                break
+    
+    async def _detect_ai_words(self):
+        """Continuously detect word boundaries for AI."""
+        while True:
+            try:
+                await asyncio.sleep(self.WORD_CHECK_INTERVAL)
+                
+                # Check if we have enough audio
+                buffer_duration = len(self._ai_buffer) / 8000.0
+                if buffer_duration < self.MIN_AUDIO_DURATION:
+                    continue
+                
+                # Check for silence or max duration
+                import time
+                time_since_last = time.time() - self._ai_last_chunk_time
+                
+                should_transcribe = (
+                    time_since_last >= self.SILENCE_TIMEOUT or
+                    buffer_duration >= self.MAX_BUFFER_DURATION
+                )
+                
+                if should_transcribe and not self._ai_processing:
+                    await self._transcribe_and_detect_words("AI")
+                    
+            except Exception as e:
+                Log.error(f"[AI word detection] error: {e}")
+                break
+    
+    async def _transcribe_and_detect_words(self, source: str):
+        """Transcribe buffer and detect new words."""
+        if source == "Caller":
+            if self._caller_processing or len(self._caller_buffer) == 0:
+                return
+            self._caller_processing = True
             
-            # Check if we have enough audio
-            buffer_duration = len(self._caller_buffer) / 8000.0
-            if buffer_duration >= self.MIN_AUDIO_DURATION:
-                return await self._flush_caller_buffer()
-        except asyncio.CancelledError:
-            pass
-        return ""
-    
-    async def _wait_for_ai_silence(self):
-        """Wait for silence period, then transcribe AI buffer."""
-        try:
-            await asyncio.sleep(self.SILENCE_TIMEOUT)
+            try:
+                # Copy buffers
+                audio_data = bytes(self._caller_buffer)
+                audio_chunks = self._caller_audio_accumulator.copy()
+                
+                # Clear buffers
+                self._caller_buffer.clear()
+                self._caller_audio_accumulator.clear()
+                
+                # Transcribe
+                transcript = await self._transcribe_audio(audio_data, source)
+                
+                if transcript:
+                    # Detect new words
+                    new_words = self._caller_word_detector.detect_new_words(transcript)
+                    
+                    if new_words and self.word_callback:
+                        # Combine audio chunks
+                        combined_audio = self._combine_audio_chunks(audio_chunks)
+                        
+                        # Send word-level update
+                        for word in new_words:
+                            await self.word_callback({
+                                "speaker": source,
+                                "word": word,
+                                "audio": combined_audio,
+                                "timestamp": int(time.time())
+                            })
+                
+            finally:
+                self._caller_processing = False
+                
+        elif source == "AI":
+            if self._ai_processing or len(self._ai_buffer) == 0:
+                return
+            self._ai_processing = True
             
-            # Check if we have enough audio
-            buffer_duration = len(self._ai_buffer) / 8000.0
-            if buffer_duration >= self.MIN_AUDIO_DURATION:
-                return await self._flush_ai_buffer()
-        except asyncio.CancelledError:
-            pass
-        return ""
+            try:
+                # Copy buffers
+                audio_data = bytes(self._ai_buffer)
+                audio_chunks = self._ai_audio_accumulator.copy()
+                
+                # Clear buffers
+                self._ai_buffer.clear()
+                self._ai_audio_accumulator.clear()
+                
+                # Transcribe
+                transcript = await self._transcribe_audio(audio_data, source)
+                
+                if transcript:
+                    # Detect new words
+                    new_words = self._ai_word_detector.detect_new_words(transcript)
+                    
+                    if new_words and self.word_callback:
+                        # Combine audio chunks
+                        combined_audio = self._combine_audio_chunks(audio_chunks)
+                        
+                        # Send word-level update
+                        for word in new_words:
+                            await self.word_callback({
+                                "speaker": source,
+                                "word": word,
+                                "audio": combined_audio,
+                                "timestamp": int(time.time())
+                            })
+                
+            finally:
+                self._ai_processing = False
     
-    async def _flush_caller_buffer(self) -> str:
-        """Transcribe and clear caller buffer."""
-        if self._caller_processing or len(self._caller_buffer) == 0:
+    def _combine_audio_chunks(self, chunks: List[str]) -> str:
+        """Combine multiple base64 audio chunks into one."""
+        if not chunks:
             return ""
         
-        self._caller_processing = True
-        
         try:
-            # Copy buffer
-            audio_data = bytes(self._caller_buffer)
-            self._caller_buffer.clear()
+            # Decode all chunks
+            combined_bytes = bytearray()
+            for chunk in chunks:
+                combined_bytes.extend(base64.b64decode(chunk))
             
-            # Transcribe
-            result = await self._transcribe_audio(audio_data, "Caller")
-            return result
-            
-        finally:
-            self._caller_processing = False
-    
-    async def _flush_ai_buffer(self) -> str:
-        """Transcribe and clear AI buffer."""
-        if self._ai_processing or len(self._ai_buffer) == 0:
-            return ""
-        
-        self._ai_processing = True
-        
-        try:
-            # Copy buffer
-            audio_data = bytes(self._ai_buffer)
-            self._ai_buffer.clear()
-            
-            # Transcribe
-            result = await self._transcribe_audio(audio_data, "AI")
-            return result
-            
-        finally:
-            self._ai_processing = False
+            # Re-encode as single base64
+            return base64.b64encode(combined_bytes).decode('ascii')
+        except Exception as e:
+            Log.error(f"Failed to combine audio chunks: {e}")
+            return chunks[0] if chunks else ""
     
     async def _transcribe_audio(self, mulaw_bytes: bytes, source: str) -> str:
         """Convert accumulated µ-law audio to PCM16 WAV and transcribe."""
