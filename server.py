@@ -20,6 +20,10 @@ from services import (
 )
 from services.log_utils import Log
 
+
+# ---------------------------
+# Word-level update handler
+# ---------------------------
 async def handle_word_update(word_data: Dict[str, Any]):
     """Handle word-level updates from transcription service."""
     payload = {
@@ -27,9 +31,10 @@ async def handle_word_update(word_data: Dict[str, Any]):
         "speaker": word_data["speaker"],
         "word": word_data["word"],
         "audio": word_data["audio"],
-        "timestamp": word_data["timestamp"]
+        "timestamp": word_data["timestamp"],
     }
     broadcast_to_dashboards_nonblocking(payload)
+
 
 app = FastAPI()
 
@@ -123,18 +128,6 @@ async def _run_log(func, msg):
         pass
 
 
-async def send_transcription_to_dashboard(text: str, speaker: str, timestamp: int):
-    """Send transcription text to dashboard."""
-    if text and text.strip():
-        payload = {
-            "messageType": "transcription",
-            "speaker": speaker,
-            "text": text.strip(),
-            "timestamp": timestamp,
-        }
-        broadcast_to_dashboards_nonblocking(payload)
-
-
 # ---------------------------
 # Simple health endpoint
 # ---------------------------
@@ -162,8 +155,8 @@ async def handle_media_stream(websocket: WebSocket):
     connection_manager = WebSocketConnectionManager(websocket)
     openai_service = OpenAIService()
     audio_service = AudioService()
-    
-    # Set up word-level callback
+
+    # Hook up word-level callback from TranscriptionService
     openai_service.whisper_service.set_word_callback(handle_word_update)
 
     try:
@@ -190,33 +183,17 @@ async def handle_media_stream(websocket: WebSocket):
                 media = data.get("media") or {}
                 payload_b64 = media.get("payload")
                 if payload_b64:
-                    timestamp = data.get("timestamp") or int(time.time())
-                    
-                    # Send audio to dashboard
-                    aud = {
-                        "messageType": "audio",
-                        "speaker": "Caller",
-                        "audio": payload_b64,
-                        "encoding": "base64",
-                        "timestamp": timestamp,
-                    }
-                    broadcast_to_dashboards_nonblocking(aud)
-
-                    # --- Parallel Whisper transcription (non-blocking, safe) ---
-                    async def transcribe_caller():
-                        try:
-                            transcript = await openai_service.whisper_service.transcribe_realtime(
-                                payload_b64, 
-                                source="Caller"
+                    # Forward audio to Whisper for real-time processing (word-level updates)
+                    try:
+                        asyncio.create_task(
+                            openai_service.whisper_service.transcribe_realtime(
+                                payload_b64, source="Caller"
                             )
-                            if transcript:
-                                await send_transcription_to_dashboard(transcript, "Caller", timestamp)
-                        except Exception as e:
-                            log_nonblocking(Log.error, f"[Caller transcription] failed: {e}")
-                    
-                    asyncio.create_task(transcribe_caller())
+                        )
+                    except Exception as e:
+                        log_nonblocking(Log.error, f"[Caller transcription] failed: {e}")
 
-                    # Send to OpenAI for conversation
+                    # Also forward to OpenAI conversation
                     if connection_manager.is_openai_connected():
                         try:
                             audio_message = audio_service.process_incoming_audio(data)
@@ -240,93 +217,58 @@ async def handle_media_stream(websocket: WebSocket):
         # ---------------------------
         async def handle_audio_delta(response: dict):
             try:
-                # first, if OpenAI produced caller transcript events, send them to dashboard
-                caller_txt = openai_service.extract_caller_transcript(response)
-                if caller_txt:
-                    broadcast_to_dashboards_nonblocking({
-                        "messageType": "text",
-                        "speaker": "Caller",
-                        "text": caller_txt,
-                        "timestamp": response.get("timestamp") or int(time.time()),
-                    })
-            except Exception:
-                # ignore transcript extraction errors to keep main flow running
-                pass
-
-            audio_data = openai_service.extract_audio_response_data(response) or {}
-            delta = audio_data.get("delta")
-
-            if delta is not None:
-                try:
-                    timestamp = response.get("timestamp") or int(time.time())
-                    
-                    # ensure base64 for dashboard (OpenAI might send bytes or base64)
+                # Forward audio deltas to Whisper for word detection
+                audio_data = openai_service.extract_audio_response_data(response) or {}
+                delta = audio_data.get("delta")
+                if delta:
                     if isinstance(delta, (bytes, bytearray)):
-                        delta_b64 = base64.b64encode(delta).decode("ascii")
                         delta_bytes = bytes(delta)
                     elif isinstance(delta, str):
-                        delta_b64 = delta
                         try:
                             delta_bytes = base64.b64decode(delta)
                         except Exception:
                             delta_bytes = None
                     else:
-                        # fallback: stringify then base64
-                        raw = json.dumps(delta).encode("utf-8")
-                        delta_b64 = base64.b64encode(raw).decode("ascii")
-                        delta_bytes = raw
+                        delta_bytes = None
 
-                    # Send audio to dashboard
-                    broadcast_to_dashboards_nonblocking({
-                        "messageType": "audio",
-                        "speaker": "AI",
-                        "audio": delta_b64,
-                        "encoding": "base64",
-                        "timestamp": timestamp,
-                    })
-
-                    # --- Parallel Whisper transcription for AI audio (non-blocking) ---
                     if delta_bytes:
-                        async def transcribe_ai():
-                            try:
-                                transcript = await openai_service.whisper_service.transcribe_realtime(
-                                    delta_bytes,
-                                    source="AI"
-                                )
-                                if transcript:
-                                    await send_transcription_to_dashboard(transcript, "AI", timestamp)
-                            except Exception as e:
-                                log_nonblocking(Log.error, f"[AI transcription] failed: {e}")
-                        
-                        asyncio.create_task(transcribe_ai())
+                        asyncio.create_task(
+                            openai_service.whisper_service.transcribe_realtime(
+                                delta_bytes, source="AI"
+                            )
+                        )
 
                     # send audio to Twilio so caller hears AI
-                    if audio_data and getattr(connection_manager.state, "stream_sid", None):
-                        audio_message = audio_service.process_outgoing_audio(
-                            response, connection_manager.state.stream_sid
-                        )
-                        if audio_message:
-                            await connection_manager.send_to_twilio(audio_message)
-                            mark_msg = audio_service.create_mark_message(connection_manager.state.stream_sid)
-                            await connection_manager.send_to_twilio(mark_msg)
-                except Exception as e:
-                    log_nonblocking(Log.error, f"[audio->twilio] failed to send audio: {e}")
+                    if getattr(connection_manager.state, "stream_sid", None):
+                        try:
+                            audio_message = audio_service.process_outgoing_audio(
+                                response, connection_manager.state.stream_sid
+                            )
+                            if audio_message:
+                                await connection_manager.send_to_twilio(audio_message)
+                                mark_msg = audio_service.create_mark_message(
+                                    connection_manager.state.stream_sid
+                                )
+                                await connection_manager.send_to_twilio(mark_msg)
+                        except Exception as e:
+                            log_nonblocking(Log.error, f"[audio->twilio] failed: {e}")
 
-            # assistant transcript text (if OpenAI sent it already)
-            transcript_text = None
-            if hasattr(openai_service, "extract_transcript_text"):
-                try:
-                    transcript_text = openai_service.extract_transcript_text(response)
-                except Exception:
-                    transcript_text = None
+                # assistant text (if available)
+                if hasattr(openai_service, "extract_transcript_text"):
+                    try:
+                        transcript_text = openai_service.extract_transcript_text(response)
+                        if transcript_text:
+                            broadcast_to_dashboards_nonblocking({
+                                "messageType": "text",
+                                "speaker": "AI",
+                                "text": transcript_text,
+                                "timestamp": response.get("timestamp") or int(time.time()),
+                            })
+                    except Exception:
+                        pass
 
-            if transcript_text:
-                broadcast_to_dashboards_nonblocking({
-                    "messageType": "text",
-                    "speaker": "AI",
-                    "text": transcript_text,
-                    "timestamp": response.get("timestamp") or int(time.time()),
-                })
+            except Exception as e:
+                log_nonblocking(Log.error, f"[audio-delta] failed: {e}")
 
         async def handle_speech_started():
             try:
@@ -382,6 +324,7 @@ async def handle_media_stream(websocket: WebSocket):
         except Exception:
             pass
 
+
 # ---------------------------
 # Proper entry point for Render + production
 # ---------------------------
@@ -393,5 +336,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.environ.get("PORT", getattr(Config, "PORT", 8000))),
         log_level="info",
-        reload=False,  # True only for dev
+        reload=False,
     )
