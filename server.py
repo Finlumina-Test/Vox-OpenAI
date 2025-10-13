@@ -20,6 +20,17 @@ from services import (
 )
 from services.log_utils import Log
 
+async def handle_word_update(word_data: Dict[str, Any]):
+    """Handle word-level updates from transcription service."""
+    payload = {
+        "messageType": "word",
+        "speaker": word_data["speaker"],
+        "word": word_data["word"],
+        "audio": word_data["audio"],
+        "timestamp": word_data["timestamp"]
+    }
+    broadcast_to_dashboards_nonblocking(payload)
+
 app = FastAPI()
 
 app.add_middleware(
@@ -151,6 +162,9 @@ async def handle_media_stream(websocket: WebSocket):
     connection_manager = WebSocketConnectionManager(websocket)
     openai_service = OpenAIService()
     audio_service = AudioService()
+    
+    # Set up word-level callback
+    openai_service.whisper_service.set_word_callback(handle_word_update)
 
     try:
         # --- Connect to OpenAI ---
