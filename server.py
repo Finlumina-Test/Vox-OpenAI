@@ -1,4 +1,4 @@
-# server.py (dual-stream: audio + transcription)
+# server.py (sequential audio streaming: no overlapping chunks)
 import os
 import json
 import time
@@ -22,27 +22,68 @@ from services.log_utils import Log
 
 
 # ---------------------------
-# Dual callbacks: audio + transcription
+# Sequential audio streaming: one chunk at a time
 # ---------------------------
+audio_send_lock = asyncio.Lock()
+dashboard_send_queue: asyncio.Queue = asyncio.Queue()
+dashboard_sender_task: Optional[asyncio.Task] = None
+
+
+async def dashboard_sequential_sender():
+    """
+    Background task that sends dashboard messages one at a time.
+    Ensures no overlapping audio chunks.
+    """
+    while True:
+        try:
+            # Wait for next message
+            payload = await dashboard_send_queue.get()
+            
+            if payload is None:  # Shutdown signal
+                break
+            
+            # Send to all connected dashboards sequentially
+            await _do_broadcast(payload)
+            
+            # Mark task as done
+            dashboard_send_queue.task_done()
+            
+            # Small delay to maintain proper flow
+            await asyncio.sleep(0.001)
+            
+        except Exception as e:
+            Log.error(f"[Dashboard sender] error: {e}")
+
+
 async def handle_audio_stream(audio_data: Dict[str, Any]):
-    """Handle raw audio chunks for real-time playback."""
+    """
+    Handle raw audio chunks - queue for sequential delivery.
+    Ensures chunks are sent one at a time without overlapping.
+    """
     payload = {
         "messageType": "audio",
         "speaker": audio_data["speaker"],
         "audio": audio_data["audio"],
         "timestamp": audio_data["timestamp"],
     }
-    broadcast_to_dashboards_nonblocking(payload)
+    
+    # Add to sequential queue instead of broadcasting immediately
+    await dashboard_send_queue.put(payload)
 
 
 async def handle_transcription_update(transcription_data: Dict[str, Any]):
-    """Handle completed transcription phrases."""
+    """
+    Handle completed transcription phrases.
+    These can be sent immediately as they don't overlap with audio chunks.
+    """
     payload = {
         "messageType": "transcription",
         "speaker": transcription_data["speaker"],
         "text": transcription_data["text"],
         "timestamp": transcription_data["timestamp"],
     }
+    
+    # Transcriptions can be sent directly (no audio overlap concern)
     broadcast_to_dashboards_nonblocking(payload)
 
 
@@ -57,6 +98,33 @@ app.add_middleware(
 )
 
 dashboard_clients: Set[WebSocket] = set()
+
+
+# ---------------------------
+# Start dashboard sender on startup
+# ---------------------------
+@app.on_event("startup")
+async def startup_event():
+    global dashboard_sender_task
+    if dashboard_sender_task is None or dashboard_sender_task.done():
+        dashboard_sender_task = asyncio.create_task(dashboard_sequential_sender())
+        Log.info("Dashboard sequential sender started")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global dashboard_sender_task
+    # Signal shutdown
+    await dashboard_send_queue.put(None)
+    
+    # Wait for sender to finish
+    if dashboard_sender_task:
+        try:
+            await asyncio.wait_for(dashboard_sender_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            dashboard_sender_task.cancel()
+    
+    Log.info("Dashboard sequential sender stopped")
 
 
 # ---------------------------
@@ -75,6 +143,8 @@ async def dashboard_stream(websocket: WebSocket):
             return
 
     dashboard_clients.add(websocket)
+    Log.info(f"Dashboard client connected. Total clients: {len(dashboard_clients)}")
+    
     try:
         try:
             msg = await asyncio.wait_for(websocket.receive_text(), timeout=5)
@@ -95,14 +165,19 @@ async def dashboard_stream(websocket: WebSocket):
         pass
     finally:
         dashboard_clients.discard(websocket)
+        Log.info(f"Dashboard client disconnected. Total clients: {len(dashboard_clients)}")
 
 
 # ---------------------------
-# Non-blocking broadcast
+# Broadcasting functions
 # ---------------------------
 async def _do_broadcast(payload: Dict[str, Any]):
-    """Internal coroutine to broadcast dashboard updates."""
+    """
+    Internal coroutine to broadcast dashboard updates.
+    Sends to all connected clients sequentially.
+    """
     try:
+        # Ensure timestamp is present
         if "timestamp" not in payload or payload["timestamp"] is None:
             payload["timestamp"] = int(time.time())
         else:
@@ -112,17 +187,25 @@ async def _do_broadcast(payload: Dict[str, Any]):
 
     text = json.dumps(payload)
     to_remove = []
-    for client in list(dashboard_clients):
-        try:
-            await client.send_text(text)
-        except Exception:
-            to_remove.append(client)
+    
+    # Use lock to prevent overlapping sends
+    async with audio_send_lock:
+        for client in list(dashboard_clients):
+            try:
+                await client.send_text(text)
+            except Exception as e:
+                Log.debug(f"Failed to send to client: {e}")
+                to_remove.append(client)
+    
+    # Clean up failed clients
     for c in to_remove:
         dashboard_clients.discard(c)
 
 
 def broadcast_to_dashboards_nonblocking(payload: Dict[str, Any]):
-    """Fire-and-forget broadcast (non-blocking)."""
+    """
+    Fire-and-forget broadcast for non-audio messages (like transcriptions).
+    """
     asyncio.create_task(_do_broadcast(payload))
 
 
@@ -166,7 +249,7 @@ async def handle_media_stream(websocket: WebSocket):
     openai_service = OpenAIService()
     audio_service = AudioService()
 
-    # ✅ Set up dual callbacks for audio + transcription
+    # ✅ Set up dual callbacks for sequential audio + transcription
     openai_service.whisper_service.set_audio_callback(handle_audio_stream)
     openai_service.whisper_service.set_word_callback(handle_transcription_update)
 
@@ -194,7 +277,7 @@ async def handle_media_stream(websocket: WebSocket):
                 media = data.get("media") or {}
                 payload_b64 = media.get("payload")
                 if payload_b64:
-                    # Forward audio to transcription service (handles both streaming & transcription)
+                    # Forward audio to transcription service (handles sequential streaming + transcription)
                     try:
                         asyncio.create_task(
                             openai_service.whisper_service.transcribe_realtime(
@@ -243,7 +326,7 @@ async def handle_media_stream(websocket: WebSocket):
                         delta_bytes = None
 
                     if delta_bytes:
-                        # Send to transcription service for processing
+                        # Send to transcription service for sequential processing
                         asyncio.create_task(
                             openai_service.whisper_service.transcribe_realtime(
                                 delta_bytes, source="AI"
@@ -331,6 +414,12 @@ async def handle_media_stream(websocket: WebSocket):
     except Exception as e:
         Log.error(f"Error in media stream handler: {e}")
     finally:
+        try:
+            # Shutdown transcription service
+            await openai_service.whisper_service.shutdown()
+        except Exception:
+            pass
+        
         try:
             await connection_manager.close_openai_connection()
         except Exception:
