@@ -6,19 +6,20 @@ import aiohttp
 import numpy as np
 import time    
 from scipy.signal import resample
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Callable
 from config import Config
 from services.log_utils import Log
 
 
 class TranscriptionService:
     """
-    Real-time transcription service with SEPARATE audio streaming.
+    Real-time transcription service with SEQUENTIAL audio streaming.
     
-    Key Changes:
-    - Audio chunks are sent IMMEDIATELY as they arrive (no pairing with words)
-    - Transcription runs independently and sends complete phrases
-    - No word-level audio pairing (prevents repetition bug)
+    Key Features:
+    - Audio chunks are queued and sent one at a time
+    - No overlapping - each chunk waits for previous to complete
+    - Maintains proper 20ms flow to dashboard
+    - Transcription runs independently in background
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
     
@@ -28,9 +29,21 @@ class TranscriptionService:
     MAX_BUFFER_DURATION = 3.0  # Force transcribe after 3 seconds
     
     def __init__(self):
-        # Separate buffers for each speaker
+        # Separate buffers for each speaker (transcription)
         self._caller_buffer: bytearray = bytearray()
         self._ai_buffer: bytearray = bytearray()
+        
+        # Audio streaming queues (for sequential delivery)
+        self._caller_audio_queue: asyncio.Queue = asyncio.Queue()
+        self._ai_audio_queue: asyncio.Queue = asyncio.Queue()
+        
+        # Sequential streaming tasks
+        self._caller_stream_task: Optional[asyncio.Task] = None
+        self._ai_stream_task: Optional[asyncio.Task] = None
+        
+        # Streaming state
+        self._caller_streaming: bool = False
+        self._ai_streaming: bool = False
         
         # Timing tracking
         self._caller_last_chunk_time: float = 0
@@ -48,30 +61,101 @@ class TranscriptionService:
         self._ai_monitor_task: Optional[asyncio.Task] = None
         
         # Callbacks
-        self.audio_callback = None  # For raw audio streaming
-        self.transcription_callback = None  # For completed transcriptions
+        self.audio_callback: Optional[Callable] = None  # For raw audio streaming
+        self.transcription_callback: Optional[Callable] = None  # For completed transcriptions
         
         # Track last transcription to avoid duplicates
         self._caller_last_transcript: str = ""
         self._ai_last_transcript: str = ""
     
-    def set_audio_callback(self, callback):
+    def set_audio_callback(self, callback: Callable):
         """Set callback for raw audio chunks (real-time streaming)."""
         self.audio_callback = callback
+        
+        # Start sequential streaming tasks
+        if not self._caller_stream_task or self._caller_stream_task.done():
+            self._caller_stream_task = asyncio.create_task(self._stream_caller_audio())
+        
+        if not self._ai_stream_task or self._ai_stream_task.done():
+            self._ai_stream_task = asyncio.create_task(self._stream_ai_audio())
     
-    def set_word_callback(self, callback):
+    def set_word_callback(self, callback: Callable):
         """Legacy: For compatibility. Now used for transcription results."""
         self.transcription_callback = callback
     
+    async def _stream_caller_audio(self):
+        """Sequential audio streaming task for Caller - sends one chunk at a time."""
+        while True:
+            try:
+                # Wait for next audio chunk
+                audio_data = await self._caller_audio_queue.get()
+                
+                if audio_data is None:  # Shutdown signal
+                    break
+                
+                # Mark as streaming
+                self._caller_streaming = True
+                
+                # Send to dashboard and WAIT for completion
+                if self.audio_callback:
+                    try:
+                        await self.audio_callback(audio_data)
+                    except Exception as e:
+                        Log.error(f"[Caller stream] callback error: {e}")
+                
+                # Mark chunk as done
+                self._caller_audio_queue.task_done()
+                
+                # Small delay to maintain flow (optional, can be removed if not needed)
+                await asyncio.sleep(0.001)
+                
+                self._caller_streaming = False
+                
+            except Exception as e:
+                Log.error(f"[Caller stream] error: {e}")
+                self._caller_streaming = False
+    
+    async def _stream_ai_audio(self):
+        """Sequential audio streaming task for AI - sends one chunk at a time."""
+        while True:
+            try:
+                # Wait for next audio chunk
+                audio_data = await self._ai_audio_queue.get()
+                
+                if audio_data is None:  # Shutdown signal
+                    break
+                
+                # Mark as streaming
+                self._ai_streaming = True
+                
+                # Send to dashboard and WAIT for completion
+                if self.audio_callback:
+                    try:
+                        await self.audio_callback(audio_data)
+                    except Exception as e:
+                        Log.error(f"[AI stream] callback error: {e}")
+                
+                # Mark chunk as done
+                self._ai_audio_queue.task_done()
+                
+                # Small delay to maintain flow (optional)
+                await asyncio.sleep(0.001)
+                
+                self._ai_streaming = False
+                
+            except Exception as e:
+                Log.error(f"[AI stream] error: {e}")
+                self._ai_streaming = False
+    
     async def transcribe_realtime(self, audio_input, source: str = "Unknown") -> str:
         """
-        Process incoming audio with IMMEDIATE audio streaming + background transcription.
+        Process incoming audio with SEQUENTIAL audio streaming + background transcription.
         
         Flow:
         1. Audio chunk arrives
-        2. IMMEDIATELY send to dashboard via audio_callback (for real-time playback)
-        3. Add to buffer for transcription
-        4. Background task monitors buffer and transcribes when ready
+        2. Add to sequential queue (guarantees one-at-a-time delivery)
+        3. Background task sends chunks sequentially to dashboard
+        4. Separate task accumulates and transcribes in background
         """
         try:
             # Convert input to bytes
@@ -84,15 +168,19 @@ class TranscriptionService:
             else:
                 return ""
             
-            # ✅ IMMEDIATELY send raw audio for playback (no delay, no pairing)
-            if self.audio_callback:
-                await self.audio_callback({
-                    "speaker": source,
-                    "audio": original_base64,
-                    "timestamp": int(time.time())
-                })
+            # ✅ Queue audio for SEQUENTIAL streaming (no overlapping)
+            audio_packet = {
+                "speaker": source,
+                "audio": original_base64,
+                "timestamp": int(time.time())
+            }
             
-            # Add to transcription buffer (runs in background)
+            if source == "Caller":
+                await self._caller_audio_queue.put(audio_packet)
+            elif source == "AI":
+                await self._ai_audio_queue.put(audio_packet)
+            
+            # Add to transcription buffer (runs independently in background)
             if source == "Caller":
                 await self._add_to_caller_buffer(audio_bytes)
             elif source == "AI":
@@ -200,11 +288,11 @@ class TranscriptionService:
                 if transcript and transcript != self._caller_last_transcript:
                     self._caller_last_transcript = transcript
                     
-                    # Send transcription update (NOT word-by-word, complete phrase)
+                    # Send transcription update (complete phrase)
                     if self.transcription_callback:
                         await self.transcription_callback({
                             "speaker": source,
-                            "text": transcript,  # Complete phrase, not individual words
+                            "text": transcript,
                             "timestamp": int(time.time())
                         })
                 
@@ -255,12 +343,12 @@ class TranscriptionService:
                 wf.writeframes(pcm16_16k.tobytes())
             wav_io.seek(0)
             
-            # ✅ ADD PROMPT FOR LATIN SCRIPT (Roman Urdu/Punjabi)
+            # ADD PROMPT FOR LATIN SCRIPT (Roman Urdu/Punjabi)
             headers = {"Authorization": f"Bearer {Config.OPENAI_API_KEY}"}
             form = aiohttp.FormData()
             form.add_field("file", wav_io, filename="audio.wav", content_type="audio/wav")
             form.add_field("model", "gpt-4o-mini-transcribe")
-            form.add_field("language", "en")  # Hint for English base
+            form.add_field("language", "en")
             form.add_field("prompt", 
                 "Transcribe using Latin script. "
                 "For Urdu words, use Roman Urdu (e.g., 'aapka shukriya'). "
@@ -308,3 +396,19 @@ class TranscriptionService:
             return pcm_data
         num_samples = int(len(pcm_data) * dst_rate / src_rate)
         return resample(pcm_data, num_samples).astype(np.int16)
+    
+    async def shutdown(self):
+        """Gracefully shutdown streaming tasks."""
+        try:
+            # Signal shutdown to streaming tasks
+            await self._caller_audio_queue.put(None)
+            await self._ai_audio_queue.put(None)
+            
+            # Wait for tasks to complete
+            if self._caller_stream_task:
+                await self._caller_stream_task
+            if self._ai_stream_task:
+                await self._ai_stream_task
+                
+        except Exception as e:
+            Log.error(f"Shutdown error: {e}")
