@@ -202,10 +202,11 @@ class OpenAIConversationManager:
 
 class OpenAIService:
     """
-    Unified service for OpenAI Realtime API:
+    Unified service for OpenAI Realtime API with sequential audio streaming:
     - Manages sessions, greetings, event logging
     - Extracts assistant & caller transcripts
     - Handles tool calls, interruptions, and goodbyes
+    - Sequential audio delivery prevents overlapping chunks
     """
 
     def __init__(self):
