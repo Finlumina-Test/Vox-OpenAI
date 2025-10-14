@@ -1,4 +1,4 @@
-# server.py (non-blocking dashboard + logging)
+# server.py (dual-stream: audio + transcription)
 import os
 import json
 import time
@@ -22,16 +22,26 @@ from services.log_utils import Log
 
 
 # ---------------------------
-# Word-level update handler
+# Dual callbacks: audio + transcription
 # ---------------------------
-async def handle_word_update(word_data: Dict[str, Any]):
-    """Handle word-level updates from transcription service."""
+async def handle_audio_stream(audio_data: Dict[str, Any]):
+    """Handle raw audio chunks for real-time playback."""
     payload = {
-        "messageType": "word",
-        "speaker": word_data["speaker"],
-        "word": word_data["word"],
-        "audio": word_data["audio"],
-        "timestamp": word_data["timestamp"],
+        "messageType": "audio",
+        "speaker": audio_data["speaker"],
+        "audio": audio_data["audio"],
+        "timestamp": audio_data["timestamp"],
+    }
+    broadcast_to_dashboards_nonblocking(payload)
+
+
+async def handle_transcription_update(transcription_data: Dict[str, Any]):
+    """Handle completed transcription phrases."""
+    payload = {
+        "messageType": "transcription",
+        "speaker": transcription_data["speaker"],
+        "text": transcription_data["text"],
+        "timestamp": transcription_data["timestamp"],
     }
     broadcast_to_dashboards_nonblocking(payload)
 
@@ -156,8 +166,9 @@ async def handle_media_stream(websocket: WebSocket):
     openai_service = OpenAIService()
     audio_service = AudioService()
 
-    # Hook up word-level callback from TranscriptionService
-    openai_service.whisper_service.set_word_callback(handle_word_update)
+    # ✅ Set up dual callbacks for audio + transcription
+    openai_service.whisper_service.set_audio_callback(handle_audio_stream)
+    openai_service.whisper_service.set_word_callback(handle_transcription_update)
 
     try:
         # --- Connect to OpenAI ---
@@ -183,7 +194,7 @@ async def handle_media_stream(websocket: WebSocket):
                 media = data.get("media") or {}
                 payload_b64 = media.get("payload")
                 if payload_b64:
-                    # Forward audio to Whisper for real-time processing (word-level updates)
+                    # Forward audio to transcription service (handles both streaming & transcription)
                     try:
                         asyncio.create_task(
                             openai_service.whisper_service.transcribe_realtime(
@@ -191,7 +202,7 @@ async def handle_media_stream(websocket: WebSocket):
                             )
                         )
                     except Exception as e:
-                        log_nonblocking(Log.error, f"[Caller transcription] failed: {e}")
+                        log_nonblocking(Log.error, f"[Caller processing] failed: {e}")
 
                     # Also forward to OpenAI conversation
                     if connection_manager.is_openai_connected():
@@ -217,7 +228,7 @@ async def handle_media_stream(websocket: WebSocket):
         # ---------------------------
         async def handle_audio_delta(response: dict):
             try:
-                # Forward audio deltas to Whisper for word detection
+                # Forward audio deltas to transcription service
                 audio_data = openai_service.extract_audio_response_data(response) or {}
                 delta = audio_data.get("delta")
                 if delta:
@@ -232,13 +243,14 @@ async def handle_media_stream(websocket: WebSocket):
                         delta_bytes = None
 
                     if delta_bytes:
+                        # Send to transcription service for processing
                         asyncio.create_task(
                             openai_service.whisper_service.transcribe_realtime(
                                 delta_bytes, source="AI"
                             )
                         )
 
-                    # send audio to Twilio so caller hears AI
+                    # Send audio to Twilio so caller hears AI
                     if getattr(connection_manager.state, "stream_sid", None):
                         try:
                             audio_message = audio_service.process_outgoing_audio(
@@ -253,7 +265,7 @@ async def handle_media_stream(websocket: WebSocket):
                         except Exception as e:
                             log_nonblocking(Log.error, f"[audio->twilio] failed: {e}")
 
-                # assistant text (if available)
+                # Assistant text (if available)
                 if hasattr(openai_service, "extract_transcript_text"):
                     try:
                         transcript_text = openai_service.extract_transcript_text(response)
