@@ -17,22 +17,21 @@ class TranscriptionService:
     
     Key Features:
     - Unified queue for first-come-first-serve
-    - Detects when a speaker has FINISHED speaking (silence period)
-    - Adds 0.5s gap only between different speakers' COMPLETE turns
-    - No gaps within same speaker's continuous chunks
-    - Resamples µ-law 8kHz to PCM16 16kHz for better browser playback
+    - Smart gap control: only Caller→AI gets 0.5s gap, AI→Caller has no artificial gap
+    - Correct sample rates: Caller=8kHz µ-law, AI=24kHz PCM16
+    - Resamples both to 24kHz PCM16 for consistent high-quality playback
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
     
     # Audio format specs
-    SAMPLE_RATE = 8000  # µ-law 8kHz from Twilio and OpenAI
-    DASHBOARD_SAMPLE_RATE = 16000  # PCM16 16kHz for dashboard playback
-    CHUNK_DURATION_MS = 20
-    BYTES_PER_20MS = 160
+    CALLER_SAMPLE_RATE = 8000   # Twilio µ-law 8kHz
+    AI_SAMPLE_RATE = 24000       # OpenAI Realtime API PCM16 24kHz
+    DASHBOARD_SAMPLE_RATE = 24000  # Output 24kHz for dashboard
     
     # Speaker turn detection
     SPEAKER_SILENCE_THRESHOLD = 0.3  # If no chunks for 0.3s, speaker is done
-    SPEAKER_TRANSITION_DELAY = 0.5   # Gap between different speakers
+    CALLER_TO_AI_GAP = 0.5           # Gap only when Caller → AI
+    AI_TO_CALLER_GAP = 0.0           # No artificial gap for AI → Caller
     
     # Transcription settings
     MIN_AUDIO_DURATION = 0.8
@@ -52,9 +51,7 @@ class TranscriptionService:
         
         # Speaker tracking for gaps
         self._last_streamed_speaker: Optional[str] = None
-        self._last_chunk_time_per_speaker: Dict[str, float] = {}
-        self._last_queued_time_per_speaker: Dict[str, float] = {}  # Track when audio was queued, not streamed
-        self._speaker_finished: Dict[str, bool] = {"Caller": False, "AI": False}
+        self._last_queued_time_per_speaker: Dict[str, float] = {}
         
         # Transcription timing
         self._caller_last_chunk_time: float = 0
@@ -92,56 +89,46 @@ class TranscriptionService:
         """Set callback for transcription results."""
         self.transcription_callback = callback
     
-    def _calculate_chunk_duration(self, audio_bytes: bytes, sample_rate: int = None) -> float:
+    def _calculate_chunk_duration(self, audio_bytes: bytes, sample_rate: int) -> float:
         """Calculate audio chunk duration in seconds."""
-        if sample_rate is None:
-            sample_rate = self.DASHBOARD_SAMPLE_RATE
         num_samples = len(audio_bytes) // 2  # PCM16 = 2 bytes per sample
         duration_seconds = num_samples / sample_rate
         return duration_seconds
     
-    def _resample_mulaw_to_pcm16(self, mulaw_bytes: bytes) -> bytes:
+    def _resample_caller_audio(self, mulaw_bytes: bytes) -> bytes:
         """
-        Convert µ-law 8kHz to PCM16 16kHz for better dashboard playback quality.
-        
-        Args:
-            mulaw_bytes: Raw µ-law encoded audio at 8kHz
-            
-        Returns:
-            PCM16 encoded audio at 16kHz as bytes
+        Convert Caller's µ-law 8kHz to PCM16 24kHz.
         """
         try:
-            # Convert µ-law to PCM16
+            # Convert µ-law to PCM16 at 8kHz
             pcm16_8k = self._mulaw_to_pcm16(mulaw_bytes)
             
-            # Resample from 8kHz to 16kHz
-            pcm16_16k = self._resample_pcm16(pcm16_8k, self.SAMPLE_RATE, self.DASHBOARD_SAMPLE_RATE)
+            # Resample from 8kHz to 24kHz
+            pcm16_24k = self._resample_pcm16(pcm16_8k, self.CALLER_SAMPLE_RATE, self.DASHBOARD_SAMPLE_RATE)
             
-            return pcm16_16k.tobytes()
+            return pcm16_24k.tobytes()
         except Exception as e:
-            Log.error(f"[Resample] Error converting audio: {e}")
-            # Fallback: just convert µ-law to PCM16 at 8kHz
-            try:
-                pcm16_8k = self._mulaw_to_pcm16(mulaw_bytes)
-                return pcm16_8k.tobytes()
-            except:
-                return mulaw_bytes
+            Log.error(f"[Resample Caller] Error: {e}")
+            pcm16_8k = self._mulaw_to_pcm16(mulaw_bytes)
+            return pcm16_8k.tobytes()
     
-    def _create_wav_base64(self, pcm16_bytes: bytes, sample_rate: int = None) -> str:
+    def _resample_ai_audio(self, pcm16_bytes: bytes) -> bytes:
+        """
+        AI audio is already PCM16 24kHz from OpenAI Realtime API.
+        Just pass through (or resample if needed).
+        """
+        try:
+            # OpenAI sends PCM16 at 24kHz, so we can use it directly
+            # If you find it's actually different, adjust AI_SAMPLE_RATE constant
+            return pcm16_bytes
+        except Exception as e:
+            Log.error(f"[Resample AI] Error: {e}")
+            return pcm16_bytes
+    
+    def _create_wav_base64(self, pcm16_bytes: bytes, sample_rate: int) -> str:
         """
         Create a WAV file from PCM16 data and return as base64.
-        This provides better browser compatibility.
-        
-        Args:
-            pcm16_bytes: PCM16 audio data
-            sample_rate: Sample rate (default: 16kHz)
-            
-        Returns:
-            Base64 encoded WAV file
         """
-        if sample_rate is None:
-            sample_rate = self.DASHBOARD_SAMPLE_RATE
-            
         try:
             wav_io = io.BytesIO()
             with wave.open(wav_io, "wb") as wf:
@@ -157,36 +144,23 @@ class TranscriptionService:
             Log.error(f"[WAV] Error creating WAV: {e}")
             return base64.b64encode(pcm16_bytes).decode('ascii')
     
-    async def _check_speaker_finished(self, speaker: str) -> bool:
-        """
-        Check if a speaker has finished their turn (no chunks recently).
-        """
-        last_time = self._last_chunk_time_per_speaker.get(speaker, 0)
-        if last_time == 0:
-            return False
-        
-        time_since_last = time.time() - last_time
-        return time_since_last >= self.SPEAKER_SILENCE_THRESHOLD
-    
     async def _stream_unified_audio(self):
         """
-        Unified streaming task with smart speaker transition detection.
-        Only adds gap when transitioning between COMPLETE speaker turns.
-        Sends resampled high-quality audio to dashboard.
+        Unified streaming with asymmetric gaps:
+        - Caller → AI: 0.5s gap (natural conversation flow)
+        - AI → Caller: NO gap (processing delay is enough)
         """
-        Log.info("[Unified Stream] Started with smart speaker detection and resampling")
+        Log.info("[Unified Stream] Started with asymmetric gap control")
         
         while not self._shutdown:
             try:
-                # Wait for next chunk
                 audio_data = await self._unified_audio_queue.get()
                 
                 if audio_data is None:
                     break
                 
                 speaker = audio_data.get("speaker")
-                queued_time = audio_data.get("queued_time", time.time())  # When it was queued
-                current_time = time.time()
+                queued_time = audio_data.get("queued_time", time.time())
                 
                 # Check if we're switching speakers
                 speaker_changed = (
@@ -195,56 +169,61 @@ class TranscriptionService:
                 )
                 
                 if speaker_changed:
-                    # Use QUEUED time to calculate gap, not processing time
                     previous_speaker = self._last_streamed_speaker
                     previous_last_queued = self._last_queued_time_per_speaker.get(previous_speaker, 0)
                     
-                    # Calculate gap between when previous speaker's last chunk was QUEUED 
-                    # and when current speaker's first chunk was QUEUED
+                    # Calculate natural gap between speakers
                     time_gap = queued_time - previous_last_queued if previous_last_queued > 0 else 0
-                    
-                    # Check if previous speaker finished
                     previous_finished = time_gap >= self.SPEAKER_SILENCE_THRESHOLD
                     
-                    if previous_finished and time_gap < self.SPEAKER_TRANSITION_DELAY:
-                        # Add remaining gap to reach the desired delay
-                        remaining_gap = self.SPEAKER_TRANSITION_DELAY - time_gap
-                        Log.debug(f"[Stream] Turn complete: {previous_speaker} → {speaker}, adding {remaining_gap:.3f}s gap (natural: {time_gap:.3f}s)")
-                        await asyncio.sleep(remaining_gap)
-                    elif previous_finished:
-                        # Natural gap already exceeds our desired delay, no artificial gap needed
-                        Log.debug(f"[Stream] Turn complete: {previous_speaker} → {speaker}, natural gap {time_gap:.3f}s (no artificial gap needed)")
+                    # ASYMMETRIC GAP LOGIC
+                    if previous_speaker == "Caller" and speaker == "AI":
+                        # Caller → AI: Add gap for natural feel
+                        if previous_finished and time_gap < self.CALLER_TO_AI_GAP:
+                            remaining_gap = self.CALLER_TO_AI_GAP - time_gap
+                            Log.debug(f"[Stream] Caller → AI: adding {remaining_gap:.3f}s gap")
+                            await asyncio.sleep(remaining_gap)
+                        elif previous_finished:
+                            Log.debug(f"[Stream] Caller → AI: natural gap {time_gap:.3f}s sufficient")
+                    
+                    elif previous_speaker == "AI" and speaker == "Caller":
+                        # AI → Caller: NO artificial gap (processing delay is enough)
+                        Log.debug(f"[Stream] AI → Caller: no gap (natural: {time_gap:.3f}s)")
+                    
                     else:
-                        # Quick interruption/overlap - no gap
-                        Log.debug(f"[Stream] Quick switch {previous_speaker} → {speaker}, no gap (time_gap: {time_gap:.3f}s)")
+                        # Same speaker continuing or quick interruption
+                        Log.debug(f"[Stream] {previous_speaker} → {speaker}: no gap")
                 
-                # Update tracking times
-                self._last_chunk_time_per_speaker[speaker] = current_time
+                # Update tracking
                 self._last_queued_time_per_speaker[speaker] = queued_time
-                
-                # Update current speaker
                 self._last_streamed_speaker = speaker
                 
-                # Send to dashboard with resampled audio
+                # Process and send audio
                 if self.audio_callback:
                     try:
-                        # Get the original µ-law audio
                         audio_b64 = audio_data.get("audio", "")
-                        mulaw_bytes = base64.b64decode(audio_b64)
+                        raw_bytes = base64.b64decode(audio_b64)
                         
-                        # Resample to PCM16 16kHz for better quality
-                        pcm16_bytes = self._resample_mulaw_to_pcm16(mulaw_bytes)
+                        # Resample based on speaker
+                        if speaker == "Caller":
+                            # Caller: µ-law 8kHz → PCM16 24kHz
+                            pcm16_bytes = self._resample_caller_audio(raw_bytes)
+                            source_rate = self.CALLER_SAMPLE_RATE
+                        else:  # AI
+                            # AI: Already PCM16 24kHz (or convert if needed)
+                            pcm16_bytes = self._resample_ai_audio(raw_bytes)
+                            source_rate = self.AI_SAMPLE_RATE
                         
-                        # Create WAV format for better browser compatibility
+                        # Create WAV
                         wav_b64 = self._create_wav_base64(pcm16_bytes, self.DASHBOARD_SAMPLE_RATE)
                         
-                        # Create enhanced payload
+                        # Send to dashboard
                         enhanced_payload = {
                             "speaker": speaker,
-                            "audio": wav_b64,  # High quality resampled audio
+                            "audio": wav_b64,
                             "timestamp": audio_data.get("timestamp"),
                             "size": len(pcm16_bytes),
-                            "format": "wav",  # Indicate WAV format
+                            "format": "wav",
                             "sampleRate": self.DASHBOARD_SAMPLE_RATE,
                             "channels": 1,
                             "bitDepth": 16
@@ -254,15 +233,11 @@ class TranscriptionService:
                     except Exception as e:
                         Log.error(f"[Stream] callback error: {e}")
                 
-                # Wait for chunk playback (use new sample rate for timing)
+                # Wait for chunk playback
                 try:
-                    audio_b64 = audio_data.get("audio", "")
-                    mulaw_bytes = base64.b64decode(audio_b64)
-                    pcm16_bytes = self._resample_mulaw_to_pcm16(mulaw_bytes)
                     chunk_duration = self._calculate_chunk_duration(pcm16_bytes, self.DASHBOARD_SAMPLE_RATE)
                     await asyncio.sleep(chunk_duration * 0.95)
-                except Exception as e:
-                    Log.debug(f"[Stream] Duration calc error: {e}")
+                except Exception:
                     await asyncio.sleep(0.02)
                 
                 self._unified_audio_queue.task_done()
@@ -286,15 +261,15 @@ class TranscriptionService:
             else:
                 return ""
             
-            # Capture the EXACT time this audio was received/queued
+            # Capture exact arrival time
             queued_time = time.time()
             
-            # Queue for streaming (with queued timestamp for accurate gap calculation)
+            # Queue for streaming
             audio_packet = {
                 "speaker": source,
                 "audio": original_base64,
                 "timestamp": int(queued_time),
-                "queued_time": queued_time,  # Critical: when audio actually arrived
+                "queued_time": queued_time,
                 "size": len(audio_bytes)
             }
             
@@ -372,7 +347,7 @@ class TranscriptionService:
             try:
                 await asyncio.sleep(0.1)
                 
-                buffer_duration = len(self._ai_buffer) / 8000.0
+                buffer_duration = len(self._ai_buffer) / 24000.0  # AI is 24kHz
                 if buffer_duration < self.MIN_AUDIO_DURATION:
                     continue
                 
@@ -401,7 +376,7 @@ class TranscriptionService:
                 audio_data = bytes(self._caller_buffer)
                 self._caller_buffer.clear()
                 
-                transcript = await self._transcribe_audio(audio_data, source)
+                transcript = await self._transcribe_audio(audio_data, source, self.CALLER_SAMPLE_RATE)
                 
                 if transcript and transcript != self._caller_last_transcript:
                     self._caller_last_transcript = transcript
@@ -425,7 +400,7 @@ class TranscriptionService:
                 audio_data = bytes(self._ai_buffer)
                 self._ai_buffer.clear()
                 
-                transcript = await self._transcribe_audio(audio_data, source)
+                transcript = await self._transcribe_audio(audio_data, source, self.AI_SAMPLE_RATE)
                 
                 if transcript and transcript != self._ai_last_transcript:
                     self._ai_last_transcript = transcript
@@ -440,17 +415,19 @@ class TranscriptionService:
             finally:
                 self._ai_processing = False
     
-    async def _transcribe_audio(self, mulaw_bytes: bytes, source: str) -> str:
+    async def _transcribe_audio(self, audio_bytes: bytes, source: str, source_sample_rate: int) -> str:
         """
-        Convert µ-law 8kHz to PCM16 16kHz and transcribe.
-        
-        Audio conversion for Whisper:
-        - Input: µ-law 8kHz (from Twilio/OpenAI)
-        - Output: PCM16 16kHz (for Whisper API)
+        Convert audio to PCM16 16kHz and transcribe with Whisper.
         """
         try:
-            pcm16 = self._mulaw_to_pcm16(mulaw_bytes)
-            pcm16_16k = self._resample_pcm16(pcm16, 8000, 16000)
+            # Convert to PCM16 if needed
+            if source == "Caller":
+                pcm16 = self._mulaw_to_pcm16(audio_bytes)
+            else:  # AI already PCM16
+                pcm16 = np.frombuffer(audio_bytes, dtype=np.int16)
+            
+            # Resample to 16kHz for Whisper
+            pcm16_16k = self._resample_pcm16(pcm16, source_sample_rate, 16000)
             
             wav_io = io.BytesIO()
             with wave.open(wav_io, "wb") as wf:
