@@ -26,7 +26,7 @@ class TranscriptionService:
     # Audio format specs
     CALLER_SAMPLE_RATE = 8000   # Twilio µ-law 8kHz
     AI_SAMPLE_RATE = 24000       # OpenAI Realtime API PCM16 24kHz
-    DASHBOARD_SAMPLE_RATE = 24000  # Output 24kHz for dashboard
+    DASHBOARD_SAMPLE_RATE = 16000  # Output 16kHz for dashboard (browser-friendly)
     
     # Speaker turn detection
     SPEAKER_SILENCE_THRESHOLD = 0.3  # If no chunks for 0.3s, speaker is done
