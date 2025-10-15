@@ -124,9 +124,6 @@ class TranscriptionService:
                 speaker = audio_data.get("speaker")
                 current_time = time.time()
                 
-                # Update last chunk time for this speaker
-                self._last_chunk_time_per_speaker[speaker] = current_time
-                
                 # Check if we're switching speakers
                 speaker_changed = (
                     self._last_streamed_speaker is not None and 
@@ -134,17 +131,31 @@ class TranscriptionService:
                 )
                 
                 if speaker_changed:
-                    # Check if previous speaker had finished their turn
+                    # Check if previous speaker had finished BEFORE current speaker started
                     previous_speaker = self._last_streamed_speaker
-                    previous_finished = await self._check_speaker_finished(previous_speaker)
+                    previous_last_time = self._last_chunk_time_per_speaker.get(previous_speaker, 0)
                     
-                    if previous_finished:
-                        # Add gap only if previous speaker truly finished
-                        Log.debug(f"[Stream] Turn complete: {previous_speaker} → {speaker}, adding {self.SPEAKER_TRANSITION_DELAY}s gap")
-                        await asyncio.sleep(self.SPEAKER_TRANSITION_DELAY)
+                    # Calculate the time gap between previous speaker's last chunk and current chunk
+                    time_gap = current_time - previous_last_time if previous_last_time > 0 else 0
+                    
+                    # Only add artificial gap if the natural gap is less than our threshold
+                    # AND the previous speaker had actually finished (silence > threshold)
+                    previous_finished = time_gap >= self.SPEAKER_SILENCE_THRESHOLD
+                    
+                    if previous_finished and time_gap < self.SPEAKER_TRANSITION_DELAY:
+                        # Add remaining gap to reach the desired delay
+                        remaining_gap = self.SPEAKER_TRANSITION_DELAY - time_gap
+                        Log.debug(f"[Stream] Turn complete: {previous_speaker} → {speaker}, adding {remaining_gap:.3f}s gap (natural: {time_gap:.3f}s)")
+                        await asyncio.sleep(remaining_gap)
+                    elif previous_finished:
+                        # Natural gap already exceeds our desired delay, no artificial gap needed
+                        Log.debug(f"[Stream] Turn complete: {previous_speaker} → {speaker}, natural gap {time_gap:.3f}s (no artificial gap needed)")
                     else:
-                        # Previous speaker interrupted or chunks still arriving - no gap
-                        Log.debug(f"[Stream] Quick switch {previous_speaker} → {speaker}, no gap")
+                        # Quick interruption/overlap - no gap
+                        Log.debug(f"[Stream] Quick switch {previous_speaker} → {speaker}, no gap (time_gap: {time_gap:.3f}s)")
+                
+                # Update last chunk time for this speaker AFTER calculating gaps
+                self._last_chunk_time_per_speaker[speaker] = current_time
                 
                 # Update current speaker
                 self._last_streamed_speaker = speaker
