@@ -53,6 +53,7 @@ class TranscriptionService:
         # Speaker tracking for gaps
         self._last_streamed_speaker: Optional[str] = None
         self._last_chunk_time_per_speaker: Dict[str, float] = {}
+        self._last_queued_time_per_speaker: Dict[str, float] = {}  # Track when audio was queued, not streamed
         self._speaker_finished: Dict[str, bool] = {"Caller": False, "AI": False}
         
         # Transcription timing
@@ -184,6 +185,7 @@ class TranscriptionService:
                     break
                 
                 speaker = audio_data.get("speaker")
+                queued_time = audio_data.get("queued_time", time.time())  # When it was queued
                 current_time = time.time()
                 
                 # Check if we're switching speakers
@@ -193,15 +195,15 @@ class TranscriptionService:
                 )
                 
                 if speaker_changed:
-                    # Check if previous speaker had finished BEFORE current speaker started
+                    # Use QUEUED time to calculate gap, not processing time
                     previous_speaker = self._last_streamed_speaker
-                    previous_last_time = self._last_chunk_time_per_speaker.get(previous_speaker, 0)
+                    previous_last_queued = self._last_queued_time_per_speaker.get(previous_speaker, 0)
                     
-                    # Calculate the time gap between previous speaker's last chunk and current chunk
-                    time_gap = current_time - previous_last_time if previous_last_time > 0 else 0
+                    # Calculate gap between when previous speaker's last chunk was QUEUED 
+                    # and when current speaker's first chunk was QUEUED
+                    time_gap = queued_time - previous_last_queued if previous_last_queued > 0 else 0
                     
-                    # Only add artificial gap if the natural gap is less than our threshold
-                    # AND the previous speaker had actually finished (silence > threshold)
+                    # Check if previous speaker finished
                     previous_finished = time_gap >= self.SPEAKER_SILENCE_THRESHOLD
                     
                     if previous_finished and time_gap < self.SPEAKER_TRANSITION_DELAY:
@@ -216,8 +218,9 @@ class TranscriptionService:
                         # Quick interruption/overlap - no gap
                         Log.debug(f"[Stream] Quick switch {previous_speaker} → {speaker}, no gap (time_gap: {time_gap:.3f}s)")
                 
-                # Update last chunk time for this speaker AFTER calculating gaps
+                # Update tracking times
                 self._last_chunk_time_per_speaker[speaker] = current_time
+                self._last_queued_time_per_speaker[speaker] = queued_time
                 
                 # Update current speaker
                 self._last_streamed_speaker = speaker
@@ -283,11 +286,15 @@ class TranscriptionService:
             else:
                 return ""
             
-            # Queue for streaming (original µ-law for now, will be resampled in stream)
+            # Capture the EXACT time this audio was received/queued
+            queued_time = time.time()
+            
+            # Queue for streaming (with queued timestamp for accurate gap calculation)
             audio_packet = {
                 "speaker": source,
                 "audio": original_base64,
-                "timestamp": int(time.time()),
+                "timestamp": int(queued_time),
+                "queued_time": queued_time,  # Critical: when audio actually arrived
                 "size": len(audio_bytes)
             }
             
