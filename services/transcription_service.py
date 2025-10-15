@@ -13,24 +13,23 @@ from services.log_utils import Log
 
 class TranscriptionService:
     """
-    Real-time transcription service with PROPER TIMED audio streaming.
+    Real-time transcription service with SINGLE QUEUE audio streaming.
     
     Key Features:
-    - Audio chunks are queued and sent with proper 20ms timing
-    - Respects actual audio playback duration
-    - No overlapping - proper flow maintained
-    - Transcription runs independently in background
-    - Natural pause between speaker transitions
+    - ALL audio goes through one queue (first-come, first-serve)
+    - Each speaker's chunks play completely before next speaker
+    - 0.5s gap between different speakers
+    - Proper sequential flow maintained
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
     
     # Audio chunk timing (µ-law 8kHz, 20ms chunks = 160 bytes)
-    CHUNK_DURATION_MS = 20  # Each chunk is 20ms of audio
-    SAMPLE_RATE = 8000  # 8kHz sampling rate
-    BYTES_PER_20MS = 160  # 8000 samples/sec * 0.02 sec = 160 bytes
+    CHUNK_DURATION_MS = 20
+    SAMPLE_RATE = 8000
+    BYTES_PER_20MS = 160
     
-    # Speaker transition settings
-    SPEAKER_TRANSITION_DELAY = 0.85  # Seconds of silence between speakers (0.7-1.0)
+    # Speaker transition gap
+    SPEAKER_TRANSITION_DELAY = 0.5  # 0.5 seconds between speakers
     
     # Transcription accumulation settings
     MIN_AUDIO_DURATION = 0.8
@@ -38,35 +37,24 @@ class TranscriptionService:
     MAX_BUFFER_DURATION = 3.0
     
     def __init__(self):
-        # Separate buffers for each speaker (transcription)
+        # Separate buffers for transcription only
         self._caller_buffer: bytearray = bytearray()
         self._ai_buffer: bytearray = bytearray()
         
-        # Audio streaming queues (for timed delivery)
-        self._caller_audio_queue: asyncio.Queue = asyncio.Queue()
-        self._ai_audio_queue: asyncio.Queue = asyncio.Queue()
+        # ✅ SINGLE QUEUE for all audio (first-come, first-serve)
+        self._unified_audio_queue: asyncio.Queue = asyncio.Queue()
         
-        # Sequential streaming tasks
-        self._caller_stream_task: Optional[asyncio.Task] = None
-        self._ai_stream_task: Optional[asyncio.Task] = None
+        # Single streaming task
+        self._stream_task: Optional[asyncio.Task] = None
         
-        # Streaming state
-        self._caller_streaming: bool = False
-        self._ai_streaming: bool = False
+        # Track last speaker for gap logic
+        self._last_streamed_speaker: Optional[str] = None
         
-        # Timing tracking
+        # Timing tracking for transcription
         self._caller_last_chunk_time: float = 0
         self._ai_last_chunk_time: float = 0
-        
         self._caller_first_chunk_time: float = 0
         self._ai_first_chunk_time: float = 0
-        
-        # Track last activity per speaker for transition gaps
-        self._last_speaker_activity: Dict[str, float] = {
-            "Caller": 0,
-            "AI": 0
-        }
-        self._current_speaker: Optional[str] = None
         
         # Processing flags
         self._caller_processing: bool = False
@@ -91,12 +79,9 @@ class TranscriptionService:
         """Set callback for raw audio chunks (real-time streaming)."""
         self.audio_callback = callback
         
-        # Start sequential streaming tasks
-        if not self._caller_stream_task or self._caller_stream_task.done():
-            self._caller_stream_task = asyncio.create_task(self._stream_caller_audio())
-        
-        if not self._ai_stream_task or self._ai_stream_task.done():
-            self._ai_stream_task = asyncio.create_task(self._stream_ai_audio())
+        # Start unified streaming task
+        if not self._stream_task or self._stream_task.done():
+            self._stream_task = asyncio.create_task(self._stream_unified_audio())
     
     def set_word_callback(self, callback: Callable):
         """Legacy: For compatibility. Now used for transcription results."""
@@ -111,147 +96,68 @@ class TranscriptionService:
         duration_seconds = num_samples / self.SAMPLE_RATE
         return duration_seconds
     
-    async def _wait_for_speaker_transition(self, new_speaker: str) -> None:
+    async def _stream_unified_audio(self):
         """
-        Add natural pause when switching between speakers.
-        Only applies when switching from Caller -> AI or AI -> Caller.
+        ✅ SINGLE UNIFIED streaming task.
+        Processes ALL audio (Caller + AI) in order with proper gaps.
         """
-        if self._current_speaker is None:
-            # First speaker - no wait
-            self._current_speaker = new_speaker
-            return
-        
-        if self._current_speaker == new_speaker:
-            # Same speaker continuing - no wait
-            return
-        
-        # Different speaker - check if enough time has passed
-        last_activity = self._last_speaker_activity.get(self._current_speaker, 0)
-        time_since_last = time.time() - last_activity
-        
-        if time_since_last < self.SPEAKER_TRANSITION_DELAY:
-            # Not enough time passed - wait for the remainder
-            remaining_wait = self.SPEAKER_TRANSITION_DELAY - time_since_last
-            Log.debug(f"[Speaker Transition] Waiting {remaining_wait:.2f}s before {new_speaker} speaks")
-            await asyncio.sleep(remaining_wait)
-        
-        # Update current speaker
-        self._current_speaker = new_speaker
-    
-    async def _stream_caller_audio(self):
-        """
-        Sequential audio streaming task for Caller.
-        Sends chunks with proper timing based on audio duration.
-        """
-        Log.info("[Caller Stream] Started")
+        Log.info("[Unified Stream] Started - First come, first serve")
         
         while not self._shutdown:
             try:
-                # Wait for next audio chunk
-                audio_data = await self._caller_audio_queue.get()
+                # Wait for next audio chunk (from ANY speaker)
+                audio_data = await self._unified_audio_queue.get()
                 
                 if audio_data is None:  # Shutdown signal
                     break
                 
-                # Wait for speaker transition if needed
-                await self._wait_for_speaker_transition("Caller")
+                speaker = audio_data.get("speaker")
                 
-                self._caller_streaming = True
+                # ✅ Add gap if speaker changed
+                if self._last_streamed_speaker is not None and self._last_streamed_speaker != speaker:
+                    Log.debug(f"[Stream] Speaker transition: {self._last_streamed_speaker} → {speaker}, waiting {self.SPEAKER_TRANSITION_DELAY}s")
+                    await asyncio.sleep(self.SPEAKER_TRANSITION_DELAY)
+                
+                # Update current speaker
+                self._last_streamed_speaker = speaker
                 
                 # Send to dashboard
                 if self.audio_callback:
                     try:
                         await self.audio_callback(audio_data)
                     except Exception as e:
-                        Log.error(f"[Caller stream] callback error: {e}")
+                        Log.error(f"[Stream] callback error: {e}")
                 
-                # Update last activity time
-                self._last_speaker_activity["Caller"] = time.time()
-                
-                # Calculate how long this chunk should take to play
+                # Calculate and wait for chunk playback duration
                 audio_b64 = audio_data.get("audio", "")
                 try:
                     audio_bytes = base64.b64decode(audio_b64)
                     chunk_duration = self._calculate_chunk_duration(audio_bytes)
                     
-                    # Wait for the chunk to "play" before sending next one
+                    # Wait for chunk to "play"
                     await asyncio.sleep(chunk_duration * 0.95)
                     
-                except Exception as e:
-                    Log.debug(f"[Caller] Duration calc error: {e}, using default 20ms")
-                    await asyncio.sleep(0.02)
-                
-                self._caller_audio_queue.task_done()
-                self._caller_streaming = False
-                
-            except Exception as e:
-                Log.error(f"[Caller stream] error: {e}")
-                self._caller_streaming = False
-                await asyncio.sleep(0.01)
-    
-    async def _stream_ai_audio(self):
-        """
-        Sequential audio streaming task for AI.
-        Sends chunks with PRECISE timing based on audio duration.
-        Includes natural pause when transitioning from Caller.
-        """
-        Log.info("[AI Stream] Started")
-        
-        while not self._shutdown:
-            try:
-                # Wait for next audio chunk
-                audio_data = await self._ai_audio_queue.get()
-                
-                if audio_data is None:  # Shutdown signal
-                    break
-                
-                # ✅ CRITICAL: Wait for speaker transition (adds 0.7-1s gap)
-                await self._wait_for_speaker_transition("AI")
-                
-                self._ai_streaming = True
-                
-                # Send to dashboard
-                if self.audio_callback:
-                    try:
-                        await self.audio_callback(audio_data)
-                    except Exception as e:
-                        Log.error(f"[AI stream] callback error: {e}")
-                
-                # Update last activity time
-                self._last_speaker_activity["AI"] = time.time()
-                
-                # Calculate actual duration and wait
-                audio_b64 = audio_data.get("audio", "")
-                try:
-                    audio_bytes = base64.b64decode(audio_b64)
-                    chunk_duration = self._calculate_chunk_duration(audio_bytes)
-                    
-                    # Wait for exact playback time
-                    await asyncio.sleep(chunk_duration * 0.95)
-                    
-                    Log.debug(f"[AI] Sent chunk ({len(audio_bytes)} bytes, {chunk_duration*1000:.1f}ms)")
+                    Log.debug(f"[{speaker}] Streamed chunk ({len(audio_bytes)} bytes, {chunk_duration*1000:.1f}ms)")
                     
                 except Exception as e:
-                    Log.debug(f"[AI] Duration calc error: {e}, using default 20ms")
+                    Log.debug(f"[Stream] Duration calc error: {e}, using default 20ms")
                     await asyncio.sleep(0.02)
                 
-                self._ai_audio_queue.task_done()
-                self._ai_streaming = False
+                self._unified_audio_queue.task_done()
                 
             except Exception as e:
-                Log.error(f"[AI stream] error: {e}")
-                self._ai_streaming = False
+                Log.error(f"[Stream] error: {e}")
                 await asyncio.sleep(0.01)
     
     async def transcribe_realtime(self, audio_input, source: str = "Unknown") -> str:
         """
-        Process incoming audio with TIMED audio streaming + background transcription.
+        Process incoming audio with unified queue streaming + background transcription.
         
         Flow:
         1. Audio chunk arrives
-        2. Add to sequential queue with timing info
-        3. Background task sends chunks with proper delays
-        4. Separate task accumulates and transcribes in background
+        2. Add to UNIFIED queue (first-come, first-serve)
+        3. Single task processes all chunks in order
+        4. Separate task handles transcription in background
         """
         try:
             # Convert input to bytes
@@ -264,7 +170,7 @@ class TranscriptionService:
             else:
                 return ""
             
-            # Queue audio for TIMED streaming
+            # ✅ Queue audio to UNIFIED queue (no separate queues!)
             audio_packet = {
                 "speaker": source,
                 "audio": original_base64,
@@ -272,10 +178,7 @@ class TranscriptionService:
                 "size": len(audio_bytes)
             }
             
-            if source == "Caller":
-                await self._caller_audio_queue.put(audio_packet)
-            elif source == "AI":
-                await self._ai_audio_queue.put(audio_packet)
+            await self._unified_audio_queue.put(audio_packet)
             
             # Add to transcription buffer (runs independently)
             if source == "Caller":
@@ -491,19 +394,12 @@ class TranscriptionService:
         try:
             self._shutdown = True
             
-            # Signal shutdown to streaming tasks
-            await self._caller_audio_queue.put(None)
-            await self._ai_audio_queue.put(None)
+            # Signal shutdown to unified queue
+            await self._unified_audio_queue.put(None)
             
-            # Wait for tasks to complete with timeout
-            tasks = []
-            if self._caller_stream_task and not self._caller_stream_task.done():
-                tasks.append(self._caller_stream_task)
-            if self._ai_stream_task and not self._ai_stream_task.done():
-                tasks.append(self._ai_stream_task)
-            
-            if tasks:
-                await asyncio.wait(tasks, timeout=2.0)
+            # Wait for streaming task to complete
+            if self._stream_task and not self._stream_task.done():
+                await asyncio.wait([self._stream_task], timeout=2.0)
             
             Log.info("TranscriptionService shutdown complete")
                 
