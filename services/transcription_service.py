@@ -20,6 +20,7 @@ class TranscriptionService:
     - Respects actual audio playback duration
     - No overlapping - proper flow maintained
     - Transcription runs independently in background
+    - Natural pause between speaker transitions
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
     
@@ -27,6 +28,9 @@ class TranscriptionService:
     CHUNK_DURATION_MS = 20  # Each chunk is 20ms of audio
     SAMPLE_RATE = 8000  # 8kHz sampling rate
     BYTES_PER_20MS = 160  # 8000 samples/sec * 0.02 sec = 160 bytes
+    
+    # Speaker transition settings
+    SPEAKER_TRANSITION_DELAY = 0.85  # Seconds of silence between speakers (0.7-1.0)
     
     # Transcription accumulation settings
     MIN_AUDIO_DURATION = 0.8
@@ -56,6 +60,13 @@ class TranscriptionService:
         
         self._caller_first_chunk_time: float = 0
         self._ai_first_chunk_time: float = 0
+        
+        # Track last activity per speaker for transition gaps
+        self._last_speaker_activity: Dict[str, float] = {
+            "Caller": 0,
+            "AI": 0
+        }
+        self._current_speaker: Optional[str] = None
         
         # Processing flags
         self._caller_processing: bool = False
@@ -100,6 +111,33 @@ class TranscriptionService:
         duration_seconds = num_samples / self.SAMPLE_RATE
         return duration_seconds
     
+    async def _wait_for_speaker_transition(self, new_speaker: str) -> None:
+        """
+        Add natural pause when switching between speakers.
+        Only applies when switching from Caller -> AI or AI -> Caller.
+        """
+        if self._current_speaker is None:
+            # First speaker - no wait
+            self._current_speaker = new_speaker
+            return
+        
+        if self._current_speaker == new_speaker:
+            # Same speaker continuing - no wait
+            return
+        
+        # Different speaker - check if enough time has passed
+        last_activity = self._last_speaker_activity.get(self._current_speaker, 0)
+        time_since_last = time.time() - last_activity
+        
+        if time_since_last < self.SPEAKER_TRANSITION_DELAY:
+            # Not enough time passed - wait for the remainder
+            remaining_wait = self.SPEAKER_TRANSITION_DELAY - time_since_last
+            Log.debug(f"[Speaker Transition] Waiting {remaining_wait:.2f}s before {new_speaker} speaks")
+            await asyncio.sleep(remaining_wait)
+        
+        # Update current speaker
+        self._current_speaker = new_speaker
+    
     async def _stream_caller_audio(self):
         """
         Sequential audio streaming task for Caller.
@@ -115,6 +153,9 @@ class TranscriptionService:
                 if audio_data is None:  # Shutdown signal
                     break
                 
+                # Wait for speaker transition if needed
+                await self._wait_for_speaker_transition("Caller")
+                
                 self._caller_streaming = True
                 
                 # Send to dashboard
@@ -124,6 +165,9 @@ class TranscriptionService:
                     except Exception as e:
                         Log.error(f"[Caller stream] callback error: {e}")
                 
+                # Update last activity time
+                self._last_speaker_activity["Caller"] = time.time()
+                
                 # Calculate how long this chunk should take to play
                 audio_b64 = audio_data.get("audio", "")
                 try:
@@ -131,12 +175,11 @@ class TranscriptionService:
                     chunk_duration = self._calculate_chunk_duration(audio_bytes)
                     
                     # Wait for the chunk to "play" before sending next one
-                    # Add small buffer to prevent gaps
-                    await asyncio.sleep(chunk_duration * 0.95)  # 95% to prevent buildup
+                    await asyncio.sleep(chunk_duration * 0.95)
                     
                 except Exception as e:
                     Log.debug(f"[Caller] Duration calc error: {e}, using default 20ms")
-                    await asyncio.sleep(0.02)  # Fallback to 20ms
+                    await asyncio.sleep(0.02)
                 
                 self._caller_audio_queue.task_done()
                 self._caller_streaming = False
@@ -150,7 +193,7 @@ class TranscriptionService:
         """
         Sequential audio streaming task for AI.
         Sends chunks with PRECISE timing based on audio duration.
-        This is critical for AI to prevent chunks playing all at once.
+        Includes natural pause when transitioning from Caller.
         """
         Log.info("[AI Stream] Started")
         
@@ -162,6 +205,9 @@ class TranscriptionService:
                 if audio_data is None:  # Shutdown signal
                     break
                 
+                # ✅ CRITICAL: Wait for speaker transition (adds 0.7-1s gap)
+                await self._wait_for_speaker_transition("AI")
+                
                 self._ai_streaming = True
                 
                 # Send to dashboard
@@ -171,14 +217,16 @@ class TranscriptionService:
                     except Exception as e:
                         Log.error(f"[AI stream] callback error: {e}")
                 
-                # ✅ CRITICAL: Calculate actual duration and wait
+                # Update last activity time
+                self._last_speaker_activity["AI"] = time.time()
+                
+                # Calculate actual duration and wait
                 audio_b64 = audio_data.get("audio", "")
                 try:
                     audio_bytes = base64.b64decode(audio_b64)
                     chunk_duration = self._calculate_chunk_duration(audio_bytes)
                     
                     # Wait for exact playback time
-                    # This prevents all chunks from being sent at once
                     await asyncio.sleep(chunk_duration * 0.95)
                     
                     Log.debug(f"[AI] Sent chunk ({len(audio_bytes)} bytes, {chunk_duration*1000:.1f}ms)")
@@ -221,7 +269,7 @@ class TranscriptionService:
                 "speaker": source,
                 "audio": original_base64,
                 "timestamp": int(time.time()),
-                "size": len(audio_bytes)  # For debugging
+                "size": len(audio_bytes)
             }
             
             if source == "Caller":
