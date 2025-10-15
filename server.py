@@ -131,33 +131,6 @@ async def _do_broadcast(payload: Dict[str, Any]):
         try:
             await client.send_text(text)
         except Exception as e:
-        Log.error(f"Error in media stream handler: {e}")
-    finally:
-        try:
-            # Shutdown transcription service
-            await openai_service.whisper_service.shutdown()
-        except Exception:
-            pass
-        
-        try:
-            await connection_manager.close_openai_connection()
-        except Exception:
-            pass
-
-
-# ---------------------------
-# Proper entry point for Render + production
-# ---------------------------
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "server:app",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", getattr(Config, "PORT", 8000))),
-        log_level="info",
-        reload=False,
-    ):
             Log.debug(f"Failed to send to client: {e}")
             to_remove.append(client)
     
@@ -373,4 +346,31 @@ async def handle_media_stream(websocket: WebSocket):
             renew_openai_session(),
         )
 
-    except Exception as e
+    except Exception as e:
+        Log.error(f"Error in media stream handler: {e}")
+    finally:
+        try:
+            # Shutdown transcription service
+            await openai_service.whisper_service.shutdown()
+        except Exception:
+            pass
+        
+        try:
+            await connection_manager.close_openai_connection()
+        except Exception:
+            pass
+
+
+# ---------------------------
+# Proper entry point for Render + production
+# ---------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", getattr(Config, "PORT", 8000))),
+        log_level="info",
+        reload=False,
+    )
