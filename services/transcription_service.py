@@ -20,11 +20,13 @@ class TranscriptionService:
     - Detects when a speaker has FINISHED speaking (silence period)
     - Adds 0.5s gap only between different speakers' COMPLETE turns
     - No gaps within same speaker's continuous chunks
+    - Resamples µ-law 8kHz to PCM16 16kHz for better browser playback
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
     
     # Audio format specs
     SAMPLE_RATE = 8000  # µ-law 8kHz from Twilio and OpenAI
+    DASHBOARD_SAMPLE_RATE = 16000  # PCM16 16kHz for dashboard playback
     CHUNK_DURATION_MS = 20
     BYTES_PER_20MS = 160
     
@@ -89,11 +91,70 @@ class TranscriptionService:
         """Set callback for transcription results."""
         self.transcription_callback = callback
     
-    def _calculate_chunk_duration(self, audio_bytes: bytes) -> float:
-        """Calculate audio chunk duration in seconds (8kHz µ-law)."""
-        num_samples = len(audio_bytes)
-        duration_seconds = num_samples / self.SAMPLE_RATE
+    def _calculate_chunk_duration(self, audio_bytes: bytes, sample_rate: int = None) -> float:
+        """Calculate audio chunk duration in seconds."""
+        if sample_rate is None:
+            sample_rate = self.DASHBOARD_SAMPLE_RATE
+        num_samples = len(audio_bytes) // 2  # PCM16 = 2 bytes per sample
+        duration_seconds = num_samples / sample_rate
         return duration_seconds
+    
+    def _resample_mulaw_to_pcm16(self, mulaw_bytes: bytes) -> bytes:
+        """
+        Convert µ-law 8kHz to PCM16 16kHz for better dashboard playback quality.
+        
+        Args:
+            mulaw_bytes: Raw µ-law encoded audio at 8kHz
+            
+        Returns:
+            PCM16 encoded audio at 16kHz as bytes
+        """
+        try:
+            # Convert µ-law to PCM16
+            pcm16_8k = self._mulaw_to_pcm16(mulaw_bytes)
+            
+            # Resample from 8kHz to 16kHz
+            pcm16_16k = self._resample_pcm16(pcm16_8k, self.SAMPLE_RATE, self.DASHBOARD_SAMPLE_RATE)
+            
+            return pcm16_16k.tobytes()
+        except Exception as e:
+            Log.error(f"[Resample] Error converting audio: {e}")
+            # Fallback: just convert µ-law to PCM16 at 8kHz
+            try:
+                pcm16_8k = self._mulaw_to_pcm16(mulaw_bytes)
+                return pcm16_8k.tobytes()
+            except:
+                return mulaw_bytes
+    
+    def _create_wav_base64(self, pcm16_bytes: bytes, sample_rate: int = None) -> str:
+        """
+        Create a WAV file from PCM16 data and return as base64.
+        This provides better browser compatibility.
+        
+        Args:
+            pcm16_bytes: PCM16 audio data
+            sample_rate: Sample rate (default: 16kHz)
+            
+        Returns:
+            Base64 encoded WAV file
+        """
+        if sample_rate is None:
+            sample_rate = self.DASHBOARD_SAMPLE_RATE
+            
+        try:
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, "wb") as wf:
+                wf.setnchannels(1)  # Mono
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(sample_rate)
+                wf.writeframes(pcm16_bytes)
+            
+            wav_io.seek(0)
+            wav_bytes = wav_io.read()
+            return base64.b64encode(wav_bytes).decode('ascii')
+        except Exception as e:
+            Log.error(f"[WAV] Error creating WAV: {e}")
+            return base64.b64encode(pcm16_bytes).decode('ascii')
     
     async def _check_speaker_finished(self, speaker: str) -> bool:
         """
@@ -110,8 +171,9 @@ class TranscriptionService:
         """
         Unified streaming task with smart speaker transition detection.
         Only adds gap when transitioning between COMPLETE speaker turns.
+        Sends resampled high-quality audio to dashboard.
         """
-        Log.info("[Unified Stream] Started with smart speaker detection")
+        Log.info("[Unified Stream] Started with smart speaker detection and resampling")
         
         while not self._shutdown:
             try:
@@ -160,18 +222,41 @@ class TranscriptionService:
                 # Update current speaker
                 self._last_streamed_speaker = speaker
                 
-                # Send to dashboard
+                # Send to dashboard with resampled audio
                 if self.audio_callback:
                     try:
-                        await self.audio_callback(audio_data)
+                        # Get the original µ-law audio
+                        audio_b64 = audio_data.get("audio", "")
+                        mulaw_bytes = base64.b64decode(audio_b64)
+                        
+                        # Resample to PCM16 16kHz for better quality
+                        pcm16_bytes = self._resample_mulaw_to_pcm16(mulaw_bytes)
+                        
+                        # Create WAV format for better browser compatibility
+                        wav_b64 = self._create_wav_base64(pcm16_bytes, self.DASHBOARD_SAMPLE_RATE)
+                        
+                        # Create enhanced payload
+                        enhanced_payload = {
+                            "speaker": speaker,
+                            "audio": wav_b64,  # High quality resampled audio
+                            "timestamp": audio_data.get("timestamp"),
+                            "size": len(pcm16_bytes),
+                            "format": "wav",  # Indicate WAV format
+                            "sampleRate": self.DASHBOARD_SAMPLE_RATE,
+                            "channels": 1,
+                            "bitDepth": 16
+                        }
+                        
+                        await self.audio_callback(enhanced_payload)
                     except Exception as e:
                         Log.error(f"[Stream] callback error: {e}")
                 
-                # Wait for chunk playback
-                audio_b64 = audio_data.get("audio", "")
+                # Wait for chunk playback (use new sample rate for timing)
                 try:
-                    audio_bytes = base64.b64decode(audio_b64)
-                    chunk_duration = self._calculate_chunk_duration(audio_bytes)
+                    audio_b64 = audio_data.get("audio", "")
+                    mulaw_bytes = base64.b64decode(audio_b64)
+                    pcm16_bytes = self._resample_mulaw_to_pcm16(mulaw_bytes)
+                    chunk_duration = self._calculate_chunk_duration(pcm16_bytes, self.DASHBOARD_SAMPLE_RATE)
                     await asyncio.sleep(chunk_duration * 0.95)
                 except Exception as e:
                     Log.debug(f"[Stream] Duration calc error: {e}")
@@ -198,7 +283,7 @@ class TranscriptionService:
             else:
                 return ""
             
-            # Queue for streaming
+            # Queue for streaming (original µ-law for now, will be resampled in stream)
             audio_packet = {
                 "speaker": source,
                 "audio": original_base64,
