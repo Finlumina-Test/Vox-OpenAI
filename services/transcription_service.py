@@ -19,7 +19,7 @@ class TranscriptionService:
     - Unified queue for first-come-first-serve
     - Detects when a speaker has FINISHED speaking (silence period)
     - Adds 0.5s gap ONLY between Caller->AI transitions
-    - No gaps for AI->Caller or within same speaker's continuous chunks
+    - NO gaps for AI->Caller (removed artificial delay)
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
     
@@ -30,7 +30,7 @@ class TranscriptionService:
     
     # Speaker turn detection
     SPEAKER_SILENCE_THRESHOLD = 0.3  # If no chunks for 0.3s, speaker is done
-    SPEAKER_TRANSITION_DELAY = 0.5   # Gap between different speakers
+    SPEAKER_TRANSITION_DELAY = 0.5   # Gap ONLY for Caller->AI
     
     # Transcription settings
     MIN_AUDIO_DURATION = 0.8
@@ -109,9 +109,10 @@ class TranscriptionService:
     async def _stream_unified_audio(self):
         """
         Unified streaming task with smart speaker transition detection.
-        Only adds gap when transitioning from Caller -> AI.
+        ONLY adds gap when transitioning from Caller -> AI.
+        NO gap for AI -> Caller (natural conversation flow).
         """
-        Log.info("[Unified Stream] Started with Caller->AI gap only")
+        Log.info("[Unified Stream] Started - Gap ONLY for Caller→AI")
         
         while not self._shutdown:
             try:
@@ -140,7 +141,7 @@ class TranscriptionService:
                     # Check if previous speaker had finished
                     previous_finished = time_gap >= self.SPEAKER_SILENCE_THRESHOLD
                     
-                    # ONLY add gap for Caller -> AI transition
+                    # ✅ ONLY add gap for Caller -> AI transition
                     if previous_speaker == "Caller" and speaker == "AI" and previous_finished:
                         if time_gap < self.SPEAKER_TRANSITION_DELAY:
                             remaining_gap = self.SPEAKER_TRANSITION_DELAY - time_gap
@@ -148,9 +149,12 @@ class TranscriptionService:
                             await asyncio.sleep(remaining_gap)
                         else:
                             Log.debug(f"[Stream] Caller → AI: natural gap {time_gap:.3f}s sufficient")
+                    # ✅ AI -> Caller: NO gap (removed completely)
+                    elif previous_speaker == "AI" and speaker == "Caller":
+                        Log.debug(f"[Stream] AI → Caller: NO GAP (natural flow)")
+                    # Same speaker: no gap
                     else:
-                        # AI -> Caller or same speaker: no gap
-                        Log.debug(f"[Stream] {previous_speaker} → {speaker}: no gap")
+                        Log.debug(f"[Stream] {previous_speaker} continuing: no gap")
                 
                 # Update last chunk time for this speaker
                 self._last_chunk_time_per_speaker[speaker] = current_time
@@ -165,7 +169,7 @@ class TranscriptionService:
                     except Exception as e:
                         Log.error(f"[Stream] callback error: {e}")
                 
-                # Wait for chunk playback
+                # Wait for chunk playback (95% of duration to prevent gaps)
                 audio_b64 = audio_data.get("audio", "")
                 try:
                     audio_bytes = base64.b64decode(audio_b64)
