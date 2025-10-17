@@ -13,13 +13,14 @@ from services.log_utils import Log
 
 class TranscriptionService:
     """
-    Real-time transcription service with smart speaker-aware streaming.
+    Real-time transcription service with strict sequential audio streaming.
     
     Key Features:
-    - Unified queue for first-come-first-serve
-    - Detects when a speaker has FINISHED speaking (silence period)
-    - Adds 0.5s gap ONLY between Caller->AI transitions
-    - NO gaps for AI->Caller (removed artificial delay)
+    - TRULY sequential audio delivery (one chunk completes before next starts)
+    - Smart speaker transition detection with proper delays
+    - 0.5s gap ONLY for Caller->AI transitions
+    - NO gaps for AI->Caller (natural flow)
+    - Prevents audio overlap completely
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
     
@@ -51,7 +52,10 @@ class TranscriptionService:
         # Speaker tracking for gaps
         self._last_streamed_speaker: Optional[str] = None
         self._last_chunk_time_per_speaker: Dict[str, float] = {}
-        self._speaker_finished: Dict[str, bool] = {"Caller": False, "AI": False}
+        
+        # Critical: Lock to ensure sequential playback
+        self._playback_lock: asyncio.Lock = asyncio.Lock()
+        self._last_chunk_end_time: float = 0
         
         # Transcription timing
         self._caller_last_chunk_time: float = 0
@@ -95,24 +99,15 @@ class TranscriptionService:
         duration_seconds = num_samples / self.SAMPLE_RATE
         return duration_seconds
     
-    async def _check_speaker_finished(self, speaker: str) -> bool:
-        """
-        Check if a speaker has finished their turn (no chunks recently).
-        """
-        last_time = self._last_chunk_time_per_speaker.get(speaker, 0)
-        if last_time == 0:
-            return False
-        
-        time_since_last = time.time() - last_time
-        return time_since_last >= self.SPEAKER_SILENCE_THRESHOLD
-    
     async def _stream_unified_audio(self):
         """
-        Unified streaming task with smart speaker transition detection.
-        ONLY adds gap when transitioning from Caller -> AI.
-        NO gap for AI -> Caller (natural conversation flow).
+        SEQUENTIAL audio streaming with proper speaker transitions.
+        - Uses async lock to ensure ONE chunk plays at a time
+        - Adds 0.5s gap ONLY for Caller->AI transitions
+        - NO gap for AI->Caller
+        - Prevents all audio overlap issues
         """
-        Log.info("[Unified Stream] Started - Gap ONLY for Caller→AI")
+        Log.info("[Unified Stream] Started - SEQUENTIAL playback with smart gaps")
         
         while not self._shutdown:
             try:
@@ -125,59 +120,68 @@ class TranscriptionService:
                 speaker = audio_data.get("speaker")
                 current_time = time.time()
                 
-                # Check if we're switching speakers
-                speaker_changed = (
-                    self._last_streamed_speaker is not None and 
-                    self._last_streamed_speaker != speaker
-                )
-                
-                if speaker_changed:
-                    previous_speaker = self._last_streamed_speaker
-                    previous_last_time = self._last_chunk_time_per_speaker.get(previous_speaker, 0)
-                    
-                    # Calculate the time gap between previous speaker's last chunk and current chunk
-                    time_gap = current_time - previous_last_time if previous_last_time > 0 else 0
-                    
-                    # Check if previous speaker had finished
-                    previous_finished = time_gap >= self.SPEAKER_SILENCE_THRESHOLD
-                    
-                    # ✅ ONLY add gap for Caller -> AI transition
-                    if previous_speaker == "Caller" and speaker == "AI" and previous_finished:
-                        if time_gap < self.SPEAKER_TRANSITION_DELAY:
-                            remaining_gap = self.SPEAKER_TRANSITION_DELAY - time_gap
-                            Log.debug(f"[Stream] Caller → AI: adding {remaining_gap:.3f}s gap")
-                            await asyncio.sleep(remaining_gap)
-                        else:
-                            Log.debug(f"[Stream] Caller → AI: natural gap {time_gap:.3f}s sufficient")
-                    # ✅ AI -> Caller: NO gap (removed completely)
-                    elif previous_speaker == "AI" and speaker == "Caller":
-                        Log.debug(f"[Stream] AI → Caller: NO GAP (natural flow)")
-                    # Same speaker: no gap
-                    else:
-                        Log.debug(f"[Stream] {previous_speaker} continuing: no gap")
-                
-                # Update last chunk time for this speaker
-                self._last_chunk_time_per_speaker[speaker] = current_time
-                
-                # Update current speaker
-                self._last_streamed_speaker = speaker
-                
-                # Send to dashboard
-                if self.audio_callback:
+                # 🔒 CRITICAL: Lock ensures sequential playback
+                async with self._playback_lock:
+                    # Calculate chunk duration first
+                    audio_b64 = audio_data.get("audio", "")
                     try:
-                        await self.audio_callback(audio_data)
+                        audio_bytes = base64.b64decode(audio_b64)
+                        chunk_duration = self._calculate_chunk_duration(audio_bytes)
                     except Exception as e:
-                        Log.error(f"[Stream] callback error: {e}")
-                
-                # Wait for chunk playback (95% of duration to prevent gaps)
-                audio_b64 = audio_data.get("audio", "")
-                try:
-                    audio_bytes = base64.b64decode(audio_b64)
-                    chunk_duration = self._calculate_chunk_duration(audio_bytes)
-                    await asyncio.sleep(chunk_duration * 0.95)
-                except Exception as e:
-                    Log.debug(f"[Stream] Duration calc error: {e}")
-                    await asyncio.sleep(0.02)
+                        Log.debug(f"[Stream] Duration calc error: {e}")
+                        chunk_duration = 0.02
+                    
+                    # Check if we're switching speakers
+                    speaker_changed = (
+                        self._last_streamed_speaker is not None and 
+                        self._last_streamed_speaker != speaker
+                    )
+                    
+                    if speaker_changed:
+                        previous_speaker = self._last_streamed_speaker
+                        previous_last_time = self._last_chunk_time_per_speaker.get(previous_speaker, 0)
+                        
+                        # Time gap from when previous speaker stopped to now
+                        time_gap = current_time - previous_last_time if previous_last_time > 0 else 0
+                        
+                        # Check if previous speaker had finished speaking
+                        previous_finished = time_gap >= self.SPEAKER_SILENCE_THRESHOLD
+                        
+                        # ✅ ONLY add gap for Caller -> AI transition
+                        if previous_speaker == "Caller" and speaker == "AI" and previous_finished:
+                            # Ensure minimum 0.5s gap between Caller finishing and AI starting
+                            if time_gap < self.SPEAKER_TRANSITION_DELAY:
+                                remaining_gap = self.SPEAKER_TRANSITION_DELAY - time_gap
+                                Log.debug(f"[Stream] Caller → AI: adding {remaining_gap:.3f}s gap")
+                                await asyncio.sleep(remaining_gap)
+                            else:
+                                Log.debug(f"[Stream] Caller → AI: natural gap {time_gap:.3f}s sufficient")
+                        
+                        # ✅ AI -> Caller: NO gap (natural conversation flow)
+                        elif previous_speaker == "AI" and speaker == "Caller":
+                            Log.debug(f"[Stream] AI → Caller: NO GAP (immediate response)")
+                        
+                        # Same speaker continuing: no gap
+                        else:
+                            Log.debug(f"[Stream] {previous_speaker} continuing: no gap")
+                    
+                    # Update tracking
+                    self._last_chunk_time_per_speaker[speaker] = current_time
+                    self._last_streamed_speaker = speaker
+                    
+                    # Send to dashboard immediately
+                    if self.audio_callback:
+                        try:
+                            await self.audio_callback(audio_data)
+                        except Exception as e:
+                            Log.error(f"[Stream] callback error: {e}")
+                    
+                    # Wait for THIS chunk to complete playback before releasing lock
+                    # This ensures next chunk won't start until current one finishes
+                    await asyncio.sleep(chunk_duration)
+                    
+                    # Update last chunk end time
+                    self._last_chunk_end_time = time.time()
                 
                 self._unified_audio_queue.task_done()
                 
