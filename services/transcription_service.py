@@ -7,19 +7,20 @@ import numpy as np
 import time    
 from scipy.signal import resample
 from typing import Dict, Optional, List, Callable
+from collections import deque
 from config import Config
 from services.log_utils import Log
 
 
 class TranscriptionService:
     """
-    Real-time transcription service with strict sequential audio delivery.
+    Real-time transcription service with Voice Activity Detection.
     
     Key Features:
+    - VAD prevents streaming non-speech caller audio (solves delay issue!)
     - Sequential audio playback (no overlap possible)
     - 0.5s gap ONLY for Caller->AI transitions
     - NO gaps for AI->Caller (natural conversation flow)
-    - Silence detection to prevent silent chunk backlog
     - Async lock ensures one chunk completes before next starts
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
@@ -33,9 +34,12 @@ class TranscriptionService:
     SPEAKER_SILENCE_THRESHOLD = 0.3  # If no chunks for 0.3s, speaker is done
     SPEAKER_TRANSITION_DELAY = 0.5   # Gap ONLY for Caller->AI
     
-    # Silence detection (for skipping silent chunks)
-    SILENCE_THRESHOLD_ENERGY = 500  # Energy threshold for silence (tune as needed)
-    SILENCE_THRESHOLD_RMS = 200     # RMS threshold for silence
+    # Voice Activity Detection (VAD)
+    VAD_ENERGY_THRESHOLD = 1000      # Energy threshold for speech
+    VAD_ZCR_THRESHOLD = 0.1          # Zero-crossing rate threshold
+    VAD_CONSECUTIVE_SPEECH = 3       # Need 3 consecutive speech chunks to start
+    VAD_CONSECUTIVE_SILENCE = 5      # Need 5 consecutive silence chunks to stop
+    VAD_LOOKBACK_CHUNKS = 10         # Keep last 10 chunks for context
     
     # Transcription settings
     MIN_AUDIO_DURATION = 0.8
@@ -59,6 +63,12 @@ class TranscriptionService:
         
         # 🔒 CRITICAL: Sequential playback lock
         self._playback_lock: asyncio.Lock = asyncio.Lock()
+        
+        # VAD state for caller
+        self._caller_is_speaking: bool = False
+        self._caller_speech_chunks_count: int = 0
+        self._caller_silence_chunks_count: int = 0
+        self._caller_chunk_history: deque = deque(maxlen=self.VAD_LOOKBACK_CHUNKS)
         
         # Transcription timing
         self._caller_last_chunk_time: float = 0
@@ -102,12 +112,11 @@ class TranscriptionService:
         duration_seconds = num_samples / self.SAMPLE_RATE
         return duration_seconds
     
-    def _is_silence(self, mulaw_bytes: bytes) -> bool:
+    def _detect_speech(self, mulaw_bytes: bytes) -> bool:
         """
-        Detect if audio chunk is silence using energy and RMS thresholds.
+        Voice Activity Detection using energy and zero-crossing rate.
         
-        This prevents silent caller chunks (when listening to AI) from
-        clogging the queue and adding artificial delay.
+        Returns True if chunk likely contains speech, False otherwise.
         """
         try:
             # Convert µ-law to PCM16 for analysis
@@ -116,18 +125,50 @@ class TranscriptionService:
             # Calculate energy (sum of squared amplitudes)
             energy = np.sum(pcm16.astype(np.float64) ** 2)
             
-            # Calculate RMS (root mean square)
-            rms = np.sqrt(np.mean(pcm16.astype(np.float64) ** 2))
+            # Calculate zero-crossing rate (indicator of voice frequency content)
+            zcr = np.sum(np.abs(np.diff(np.sign(pcm16)))) / (2 * len(pcm16))
             
-            # Chunk is silent if both energy and RMS are below thresholds
-            is_silent = (energy < self.SILENCE_THRESHOLD_ENERGY and 
-                        rms < self.SILENCE_THRESHOLD_RMS)
+            # Speech has high energy AND moderate zero-crossing rate
+            has_speech = (energy > self.VAD_ENERGY_THRESHOLD and 
+                         zcr > self.VAD_ZCR_THRESHOLD)
             
-            return is_silent
+            return has_speech
             
         except Exception as e:
-            Log.debug(f"[Silence Detection] Error: {e}")
-            return False  # If error, assume not silent (safer)
+            Log.debug(f"[VAD] Error: {e}")
+            return False
+    
+    def _update_vad_state(self, has_speech: bool, audio_bytes: bytes) -> bool:
+        """
+        Update VAD state machine and determine if chunk should be streamed.
+        
+        Returns True if chunk should be streamed to dashboard.
+        """
+        # Store chunk in history
+        self._caller_chunk_history.append(audio_bytes)
+        
+        if has_speech:
+            self._caller_speech_chunks_count += 1
+            self._caller_silence_chunks_count = 0
+            
+            # Start speaking after consecutive speech chunks
+            if not self._caller_is_speaking and self._caller_speech_chunks_count >= self.VAD_CONSECUTIVE_SPEECH:
+                self._caller_is_speaking = True
+                Log.info("[VAD] 🎤 Caller started speaking")
+                
+                # Stream buffered chunks from history
+                return True
+        else:
+            self._caller_silence_chunks_count += 1
+            self._caller_speech_chunks_count = 0
+            
+            # Stop speaking after consecutive silence chunks
+            if self._caller_is_speaking and self._caller_silence_chunks_count >= self.VAD_CONSECUTIVE_SILENCE:
+                self._caller_is_speaking = False
+                Log.info("[VAD] 🔇 Caller stopped speaking")
+        
+        # Stream if currently in speaking state
+        return self._caller_is_speaking
     
     async def _stream_unified_audio(self):
         """
@@ -220,9 +261,10 @@ class TranscriptionService:
     
     async def transcribe_realtime(self, audio_input, source: str = "Unknown") -> str:
         """
-        Process incoming audio: queue for streaming + buffer for transcription.
+        Process incoming audio with Voice Activity Detection.
         
-        🎯 KEY FIX: Skip silent caller chunks to prevent queue backlog!
+        🎯 KEY FIX: Only stream caller audio when actually speaking!
+        This prevents queue backlog from background noise.
         """
         try:
             # Convert to bytes
@@ -235,29 +277,41 @@ class TranscriptionService:
             else:
                 return ""
             
-            # 🎯 CRITICAL: Skip silent caller chunks
-            # This prevents queue backlog when caller is listening
+            should_stream = True
+            
+            # 🎯 CRITICAL: Apply VAD to caller audio only
             if source == "Caller":
-                if self._is_silence(audio_bytes):
-                    # Still buffer for transcription (might be pause between words)
-                    await self._add_to_caller_buffer(audio_bytes)
-                    # But DON'T queue for streaming - this prevents delay!
-                    return ""
-            
-            # Queue for streaming (only non-silent chunks for Caller)
-            audio_packet = {
-                "speaker": source,
-                "audio": original_base64,
-                "timestamp": int(time.time()),
-                "size": len(audio_bytes)
-            }
-            
-            await self._unified_audio_queue.put(audio_packet)
-            
-            # Buffer for transcription
-            if source == "Caller":
+                has_speech = self._detect_speech(audio_bytes)
+                should_stream = self._update_vad_state(has_speech, audio_bytes)
+                
+                # Always buffer for transcription (even non-speech)
                 await self._add_to_caller_buffer(audio_bytes)
-            elif source == "AI":
+                
+                # If VAD says caller just started speaking, flush history
+                if should_stream and self._caller_speech_chunks_count == self.VAD_CONSECUTIVE_SPEECH:
+                    # Stream recent chunks from history for context
+                    for hist_chunk in list(self._caller_chunk_history)[:-1]:  # All except current
+                        hist_b64 = base64.b64encode(hist_chunk).decode('ascii')
+                        hist_packet = {
+                            "speaker": source,
+                            "audio": hist_b64,
+                            "timestamp": int(time.time()),
+                            "size": len(hist_chunk)
+                        }
+                        await self._unified_audio_queue.put(hist_packet)
+            
+            # Only queue if should stream
+            if should_stream:
+                audio_packet = {
+                    "speaker": source,
+                    "audio": original_base64,
+                    "timestamp": int(time.time()),
+                    "size": len(audio_bytes)
+                }
+                await self._unified_audio_queue.put(audio_packet)
+            
+            # Buffer for transcription (AI always buffers)
+            if source == "AI":
                 await self._add_to_ai_buffer(audio_bytes)
             
             return ""
