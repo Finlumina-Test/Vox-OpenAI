@@ -19,6 +19,7 @@ class TranscriptionService:
     - Sequential audio playback (no overlap possible)
     - 0.5s gap ONLY for Caller->AI transitions
     - NO gaps for AI->Caller (natural conversation flow)
+    - Silence detection to prevent silent chunk backlog
     - Async lock ensures one chunk completes before next starts
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
@@ -31,6 +32,10 @@ class TranscriptionService:
     # Speaker turn detection
     SPEAKER_SILENCE_THRESHOLD = 0.3  # If no chunks for 0.3s, speaker is done
     SPEAKER_TRANSITION_DELAY = 0.5   # Gap ONLY for Caller->AI
+    
+    # Silence detection (for skipping silent chunks)
+    SILENCE_THRESHOLD_ENERGY = 500  # Energy threshold for silence (tune as needed)
+    SILENCE_THRESHOLD_RMS = 200     # RMS threshold for silence
     
     # Transcription settings
     MIN_AUDIO_DURATION = 0.8
@@ -96,6 +101,33 @@ class TranscriptionService:
         num_samples = len(audio_bytes)
         duration_seconds = num_samples / self.SAMPLE_RATE
         return duration_seconds
+    
+    def _is_silence(self, mulaw_bytes: bytes) -> bool:
+        """
+        Detect if audio chunk is silence using energy and RMS thresholds.
+        
+        This prevents silent caller chunks (when listening to AI) from
+        clogging the queue and adding artificial delay.
+        """
+        try:
+            # Convert µ-law to PCM16 for analysis
+            pcm16 = self._mulaw_to_pcm16(mulaw_bytes)
+            
+            # Calculate energy (sum of squared amplitudes)
+            energy = np.sum(pcm16.astype(np.float64) ** 2)
+            
+            # Calculate RMS (root mean square)
+            rms = np.sqrt(np.mean(pcm16.astype(np.float64) ** 2))
+            
+            # Chunk is silent if both energy and RMS are below thresholds
+            is_silent = (energy < self.SILENCE_THRESHOLD_ENERGY and 
+                        rms < self.SILENCE_THRESHOLD_RMS)
+            
+            return is_silent
+            
+        except Exception as e:
+            Log.debug(f"[Silence Detection] Error: {e}")
+            return False  # If error, assume not silent (safer)
     
     async def _stream_unified_audio(self):
         """
@@ -189,6 +221,8 @@ class TranscriptionService:
     async def transcribe_realtime(self, audio_input, source: str = "Unknown") -> str:
         """
         Process incoming audio: queue for streaming + buffer for transcription.
+        
+        🎯 KEY FIX: Skip silent caller chunks to prevent queue backlog!
         """
         try:
             # Convert to bytes
@@ -201,7 +235,16 @@ class TranscriptionService:
             else:
                 return ""
             
-            # Queue for streaming
+            # 🎯 CRITICAL: Skip silent caller chunks
+            # This prevents queue backlog when caller is listening
+            if source == "Caller":
+                if self._is_silence(audio_bytes):
+                    # Still buffer for transcription (might be pause between words)
+                    await self._add_to_caller_buffer(audio_bytes)
+                    # But DON'T queue for streaming - this prevents delay!
+                    return ""
+            
+            # Queue for streaming (only non-silent chunks for Caller)
             audio_packet = {
                 "speaker": source,
                 "audio": original_base64,
