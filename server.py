@@ -1,4 +1,4 @@
-# server.py (multi-call capable with call isolation)
+# server.py (multi-call capable with dual transcription system)
 import os
 import json
 import time
@@ -45,7 +45,7 @@ async def handle_audio_stream(audio_data: Dict[str, Any], call_sid: str):
         "speaker": audio_data["speaker"],
         "audio": audio_data["audio"],
         "timestamp": audio_data["timestamp"],
-        "callSid": call_sid,  # ✅ Add call_sid to every message
+        "callSid": call_sid,
     }
     
     await _do_broadcast(payload, call_sid)
@@ -58,7 +58,7 @@ async def handle_transcription_update(transcription_data: Dict[str, Any], call_s
         "speaker": transcription_data["speaker"],
         "text": transcription_data["text"],
         "timestamp": transcription_data["timestamp"],
-        "callSid": call_sid,  # ✅ Add call_sid
+        "callSid": call_sid,
     }
     
     broadcast_to_dashboards_nonblocking(payload, call_sid)
@@ -207,7 +207,7 @@ async def handle_media_stream(websocket: WebSocket):
     Log.header("Client connected")
     await websocket.accept()
 
-    # ✅ Each connection gets its own instances (isolated)
+    # ✅ Each connection gets its own instances (isolated per call)
     connection_manager = WebSocketConnectionManager(websocket)
     openai_service = OpenAIService()
     audio_service = AudioService()
@@ -223,29 +223,38 @@ async def handle_media_stream(websocket: WebSocket):
             "messageType": "orderUpdate",
             "orderData": order_data,
             "timestamp": int(time.time()),
-            "callSid": current_call_sid,  # ✅ Include call_sid
+            "callSid": current_call_sid,
         }
         broadcast_to_dashboards_nonblocking(payload, current_call_sid)
     
     order_extractor.set_update_callback(send_order_update)
     
-    # ✅ Enhanced transcription callback WITH call_sid
+    # ✅ Unified transcription callback with dual-source handling
     async def handle_transcription_with_extraction(transcription_data: Dict[str, Any]):
-        """Handle transcription AND extract order info."""
-        # Send transcription to dashboard
-        payload = {
-            "messageType": "transcription",
-            "speaker": transcription_data["speaker"],
-            "text": transcription_data["text"],
-            "timestamp": transcription_data["timestamp"],
-            "callSid": current_call_sid,  # ✅ Include call_sid
-        }
-        broadcast_to_dashboards_nonblocking(payload, current_call_sid)
+        """
+        Handle transcription from multiple sources:
+        - Caller: Whisper transcription
+        - AI: OpenAI native (for dashboard)
+        - AI_whisper: Whisper transcription (for order extraction only)
+        """
+        speaker = transcription_data["speaker"]
         
-        # Extract order information
+        # Only send to dashboard if NOT from Whisper's AI transcription
+        # (OpenAI's native transcript goes to dashboard instead)
+        if speaker != "AI_whisper":
+            payload = {
+                "messageType": "transcription",
+                "speaker": "AI" if speaker == "AI_whisper" else speaker,  # Normalize
+                "text": transcription_data["text"],
+                "timestamp": transcription_data["timestamp"],
+                "callSid": current_call_sid,
+            }
+            broadcast_to_dashboards_nonblocking(payload, current_call_sid)
+        
+        # Extract order information from ALL transcripts (including AI_whisper)
         try:
             order_extractor.add_transcript(
-                transcription_data["speaker"],
+                "AI" if speaker == "AI_whisper" else speaker,  # Normalize for extraction
                 transcription_data["text"]
             )
         except Exception as e:
@@ -253,13 +262,14 @@ async def handle_media_stream(websocket: WebSocket):
     
     # ✅ Audio callback with call_sid
     async def handle_audio_with_call_id(audio_data: Dict[str, Any]):
-        """Wrapper to add call_sid to audio."""
+        """Wrapper to add call_sid to audio streams."""
         if current_call_sid:
             await handle_audio_stream(audio_data, current_call_sid)
     
-    # Set up callbacks
+    # Set up callbacks for transcription system
     openai_service.whisper_service.set_audio_callback(handle_audio_with_call_id)
-    openai_service.whisper_service.set_word_callback(handle_transcription_with_extraction)
+    openai_service.whisper_service.set_word_callback(handle_transcription_with_extraction)  # ALL Whisper transcripts
+    openai_service.ai_transcript_callback = handle_transcription_with_extraction  # OpenAI native (for dashboard)
 
     try:
         # Connect to OpenAI
@@ -284,6 +294,7 @@ async def handle_media_stream(websocket: WebSocket):
                 payload_b64 = media.get("payload")
                 if payload_b64:
                     try:
+                        # Transcribe caller audio with Whisper
                         asyncio.create_task(
                             openai_service.whisper_service.transcribe_realtime(
                                 payload_b64, source="Caller"
@@ -306,7 +317,7 @@ async def handle_media_stream(websocket: WebSocket):
                     "speaker": "Caller",
                     "text": data["text"].strip(),
                     "timestamp": data.get("timestamp") or int(time.time()),
-                    "callSid": current_call_sid,  # ✅ Include call_sid
+                    "callSid": current_call_sid,
                 }
                 broadcast_to_dashboards_nonblocking(txt_obj, current_call_sid)
 
@@ -327,9 +338,11 @@ async def handle_media_stream(websocket: WebSocket):
                         delta_bytes = None
 
                     if delta_bytes:
+                        # ✅ Transcribe AI audio with Whisper for order extraction accuracy
+                        # This catches network issues, audio glitches, pronunciation variations
                         asyncio.create_task(
                             openai_service.whisper_service.transcribe_realtime(
-                                delta_bytes, source="AI"
+                                delta_bytes, source="AI_whisper"  # Different tag to prevent dashboard display
                             )
                         )
 
@@ -347,20 +360,6 @@ async def handle_media_stream(websocket: WebSocket):
                         except Exception as e:
                             log_nonblocking(Log.error, f"[audio->twilio] failed: {e}")
 
-                if hasattr(openai_service, "extract_transcript_text"):
-                    try:
-                        transcript_text = openai_service.extract_transcript_text(response)
-                        if transcript_text:
-                            broadcast_to_dashboards_nonblocking({
-                                "messageType": "text",
-                                "speaker": "AI",
-                                "text": transcript_text,
-                                "timestamp": response.get("timestamp") or int(time.time()),
-                                "callSid": current_call_sid,  # ✅ Include call_sid
-                            }, current_call_sid)
-                    except Exception:
-                        pass
-
             except Exception as e:
                 log_nonblocking(Log.error, f"[audio-delta] failed: {e}")
 
@@ -372,6 +371,9 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def handle_other_openai_event(response: dict):
             openai_service.process_event_for_logging(response)
+            
+            # ✅ Extract AI transcript from OpenAI native (for dashboard display)
+            await openai_service.extract_and_emit_ai_transcript(response)
 
         async def openai_receiver():
             await connection_manager.receive_from_openai(
@@ -426,7 +428,7 @@ async def handle_media_stream(websocket: WebSocket):
                     "orderData": final_order,
                     "summary": final_summary,
                     "timestamp": int(time.time()),
-                    "callSid": current_call_sid,  # ✅ Include call_sid
+                    "callSid": current_call_sid,
                 }, current_call_sid)
         except Exception:
             pass
