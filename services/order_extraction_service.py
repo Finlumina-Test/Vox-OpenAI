@@ -30,17 +30,6 @@ class OrderExtractionService:
             "delivery_time": None,
             "total_price": None
         }
-    
-    async def shutdown(self):
-        """Graceful shutdown."""
-        self._shutdown = True
-        if self._extraction_task and not self._extraction_task.done():
-            self._extraction_task.cancel()
-            try:
-                await self._extraction_task
-            except asyncio.CancelledError:
-                pass_price": None
-        }
         
         self._last_extraction_time: float = 0
         self._extraction_interval: float = 5.0
@@ -259,8 +248,11 @@ Return ONLY valid JSON. Example:
         return "\n".join(lines)
     
     def is_order_complete(self) -> bool:
-        """Check if all essential order information is captured."""
-        essential_fields = ["customer_name", "phone_number", "order_items", "delivery_address"]
+        """
+        Check if all essential order information is captured.
+        Essential fields: customer_name, phone_number, delivery_address, order_items
+        """
+        essential_fields = ["customer_name", "phone_number", "delivery_address", "order_items"]
         return all(
             self._sent_data.get(field) and 
             (not isinstance(self._sent_data[field], list) or len(self._sent_data[field]) > 0)
@@ -278,4 +270,15 @@ Return ONLY valid JSON. Example:
             "special_instructions": None,
             "payment_method": None,
             "delivery_time": None,
-            "total
+            "total_price": None
+        }
+    
+    async def shutdown(self):
+        """Graceful shutdown."""
+        self._shutdown = True
+        if self._extraction_task and not self._extraction_task.done():
+            self._extraction_task.cancel()
+            try:
+                await self._extraction_task
+            except asyncio.CancelledError:
+                pass
