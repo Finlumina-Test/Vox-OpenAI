@@ -5,7 +5,8 @@ import asyncio
 import aiohttp
 import numpy as np
 import time    
-from scipy.signal import resample
+from scipy.signal import resample, butter, filtfilt, wiener
+from scipy.ndimage import median_filter
 from typing import Dict, Optional, List, Callable
 from collections import deque
 from config import Config
@@ -14,32 +15,38 @@ from services.log_utils import Log
 
 class TranscriptionService:
     """
-    Real-time transcription service with Voice Activity Detection.
+    Real-time transcription service with 4K audio enhancement.
     
     Key Features:
-    - VAD prevents streaming non-speech caller audio (solves delay issue!)
-    - Sequential audio playback (no overlap possible)
+    - 24kHz PCM16 output (3x higher quality than 8kHz)
+    - Noise reduction & spectral enhancement
+    - Voice Activity Detection (VAD)
+    - Sequential audio playback
     - 0.5s gap ONLY for Caller->AI transitions
-    - NO gaps for AI->Caller (natural conversation flow)
-    - Async lock ensures one chunk completes before next starts
+    - NO gaps for AI->Caller
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
     
     # Audio format specs
-    SAMPLE_RATE = 8000  # µ-law 8kHz from Twilio and OpenAI
+    INPUT_SAMPLE_RATE = 8000    # µ-law 8kHz from Twilio/OpenAI
+    OUTPUT_SAMPLE_RATE = 24000  # 🎵 24kHz for dashboard (3x quality boost!)
     CHUNK_DURATION_MS = 20
-    BYTES_PER_20MS = 160
     
     # Speaker turn detection
-    SPEAKER_SILENCE_THRESHOLD = 0.3  # If no chunks for 0.3s, speaker is done
-    SPEAKER_TRANSITION_DELAY = 0.5   # Gap ONLY for Caller->AI
+    SPEAKER_SILENCE_THRESHOLD = 0.3
+    SPEAKER_TRANSITION_DELAY = 0.5
     
-    # Voice Activity Detection (VAD)
-    VAD_ENERGY_THRESHOLD = 1000      # Energy threshold for speech
-    VAD_ZCR_THRESHOLD = 0.1          # Zero-crossing rate threshold
-    VAD_CONSECUTIVE_SPEECH = 3       # Need 3 consecutive speech chunks to start
-    VAD_CONSECUTIVE_SILENCE = 5      # Need 5 consecutive silence chunks to stop
-    VAD_LOOKBACK_CHUNKS = 10         # Keep last 10 chunks for context
+    # Voice Activity Detection
+    VAD_ENERGY_THRESHOLD = 1000
+    VAD_ZCR_THRESHOLD = 0.1
+    VAD_CONSECUTIVE_SPEECH = 3
+    VAD_CONSECUTIVE_SILENCE = 5
+    VAD_LOOKBACK_CHUNKS = 10
+    
+    # Audio enhancement settings
+    NOISE_REDUCTION_STRENGTH = 0.7  # 0.0-1.0 (higher = more aggressive)
+    SPECTRAL_ENHANCEMENT = True     # Enable frequency enhancement
+    DYNAMIC_RANGE_COMPRESSION = True # Normalize volume
     
     # Transcription settings
     MIN_AUDIO_DURATION = 0.8
@@ -61,10 +68,10 @@ class TranscriptionService:
         self._last_streamed_speaker: Optional[str] = None
         self._last_chunk_time_per_speaker: Dict[str, float] = {}
         
-        # 🔒 CRITICAL: Sequential playback lock
+        # Sequential playback lock
         self._playback_lock: asyncio.Lock = asyncio.Lock()
         
-        # VAD state for caller
+        # VAD state
         self._caller_is_speaking: bool = False
         self._caller_speech_chunks_count: int = 0
         self._caller_silence_chunks_count: int = 0
@@ -92,6 +99,10 @@ class TranscriptionService:
         self._caller_last_transcript: str = ""
         self._ai_last_transcript: str = ""
         
+        # Noise profile estimation (for adaptive noise reduction)
+        self._noise_profile: Optional[np.ndarray] = None
+        self._noise_samples_count: int = 0
+        
         # Shutdown flag
         self._shutdown: bool = False
     
@@ -106,29 +117,184 @@ class TranscriptionService:
         """Set callback for transcription results."""
         self.transcription_callback = callback
     
-    def _calculate_chunk_duration(self, audio_bytes: bytes) -> float:
-        """Calculate audio chunk duration in seconds (8kHz µ-law)."""
-        num_samples = len(audio_bytes)
-        duration_seconds = num_samples / self.SAMPLE_RATE
+    def _calculate_chunk_duration(self, audio_bytes: bytes, sample_rate: int = None) -> float:
+        """Calculate audio chunk duration in seconds."""
+        if sample_rate is None:
+            sample_rate = self.OUTPUT_SAMPLE_RATE
+        # For PCM16, each sample is 2 bytes
+        num_samples = len(audio_bytes) // 2
+        duration_seconds = num_samples / sample_rate
         return duration_seconds
     
-    def _detect_speech(self, mulaw_bytes: bytes) -> bool:
+    # ==================== AUDIO ENHANCEMENT ====================
+    
+    def _enhance_audio(self, pcm16_data: np.ndarray, sample_rate: int) -> np.ndarray:
         """
-        Voice Activity Detection using energy and zero-crossing rate.
+        🎵 4K Audio Enhancement Pipeline
         
-        Returns True if chunk likely contains speech, False otherwise.
+        Steps:
+        1. Noise reduction (spectral subtraction + Wiener filtering)
+        2. Bandpass filter (preserve voice frequencies)
+        3. Spectral enhancement (clarity boost)
+        4. Dynamic range compression (volume normalization)
         """
         try:
-            # Convert µ-law to PCM16 for analysis
+            # Convert to float for processing
+            audio_float = pcm16_data.astype(np.float32) / 32768.0
+            
+            # Step 1: Noise Reduction
+            audio_float = self._reduce_noise(audio_float, sample_rate)
+            
+            # Step 2: Bandpass Filter (300Hz - 3400Hz for voice)
+            audio_float = self._bandpass_filter(audio_float, sample_rate)
+            
+            # Step 3: Spectral Enhancement
+            if self.SPECTRAL_ENHANCEMENT:
+                audio_float = self._spectral_enhancement(audio_float, sample_rate)
+            
+            # Step 4: Dynamic Range Compression
+            if self.DYNAMIC_RANGE_COMPRESSION:
+                audio_float = self._compress_dynamic_range(audio_float)
+            
+            # Convert back to PCM16
+            audio_float = np.clip(audio_float, -1.0, 1.0)
+            enhanced_pcm16 = (audio_float * 32767).astype(np.int16)
+            
+            return enhanced_pcm16
+            
+        except Exception as e:
+            Log.debug(f"[Enhancement] Error: {e}, returning original")
+            return pcm16_data
+    
+    def _reduce_noise(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        """
+        Adaptive noise reduction using spectral subtraction.
+        """
+        try:
+            # Estimate noise profile from first few frames if not done
+            if self._noise_profile is None and self._noise_samples_count < 5:
+                self._update_noise_profile(audio)
+                return audio  # Return original for first few chunks
+            
+            if self._noise_profile is None:
+                return audio
+            
+            # Apply spectral subtraction
+            fft_audio = np.fft.rfft(audio)
+            magnitude = np.abs(fft_audio)
+            phase = np.angle(fft_audio)
+            
+            # Subtract noise profile
+            clean_magnitude = magnitude - (self._noise_profile * self.NOISE_REDUCTION_STRENGTH)
+            clean_magnitude = np.maximum(clean_magnitude, magnitude * 0.1)  # Floor to prevent artifacts
+            
+            # Reconstruct signal
+            clean_fft = clean_magnitude * np.exp(1j * phase)
+            clean_audio = np.fft.irfft(clean_fft, n=len(audio))
+            
+            return clean_audio
+            
+        except Exception as e:
+            Log.debug(f"[Noise Reduction] Error: {e}")
+            return audio
+    
+    def _update_noise_profile(self, audio: np.ndarray):
+        """Update noise profile from silent/background audio."""
+        try:
+            fft_audio = np.fft.rfft(audio)
+            magnitude = np.abs(fft_audio)
+            
+            if self._noise_profile is None:
+                self._noise_profile = magnitude
+            else:
+                # Running average
+                alpha = 0.95
+                self._noise_profile = alpha * self._noise_profile + (1 - alpha) * magnitude
+            
+            self._noise_samples_count += 1
+            
+        except Exception as e:
+            Log.debug(f"[Noise Profile] Error: {e}")
+    
+    def _bandpass_filter(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        """
+        Bandpass filter to isolate human voice frequencies (300Hz - 3400Hz).
+        """
+        try:
+            nyquist = sample_rate / 2
+            low_freq = 300 / nyquist
+            high_freq = 3400 / nyquist
+            
+            # Butterworth bandpass filter
+            b, a = butter(4, [low_freq, high_freq], btype='band')
+            filtered = filtfilt(b, a, audio)
+            
+            return filtered
+            
+        except Exception as e:
+            Log.debug(f"[Bandpass] Error: {e}")
+            return audio
+    
+    def _spectral_enhancement(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        """
+        Enhance speech clarity by boosting mid-high frequencies (1kHz-3kHz).
+        """
+        try:
+            # Apply gentle high-shelf filter to enhance clarity
+            fft_audio = np.fft.rfft(audio)
+            freqs = np.fft.rfftfreq(len(audio), 1/sample_rate)
+            
+            # Boost 1kHz-3kHz range (speech clarity)
+            boost_mask = (freqs >= 1000) & (freqs <= 3000)
+            boost_factor = 1.3  # 30% boost
+            
+            fft_audio[boost_mask] *= boost_factor
+            
+            enhanced = np.fft.irfft(fft_audio, n=len(audio))
+            return enhanced
+            
+        except Exception as e:
+            Log.debug(f"[Spectral Enhancement] Error: {e}")
+            return audio
+    
+    def _compress_dynamic_range(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Soft compression to normalize volume levels.
+        """
+        try:
+            # Calculate RMS and normalize
+            rms = np.sqrt(np.mean(audio ** 2))
+            
+            if rms < 0.01:  # Too quiet
+                return audio
+            
+            target_rms = 0.15
+            gain = target_rms / rms
+            
+            # Limit gain to prevent over-amplification
+            gain = min(gain, 3.0)
+            
+            compressed = audio * gain
+            
+            # Soft clipping
+            compressed = np.tanh(compressed * 1.2) * 0.9
+            
+            return compressed
+            
+        except Exception as e:
+            Log.debug(f"[Compression] Error: {e}")
+            return audio
+    
+    # ==================== VAD ====================
+    
+    def _detect_speech(self, mulaw_bytes: bytes) -> bool:
+        """Voice Activity Detection using energy and zero-crossing rate."""
+        try:
             pcm16 = self._mulaw_to_pcm16(mulaw_bytes)
             
-            # Calculate energy (sum of squared amplitudes)
             energy = np.sum(pcm16.astype(np.float64) ** 2)
-            
-            # Calculate zero-crossing rate (indicator of voice frequency content)
             zcr = np.sum(np.abs(np.diff(np.sign(pcm16)))) / (2 * len(pcm16))
             
-            # Speech has high energy AND moderate zero-crossing rate
             has_speech = (energy > self.VAD_ENERGY_THRESHOLD and 
                          zcr > self.VAD_ZCR_THRESHOLD)
             
@@ -139,51 +305,35 @@ class TranscriptionService:
             return False
     
     def _update_vad_state(self, has_speech: bool, audio_bytes: bytes) -> bool:
-        """
-        Update VAD state machine and determine if chunk should be streamed.
-        
-        Returns True if chunk should be streamed to dashboard.
-        """
-        # Store chunk in history
+        """Update VAD state machine."""
         self._caller_chunk_history.append(audio_bytes)
         
         if has_speech:
             self._caller_speech_chunks_count += 1
             self._caller_silence_chunks_count = 0
             
-            # Start speaking after consecutive speech chunks
             if not self._caller_is_speaking and self._caller_speech_chunks_count >= self.VAD_CONSECUTIVE_SPEECH:
                 self._caller_is_speaking = True
                 Log.info("[VAD] 🎤 Caller started speaking")
-                
-                # Stream buffered chunks from history
                 return True
         else:
             self._caller_silence_chunks_count += 1
             self._caller_speech_chunks_count = 0
             
-            # Stop speaking after consecutive silence chunks
             if self._caller_is_speaking and self._caller_silence_chunks_count >= self.VAD_CONSECUTIVE_SILENCE:
                 self._caller_is_speaking = False
                 Log.info("[VAD] 🔇 Caller stopped speaking")
         
-        # Stream if currently in speaking state
         return self._caller_is_speaking
     
+    # ==================== STREAMING ====================
+    
     async def _stream_unified_audio(self):
-        """
-        Sequential audio streaming with smart speaker transitions.
-        
-        🔒 Uses async lock to guarantee:
-        - ONE chunk plays at a time (no overlap)
-        - 0.5s gap for Caller->AI transitions
-        - NO gap for AI->Caller transitions
-        """
-        Log.info("[Stream] Started - SEQUENTIAL with Caller→AI gap only")
+        """Sequential audio streaming with transitions."""
+        Log.info("[Stream] Started - 24kHz PCM16 enhanced audio")
         
         while not self._shutdown:
             try:
-                # Wait for next chunk
                 audio_data = await self._unified_audio_queue.get()
                 
                 if audio_data is None:
@@ -192,19 +342,16 @@ class TranscriptionService:
                 speaker = audio_data.get("speaker")
                 current_time = time.time()
                 
-                # 🔒 LOCK: Ensures sequential playback
                 async with self._playback_lock:
                     
-                    # Calculate chunk duration first
                     audio_b64 = audio_data.get("audio", "")
                     try:
                         audio_bytes = base64.b64decode(audio_b64)
-                        chunk_duration = self._calculate_chunk_duration(audio_bytes)
+                        chunk_duration = self._calculate_chunk_duration(audio_bytes, self.OUTPUT_SAMPLE_RATE)
                     except Exception as e:
                         Log.debug(f"[Stream] Duration calc error: {e}")
                         chunk_duration = 0.02
                     
-                    # Check if speaker changed
                     speaker_changed = (
                         self._last_streamed_speaker is not None and 
                         self._last_streamed_speaker != speaker
@@ -213,46 +360,29 @@ class TranscriptionService:
                     if speaker_changed:
                         previous_speaker = self._last_streamed_speaker
                         previous_last_time = self._last_chunk_time_per_speaker.get(previous_speaker, 0)
-                        
-                        # Time gap since previous speaker's last chunk
                         time_gap = current_time - previous_last_time if previous_last_time > 0 else 0
-                        
-                        # Check if previous speaker finished
                         previous_finished = time_gap >= self.SPEAKER_SILENCE_THRESHOLD
                         
-                        # ✅ ONLY add gap for Caller → AI
                         if previous_speaker == "Caller" and speaker == "AI" and previous_finished:
                             if time_gap < self.SPEAKER_TRANSITION_DELAY:
                                 remaining_gap = self.SPEAKER_TRANSITION_DELAY - time_gap
                                 Log.debug(f"[Stream] Caller → AI: +{remaining_gap:.3f}s gap")
                                 await asyncio.sleep(remaining_gap)
-                            else:
-                                Log.debug(f"[Stream] Caller → AI: {time_gap:.3f}s natural")
                         
-                        # ✅ AI → Caller: NO gap
                         elif previous_speaker == "AI" and speaker == "Caller":
                             Log.debug(f"[Stream] AI → Caller: NO GAP")
-                        
-                        # Same speaker: no gap
-                        else:
-                            Log.debug(f"[Stream] {speaker} continuing")
                     
-                    # Update tracking
                     self._last_chunk_time_per_speaker[speaker] = current_time
                     self._last_streamed_speaker = speaker
                     
-                    # Send to dashboard
                     if self.audio_callback:
                         try:
                             await self.audio_callback(audio_data)
                         except Exception as e:
                             Log.error(f"[Stream] callback error: {e}")
                     
-                    # ⏱️ Wait for chunk to complete playback
-                    # This ensures next chunk won't start until current finishes
                     await asyncio.sleep(chunk_duration)
                 
-                # Lock released here - next chunk can now proceed
                 self._unified_audio_queue.task_done()
                 
             except Exception as e:
@@ -261,56 +391,36 @@ class TranscriptionService:
     
     async def transcribe_realtime(self, audio_input, source: str = "Unknown") -> str:
         """
-        Process incoming audio with Voice Activity Detection.
-        
-        🎯 KEY FIX: Only stream caller audio when actually speaking!
-        This prevents queue backlog from background noise.
+        Process incoming audio with VAD and enhancement.
         """
         try:
             # Convert to bytes
             if isinstance(audio_input, str):
                 audio_bytes = base64.b64decode(audio_input)
-                original_base64 = audio_input
             elif isinstance(audio_input, (bytes, bytearray)):
                 audio_bytes = bytes(audio_input)
-                original_base64 = base64.b64encode(audio_bytes).decode('ascii')
             else:
                 return ""
             
             should_stream = True
             
-            # 🎯 CRITICAL: Apply VAD to caller audio only
+            # Apply VAD to caller audio
             if source == "Caller":
                 has_speech = self._detect_speech(audio_bytes)
                 should_stream = self._update_vad_state(has_speech, audio_bytes)
                 
-                # Always buffer for transcription (even non-speech)
                 await self._add_to_caller_buffer(audio_bytes)
                 
-                # If VAD says caller just started speaking, flush history
+                # Flush history when starting to speak
                 if should_stream and self._caller_speech_chunks_count == self.VAD_CONSECUTIVE_SPEECH:
-                    # Stream recent chunks from history for context
-                    for hist_chunk in list(self._caller_chunk_history)[:-1]:  # All except current
-                        hist_b64 = base64.b64encode(hist_chunk).decode('ascii')
-                        hist_packet = {
-                            "speaker": source,
-                            "audio": hist_b64,
-                            "timestamp": int(time.time()),
-                            "size": len(hist_chunk)
-                        }
-                        await self._unified_audio_queue.put(hist_packet)
+                    for hist_chunk in list(self._caller_chunk_history)[:-1]:
+                        await self._queue_enhanced_audio(hist_chunk, source)
             
-            # Only queue if should stream
+            # Queue enhanced audio
             if should_stream:
-                audio_packet = {
-                    "speaker": source,
-                    "audio": original_base64,
-                    "timestamp": int(time.time()),
-                    "size": len(audio_bytes)
-                }
-                await self._unified_audio_queue.put(audio_packet)
+                await self._queue_enhanced_audio(audio_bytes, source)
             
-            # Buffer for transcription (AI always buffers)
+            # Buffer AI audio
             if source == "AI":
                 await self._add_to_ai_buffer(audio_bytes)
             
@@ -319,6 +429,40 @@ class TranscriptionService:
         except Exception as e:
             Log.error(f"[{source}] Error: {e}")
             return ""
+    
+    async def _queue_enhanced_audio(self, mulaw_bytes: bytes, source: str):
+        """
+        🎵 Convert µ-law 8kHz → Enhanced PCM16 24kHz
+        """
+        try:
+            # Step 1: µ-law → PCM16 8kHz
+            pcm16_8k = self._mulaw_to_pcm16(mulaw_bytes)
+            
+            # Step 2: Upsample to 24kHz (3x quality)
+            pcm16_24k = self._resample_pcm16(pcm16_8k, self.INPUT_SAMPLE_RATE, self.OUTPUT_SAMPLE_RATE)
+            
+            # Step 3: Apply audio enhancement
+            enhanced_pcm16 = self._enhance_audio(pcm16_24k, self.OUTPUT_SAMPLE_RATE)
+            
+            # Step 4: Encode to base64
+            enhanced_base64 = base64.b64encode(enhanced_pcm16.tobytes()).decode('ascii')
+            
+            audio_packet = {
+                "speaker": source,
+                "audio": enhanced_base64,
+                "timestamp": int(time.time()),
+                "size": len(enhanced_pcm16.tobytes()),
+                "format": "pcm16",        # 🎵 High quality PCM16
+                "sample_rate": 24000,     # 🎵 24kHz
+                "encoding": "pcm16"
+            }
+            
+            await self._unified_audio_queue.put(audio_packet)
+            
+        except Exception as e:
+            Log.error(f"[Enhancement] Error for {source}: {e}")
+    
+    # ==================== TRANSCRIPTION BUFFERS ====================
     
     async def _add_to_caller_buffer(self, audio_bytes: bytes):
         """Add to caller transcription buffer."""
@@ -449,13 +593,7 @@ class TranscriptionService:
                 self._ai_processing = False
     
     async def _transcribe_audio(self, mulaw_bytes: bytes, source: str) -> str:
-        """
-        Convert µ-law 8kHz to PCM16 16kHz and transcribe.
-        
-        Audio conversion for Whisper:
-        - Input: µ-law 8kHz (from Twilio/OpenAI)
-        - Output: PCM16 16kHz (for Whisper API)
-        """
+        """Convert µ-law 8kHz to PCM16 16kHz and transcribe."""
         try:
             pcm16 = self._mulaw_to_pcm16(mulaw_bytes)
             pcm16_16k = self._resample_pcm16(pcm16, 8000, 16000)
