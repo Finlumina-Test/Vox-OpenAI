@@ -43,10 +43,11 @@ class TranscriptionService:
     VAD_CONSECUTIVE_SILENCE = 5
     VAD_LOOKBACK_CHUNKS = 10
     
-    # Audio enhancement settings
-    NOISE_REDUCTION_STRENGTH = 0.7  # 0.0-1.0 (higher = more aggressive)
-    SPECTRAL_ENHANCEMENT = True     # Enable frequency enhancement
-    DYNAMIC_RANGE_COMPRESSION = True # Normalize volume
+    # Audio enhancement settings (START DISABLED for safety)
+    ENABLE_ENHANCEMENT = False       # 🔧 Set to True to enable enhancement
+    NOISE_REDUCTION_STRENGTH = 0.3  # 0.0-1.0 (lower = safer)
+    SPECTRAL_ENHANCEMENT = False    # Disable for now
+    DYNAMIC_RANGE_COMPRESSION = False # Disable for now
     
     # Transcription settings
     MIN_AUDIO_DURATION = 0.8
@@ -432,7 +433,7 @@ class TranscriptionService:
     
     async def _queue_enhanced_audio(self, mulaw_bytes: bytes, source: str):
         """
-        🎵 Convert µ-law 8kHz → Enhanced PCM16 24kHz
+        🎵 Convert µ-law 8kHz → PCM16 24kHz (with optional enhancement)
         """
         try:
             # Step 1: µ-law → PCM16 8kHz
@@ -441,8 +442,11 @@ class TranscriptionService:
             # Step 2: Upsample to 24kHz (3x quality)
             pcm16_24k = self._resample_pcm16(pcm16_8k, self.INPUT_SAMPLE_RATE, self.OUTPUT_SAMPLE_RATE)
             
-            # Step 3: Apply audio enhancement
-            enhanced_pcm16 = self._enhance_audio(pcm16_24k, self.OUTPUT_SAMPLE_RATE)
+            # Step 3: Apply audio enhancement (ONLY if enabled)
+            if self.ENABLE_ENHANCEMENT:
+                enhanced_pcm16 = self._enhance_audio(pcm16_24k, self.OUTPUT_SAMPLE_RATE)
+            else:
+                enhanced_pcm16 = pcm16_24k  # 🔧 Raw upsampled audio
             
             # Step 4: Encode to base64
             enhanced_base64 = base64.b64encode(enhanced_pcm16.tobytes()).decode('ascii')
