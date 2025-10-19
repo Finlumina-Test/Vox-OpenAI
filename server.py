@@ -1,4 +1,4 @@
-# server.py (timed audio streaming with proper delays)
+# server.py (multi-call capable with call isolation)
 import os
 import json
 import time
@@ -23,35 +23,45 @@ from services.log_utils import Log
 
 
 # ---------------------------
+# Multi-call dashboard tracking
+# ---------------------------
+class DashboardClient:
+    """Track dashboard websocket with optional call filtering."""
+    def __init__(self, websocket: WebSocket, call_sid: Optional[str] = None):
+        self.websocket = websocket
+        self.call_sid = call_sid  # None = subscribe to ALL calls
+
+
+dashboard_clients: Set[DashboardClient] = set()
+
+
+# ---------------------------
 # Timed audio streaming with proper delays
 # ---------------------------
-async def handle_audio_stream(audio_data: Dict[str, Any]):
-    """
-    Handle raw audio chunks with proper timing.
-    The timing is handled in TranscriptionService, so we just broadcast here.
-    """
+async def handle_audio_stream(audio_data: Dict[str, Any], call_sid: str):
+    """Handle raw audio chunks with proper timing."""
     payload = {
         "messageType": "audio",
         "speaker": audio_data["speaker"],
         "audio": audio_data["audio"],
         "timestamp": audio_data["timestamp"],
+        "callSid": call_sid,  # ✅ Add call_sid to every message
     }
     
-    # Send directly - timing is handled by the service layer
-    await _do_broadcast(payload)
+    await _do_broadcast(payload, call_sid)
 
 
-async def handle_transcription_update(transcription_data: Dict[str, Any]):
+async def handle_transcription_update(transcription_data: Dict[str, Any], call_sid: str):
     """Handle completed transcription phrases."""
     payload = {
         "messageType": "transcription",
         "speaker": transcription_data["speaker"],
         "text": transcription_data["text"],
         "timestamp": transcription_data["timestamp"],
+        "callSid": call_sid,  # ✅ Add call_sid
     }
     
-    # Transcriptions sent directly (no timing concerns)
-    broadcast_to_dashboards_nonblocking(payload)
+    broadcast_to_dashboards_nonblocking(payload, call_sid)
 
 
 app = FastAPI()
@@ -63,8 +73,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-dashboard_clients: Set[WebSocket] = set()
 
 
 # ---------------------------
@@ -82,17 +90,22 @@ async def dashboard_stream(websocket: WebSocket):
             await websocket.close(code=4003)
             return
 
-    dashboard_clients.add(websocket)
-    Log.info(f"Dashboard client connected. Total clients: {len(dashboard_clients)}")
+    # Try to get call_sid from initial message
+    try:
+        msg = await asyncio.wait_for(websocket.receive_text(), timeout=5)
+        data = json.loads(msg)
+        client_call_id = data.get("callId")
+        Log.info(f"Dashboard client subscribed to call: {client_call_id or 'ALL'}")
+    except (asyncio.TimeoutError, json.JSONDecodeError, KeyError):
+        Log.info("Dashboard client subscribed to ALL calls")
+        client_call_id = None
+
+    # Create client object with call filter
+    client = DashboardClient(websocket, client_call_id)
+    dashboard_clients.add(client)
+    Log.info(f"Dashboard connected. Total clients: {len(dashboard_clients)}")
     
     try:
-        try:
-            msg = await asyncio.wait_for(websocket.receive_text(), timeout=5)
-            data = json.loads(msg)
-            client_call_id = data.get("callId")
-        except (asyncio.TimeoutError, json.JSONDecodeError, KeyError):
-            client_call_id = None
-
         while True:
             try:
                 await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
@@ -104,20 +117,22 @@ async def dashboard_stream(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        dashboard_clients.discard(websocket)
-        Log.info(f"Dashboard client disconnected. Total clients: {len(dashboard_clients)}")
+        dashboard_clients.discard(client)
+        Log.info(f"Dashboard disconnected. Total clients: {len(dashboard_clients)}")
 
 
 # ---------------------------
-# Broadcasting functions
+# Broadcasting functions with call filtering
 # ---------------------------
-async def _do_broadcast(payload: Dict[str, Any]):
+async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None):
     """
-    Internal coroutine to broadcast dashboard updates.
-    Sends to all connected clients.
+    Broadcast to dashboard clients with call filtering.
+    
+    Args:
+        payload: Message to broadcast
+        call_sid: If provided, only send to clients subscribed to this call (or ALL)
     """
     try:
-        # Ensure timestamp is present
         if "timestamp" not in payload or payload["timestamp"] is None:
             payload["timestamp"] = int(time.time())
         else:
@@ -125,24 +140,35 @@ async def _do_broadcast(payload: Dict[str, Any]):
     except Exception:
         payload["timestamp"] = int(time.time())
 
+    # Ensure call_sid is in payload
+    if call_sid and "callSid" not in payload:
+        payload["callSid"] = call_sid
+
     text = json.dumps(payload)
     to_remove = []
     
     for client in list(dashboard_clients):
         try:
-            await client.send_text(text)
+            # Send if: client wants ALL calls OR client wants THIS specific call
+            should_send = (
+                client.call_sid is None or  # Client wants all calls
+                client.call_sid == call_sid  # Client wants this call
+            )
+            
+            if should_send:
+                await client.websocket.send_text(text)
+                
         except Exception as e:
             Log.debug(f"Failed to send to client: {e}")
             to_remove.append(client)
     
-    # Clean up failed clients
     for c in to_remove:
         dashboard_clients.discard(c)
 
 
-def broadcast_to_dashboards_nonblocking(payload: Dict[str, Any]):
-    """Fire-and-forget broadcast for non-audio messages."""
-    asyncio.create_task(_do_broadcast(payload))
+def broadcast_to_dashboards_nonblocking(payload: Dict[str, Any], call_sid: Optional[str] = None):
+    """Fire-and-forget broadcast with call filtering."""
+    asyncio.create_task(_do_broadcast(payload, call_sid))
 
 
 def log_nonblocking(func, msg):
@@ -181,26 +207,29 @@ async def handle_media_stream(websocket: WebSocket):
     Log.header("Client connected")
     await websocket.accept()
 
+    # ✅ Each connection gets its own instances (isolated)
     connection_manager = WebSocketConnectionManager(websocket)
     openai_service = OpenAIService()
     audio_service = AudioService()
-    
-    # ✅ Initialize order extractor
     order_extractor = OrderExtractionService()
     
-    # ✅ Set callback for order updates
+    # Track call_sid for this connection
+    current_call_sid: Optional[str] = None
+    
+    # ✅ Set callback for order updates WITH call_sid
     async def send_order_update(order_data: Dict[str, Any]):
         """Send order updates to dashboard."""
         payload = {
             "messageType": "orderUpdate",
             "orderData": order_data,
-            "timestamp": int(time.time())
+            "timestamp": int(time.time()),
+            "callSid": current_call_sid,  # ✅ Include call_sid
         }
-        broadcast_to_dashboards_nonblocking(payload)
+        broadcast_to_dashboards_nonblocking(payload, current_call_sid)
     
     order_extractor.set_update_callback(send_order_update)
     
-    # ✅ Enhanced transcription callback
+    # ✅ Enhanced transcription callback WITH call_sid
     async def handle_transcription_with_extraction(transcription_data: Dict[str, Any]):
         """Handle transcription AND extract order info."""
         # Send transcription to dashboard
@@ -209,8 +238,9 @@ async def handle_media_stream(websocket: WebSocket):
             "speaker": transcription_data["speaker"],
             "text": transcription_data["text"],
             "timestamp": transcription_data["timestamp"],
+            "callSid": current_call_sid,  # ✅ Include call_sid
         }
-        broadcast_to_dashboards_nonblocking(payload)
+        broadcast_to_dashboards_nonblocking(payload, current_call_sid)
         
         # Extract order information
         try:
@@ -221,8 +251,14 @@ async def handle_media_stream(websocket: WebSocket):
         except Exception as e:
             Log.error(f"[OrderExtraction] Error: {e}")
     
+    # ✅ Audio callback with call_sid
+    async def handle_audio_with_call_id(audio_data: Dict[str, Any]):
+        """Wrapper to add call_sid to audio."""
+        if current_call_sid:
+            await handle_audio_stream(audio_data, current_call_sid)
+    
     # Set up callbacks
-    openai_service.whisper_service.set_audio_callback(handle_audio_stream)
+    openai_service.whisper_service.set_audio_callback(handle_audio_with_call_id)
     openai_service.whisper_service.set_word_callback(handle_transcription_with_extraction)
 
     try:
@@ -270,8 +306,9 @@ async def handle_media_stream(websocket: WebSocket):
                     "speaker": "Caller",
                     "text": data["text"].strip(),
                     "timestamp": data.get("timestamp") or int(time.time()),
+                    "callSid": current_call_sid,  # ✅ Include call_sid
                 }
-                broadcast_to_dashboards_nonblocking(txt_obj)
+                broadcast_to_dashboards_nonblocking(txt_obj, current_call_sid)
 
         # OpenAI -> Twilio handler
         async def handle_audio_delta(response: dict):
@@ -319,7 +356,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 "speaker": "AI",
                                 "text": transcript_text,
                                 "timestamp": response.get("timestamp") or int(time.time()),
-                            })
+                                "callSid": current_call_sid,  # ✅ Include call_sid
+                            }, current_call_sid)
                     except Exception:
                         pass
 
@@ -355,7 +393,10 @@ async def handle_media_stream(websocket: WebSocket):
                     Log.error(f"Session renewal failed: {e}")
 
         async def on_start_cb(stream_sid: str):
-            Log.event("Twilio Start", {"streamSid": stream_sid})
+            nonlocal current_call_sid
+            # ✅ Capture call_sid when stream starts
+            current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
+            Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
 
         async def on_mark_cb():
             try:
@@ -379,13 +420,14 @@ async def handle_media_stream(websocket: WebSocket):
             
             # Send final order
             final_order = order_extractor.get_current_order()
-            if any(final_order.values()):  # Only send if we have data
+            if any(final_order.values()):
                 broadcast_to_dashboards_nonblocking({
                     "messageType": "orderComplete",
                     "orderData": final_order,
                     "summary": final_summary,
-                    "timestamp": int(time.time())
-                })
+                    "timestamp": int(time.time()),
+                    "callSid": current_call_sid,  # ✅ Include call_sid
+                }, current_call_sid)
         except Exception:
             pass
         
