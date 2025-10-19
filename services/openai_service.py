@@ -221,6 +221,9 @@ class OpenAIService:
         self._goodbye_audio_heard: bool = False
         self._goodbye_item_id: Optional[str] = None
         self._goodbye_watchdog: Optional[asyncio.Task] = None
+        
+        # Callback for AI transcripts from OpenAI (for dashboard UI)
+        self.ai_transcript_callback: Optional[callable] = None
 
     # --- SESSION & GREETING ---
     async def initialize_session(self, connection_manager) -> None:
@@ -394,59 +397,53 @@ class OpenAIService:
             self._goodbye_watchdog.cancel()
         self._goodbye_watchdog = None
 
-    # --- TRANSCRIPT EXTRACTION ---
-    def extract_transcript_text(self, event: Dict[str, Any]) -> Optional[str]:
+    # --- TRANSCRIPT EXTRACTION (OpenAI Native for Dashboard) ---
+    async def extract_and_emit_ai_transcript(self, event: Dict[str, Any]) -> None:
         """
-        Extract assistant (bot) transcript from events.
-        """
-        try:
-            etype = event.get("type", "")
-            Log.debug(f"[openai] Received event type for transcript extraction: {etype}")
-
-            # Streamed text delta
-            if etype in ("response.output_text.delta", "response.output_text.delta.text"):
-                delta = event.get("delta")
-                if isinstance(delta, str):
-                    return delta
-                if isinstance(delta, dict):
-                    return delta.get("text") or delta.get("value") or None
-
-            # Completed assistant message
-            if etype == "response.done":
-                resp = event.get("response") or {}
-                for item in (resp.get("output") or []):
-                    if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
-                        for c in (item.get("content") or []):
-                            if isinstance(c, dict):
-                                if c.get("type") == "output_text":
-                                    txt = c.get("text") or c.get("value")
-                                    if isinstance(txt, str):
-                                        return txt
-                                if c.get("type") == "output_audio":
-                                    txt = c.get("transcript")
-                                    if isinstance(txt, str):
-                                        return txt
-
-            if isinstance(event.get("text"), str):
-                return event.get("text")
-
-        except Exception as e:
-            Log.debug("[openai] assistant transcript extract error", e)
-        return None
-
-    def extract_caller_transcript(self, event: Dict[str, Any]) -> Optional[str]:
-        """
-        Extract caller transcript from real-time events.
+        Extract AI transcript from OpenAI's native response.done event.
+        This is used for DASHBOARD display (clean, fast, native language).
+        Whisper transcription still happens for order extraction accuracy.
         """
         try:
             etype = event.get("type", "")
-            if etype in ("input_audio.transcript", "input_audio.delta"):
-                txt = event.get("text") or event.get("transcript")
-                if isinstance(txt, str) and txt.strip():
-                    return txt
+            
+            # Only process response.done events
+            if etype != "response.done":
+                return
+            
+            resp = event.get("response") or {}
+            output = resp.get("output") or []
+            
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                    
+                if item.get("type") == "message" and item.get("role") == "assistant":
+                    content = item.get("content") or []
+                    
+                    for c in content:
+                        if not isinstance(c, dict):
+                            continue
+                            
+                        # Extract transcript from output_audio
+                        if c.get("type") == "output_audio":
+                            transcript = c.get("transcript")
+                            
+                            if transcript and isinstance(transcript, str) and transcript.strip():
+                                Log.info(f"[AI Native] 📝 {transcript}")
+                                
+                                # Emit via callback (goes to dashboard)
+                                if self.ai_transcript_callback:
+                                    await self.ai_transcript_callback({
+                                        "speaker": "AI",
+                                        "text": transcript.strip(),
+                                        "timestamp": int(asyncio.get_event_loop().time())
+                                    })
+                                
+                                return  # Found and processed transcript
+                                
         except Exception as e:
-            Log.debug("[openai] caller transcript extract error", e)
-        return None
+            Log.debug(f"[openai] AI transcript extract error: {e}")
 
     # --- AUDIO EVENTS ---
     def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
