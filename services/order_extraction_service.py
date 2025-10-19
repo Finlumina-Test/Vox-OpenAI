@@ -83,11 +83,13 @@ class OrderExtractionService:
 
 Extract ONLY confirmed information. Return null for anything not clearly mentioned.
 
+IMPORTANT: Always return the COMPLETE current order state. If items are corrected or changed, return the corrected version, not additions.
+
 Fields to extract:
 - customer_name: Full name of customer
 - phone_number: Phone number (any format)
 - delivery_address: Complete delivery address
-- order_items: Array of {"item": "name", "quantity": number, "notes": "optional"}
+- order_items: Array of {"item": "name", "quantity": number, "notes": "optional"} - COMPLETE list of current items
 - special_instructions: Any special requests
 - payment_method: "cash", "card", or "online"
 - delivery_time: Preferred time or "ASAP"
@@ -146,10 +148,10 @@ Return ONLY valid JSON. Example:
                         
                         extracted = json.loads(content.strip())
                         
-                        # Send only NEW confirmed data
+                        # Send only NEW or CHANGED data
                         updates = {}
                         
-                        # Check each field for NEW confirmed data
+                        # Check each field for NEW or CHANGED data
                         if extracted.get("customer_name") and extracted["customer_name"] != self._sent_data["customer_name"]:
                             updates["customer_name"] = extracted["customer_name"]
                             self._sent_data["customer_name"] = extracted["customer_name"]
@@ -178,21 +180,21 @@ Return ONLY valid JSON. Example:
                             updates["total_price"] = extracted["total_price"]
                             self._sent_data["total_price"] = extracted["total_price"]
                         
-                        # Handle order items (check for new items)
+                        # Handle order items - REPLACE entire list if changed (allows corrections)
                         if extracted.get("order_items") and isinstance(extracted["order_items"], list):
-                            new_items = []
-                            for item in extracted["order_items"]:
-                                if item not in self._sent_data["order_items"]:
-                                    new_items.append(item)
+                            # Normalize both lists for comparison (convert to JSON strings)
+                            new_items_normalized = json.dumps(extracted["order_items"], sort_keys=True)
+                            old_items_normalized = json.dumps(self._sent_data["order_items"], sort_keys=True)
                             
-                            if new_items:
-                                self._sent_data["order_items"].extend(new_items)
-                                updates["order_items"] = self._sent_data["order_items"].copy()
+                            # If items changed at all, replace the entire list
+                            if new_items_normalized != old_items_normalized:
+                                self._sent_data["order_items"] = extracted["order_items"]
+                                updates["order_items"] = extracted["order_items"]
                         
                         # Send updates if we have new data
                         if updates and self.update_callback:
                             await self.update_callback(updates)
-                            Log.info(f"[OrderExtraction] New data: {json.dumps(updates, indent=2)}")
+                            Log.info(f"[OrderExtraction] Updated data: {json.dumps(updates, indent=2)}")
                         
                     except json.JSONDecodeError as e:
                         Log.error(f"[OrderExtraction] JSON parse error: {e}")
