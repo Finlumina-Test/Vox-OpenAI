@@ -30,6 +30,17 @@ class OrderExtractionService:
             "delivery_time": None,
             "total_price": None
         }
+    
+    async def shutdown(self):
+        """Graceful shutdown."""
+        self._shutdown = True
+        if self._extraction_task and not self._extraction_task.done():
+            self._extraction_task.cancel()
+            try:
+                await self._extraction_task
+            except asyncio.CancelledError:
+                pass_price": None
+        }
         
         self._last_extraction_time: float = 0
         self._extraction_interval: float = 5.0
