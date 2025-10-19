@@ -4,6 +4,7 @@ from typing import Optional, Dict, Any
 from config import Config
 from services.log_utils import Log
 from services.transcription_service import TranscriptionService
+from services.order_extraction_service import OrderExtractionService
 
 
 
@@ -214,6 +215,7 @@ class OpenAIService:
         self.conversation_manager = OpenAIConversationManager()
         self.event_handler = OpenAIEventHandler()
         self.whisper_service = TranscriptionService()
+        self.order_extractor = OrderExtractionService()
         self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
         self._pending_goodbye: bool = False
         self._goodbye_audio_heard: bool = False
