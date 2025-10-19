@@ -34,7 +34,7 @@ class TranscriptionService:
     
     # Speaker turn detection
     SPEAKER_SILENCE_THRESHOLD = 0.3
-    SPEAKER_TRANSITION_DELAY = 0.5
+    SPEAKER_TRANSITION_DELAY = 1.0   # 1 second gap for Caller→AI
     
     # Voice Activity Detection
     VAD_ENERGY_THRESHOLD = 1000
