@@ -249,7 +249,7 @@ Return ONLY valid JSON. Example:
     
     def is_order_complete(self) -> bool:
         """Check if all essential order information is captured."""
-        essential_fields = ["customer_name", "phone_number", "order_items"]
+        essential_fields = ["customer_name", "phone_number", "order_items", "delivery_address"]
         return all(
             self._sent_data.get(field) and 
             (not isinstance(self._sent_data[field], list) or len(self._sent_data[field]) > 0)
@@ -267,15 +267,4 @@ Return ONLY valid JSON. Example:
             "special_instructions": None,
             "payment_method": None,
             "delivery_time": None,
-            "total_price": None
-        }
-    
-    async def shutdown(self):
-        """Graceful shutdown."""
-        self._shutdown = True
-        if self._extraction_task and not self._extraction_task.done():
-            self._extraction_task.cancel()
-            try:
-                await self._extraction_task
-            except asyncio.CancelledError:
-                pass
+            "total
