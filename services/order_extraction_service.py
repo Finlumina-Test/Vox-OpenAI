@@ -211,234 +211,15 @@ Return ONLY valid JSON. Example:
         
         if data["customer_name"]:
             lines.append(f"👤 Customer: {data['customer_name']}")
-        if dataimport re
-import json
-import asyncio
-import aiohttp
-from typing import Dict, List, Optional, Any
-from datetime import datetime
-from config import Config
-from services.log_utils import Log
-
-# To integrate into your existing code, add this to openai_service.py:
-#
-# from services.order_extraction_service import OrderExtractionService
-#
-# In OpenAIService.__init__():
-#     self.order_extractor = OrderExtractionService()
-#
-# When you receive transcription:
-#     self.order_extractor.add_transcript(speaker, text)
-#
-# To get order summary:
-#     order_data = self.order_extractor.get_order_data()
-#     summary = self.order_extractor.get_order_summary()
-#     print(summary)
-
-
-class OrderExtractionService:
-    """
-    Extracts structured order information from restaurant phone calls.
-    
-    Captures:
-    - Customer name
-    - Phone number
-    - Delivery address
-    - Order items (food/drinks)
-    - Special instructions
-    - Payment method
-    - Delivery time preference
-    """
-    
-    OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-    
-    def __init__(self):
-        # Store full conversation for context
-        self._conversation_buffer: List[Dict[str, str]] = []
-        
-        # Extracted order data
-        self._order_data: Dict[str, Any] = {
-            "customer_name": None,
-            "phone_number": None,
-            "delivery_address": None,
-            "order_items": [],
-            "special_instructions": None,
-            "payment_method": None,
-            "delivery_time": None,
-            "total_price": None,
-            "order_status": "in_progress",
-            "timestamp": None
-        }
-        
-        # Processing state
-        self._last_extraction_time: float = 0
-        self._extraction_interval: float = 5.0  # Extract every 5 seconds
-        self._extraction_task: Optional[asyncio.Task] = None
-        self._shutdown: bool = False
-    
-    def add_transcript(self, speaker: str, text: str):
-        """
-        Add a transcript line to the conversation buffer.
-        
-        Args:
-            speaker: "Caller" or "AI"
-            text: Transcribed text
-        """
-        if not text or not text.strip():
-            return
-        
-        self._conversation_buffer.append({
-            "speaker": speaker,
-            "text": text.strip(),
-            "timestamp": datetime.now().isoformat()
-        })
-        
-        # Keep only last 50 messages for context
-        if len(self._conversation_buffer) > 50:
-            self._conversation_buffer = self._conversation_buffer[-50:]
-        
-        # Trigger extraction if interval passed
-        current_time = asyncio.get_event_loop().time()
-        if current_time - self._last_extraction_time >= self._extraction_interval:
-            self._trigger_extraction()
-    
-    def _trigger_extraction(self):
-        """Start extraction task if not already running."""
-        if not self._extraction_task or self._extraction_task.done():
-            self._extraction_task = asyncio.create_task(self._extract_order_info())
-    
-    async def _extract_order_info(self):
-        """
-        Use GPT to extract structured order information from conversation.
-        """
-        try:
-            self._last_extraction_time = asyncio.get_event_loop().time()
-            
-            if len(self._conversation_buffer) < 2:
-                return  # Not enough conversation yet
-            
-            # Build conversation text
-            conversation_text = "\n".join([
-                f"{msg['speaker']}: {msg['text']}" 
-                for msg in self._conversation_buffer
-            ])
-            
-            # Create extraction prompt
-            system_prompt = """You are an AI that extracts structured order information from restaurant phone call transcripts.
-
-Extract the following information if mentioned:
-- customer_name: Full name of the customer
-- phone_number: Phone number in any format
-- delivery_address: Complete delivery address (street, area, city)
-- order_items: List of food/drink items ordered (with quantities if mentioned)
-- special_instructions: Any special requests (extra spicy, no onions, etc.)
-- payment_method: Cash, card, or online
-- delivery_time: Preferred delivery time or ASAP
-- total_price: Total order amount if mentioned
-
-Return ONLY a valid JSON object. Use null for missing information.
-For order_items, use format: [{"item": "name", "quantity": 1, "notes": "optional"}]
-
-Example:
-{
-  "customer_name": "Ahmed Khan",
-  "phone_number": "0300-1234567",
-  "delivery_address": "House 123, Street 5, DHA Phase 2, Lahore",
-  "order_items": [
-    {"item": "Chicken Biryani", "quantity": 2, "notes": "extra spicy"},
-    {"item": "Raita", "quantity": 1, "notes": null}
-  ],
-  "special_instructions": "Please call before delivery",
-  "payment_method": "cash",
-  "delivery_time": "7:30 PM",
-  "total_price": "1200 PKR"
-}"""
-            
-            user_prompt = f"""Extract order information from this conversation:
-
-{conversation_text}
-
-Return JSON only."""
-            
-            # Call GPT API
-            headers = {
-                "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                "temperature": 0.1,
-                "max_tokens": 500
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self.OPENAI_API_URL, 
-                    headers=headers, 
-                    json=payload
-                ) as resp:
-                    if resp.status != 200:
-                        Log.error(f"[OrderExtraction] API failed: {resp.status}")
-                        return
-                    
-                    data = await resp.json()
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    
-                    # Parse extracted data
-                    try:
-                        # Remove markdown code blocks if present
-                        content = content.strip()
-                        if content.startswith("```json"):
-                            content = content[7:]
-                        if content.startswith("```"):
-                            content = content[3:]
-                        if content.endswith("```"):
-                            content = content[:-3]
-                        
-                        extracted = json.loads(content.strip())
-                        
-                        # Update order data (only overwrite if new data is not null)
-                        for key, value in extracted.items():
-                            if value is not None and value != "" and value != []:
-                                self._order_data[key] = value
-                        
-                        # Update timestamp
-                        self._order_data["timestamp"] = datetime.now().isoformat()
-                        
-                        Log.info(f"[OrderExtraction] Updated: {json.dumps(self._order_data, indent=2)}")
-                        
-                    except json.JSONDecodeError as e:
-                        Log.error(f"[OrderExtraction] JSON parse error: {e}\nContent: {content}")
-            
-        except Exception as e:
-            Log.error(f"[OrderExtraction] Error: {e}")
-    
-    def get_order_data(self) -> Dict[str, Any]:
-        """Get current extracted order data."""
-        return self._order_data.copy()
-    
-    def get_order_summary(self) -> str:
-        """Get human-readable order summary."""
-        data = self._order_data
-        
-        summary_lines = ["📋 ORDER SUMMARY", "=" * 50]
-        
-        if data["customer_name"]:
-            summary_lines.append(f"👤 Customer: {data['customer_name']}")
         
         if data["phone_number"]:
-            summary_lines.append(f"📞 Phone: {data['phone_number']}")
+            lines.append(f"📞 Phone: {data['phone_number']}")
         
         if data["delivery_address"]:
-            summary_lines.append(f"📍 Address: {data['delivery_address']}")
+            lines.append(f"📍 Address: {data['delivery_address']}")
         
         if data["order_items"]:
-            summary_lines.append("\n🍽️ ORDER ITEMS:")
+            lines.append("\n🍽️ ORDER ITEMS:")
             for item in data["order_items"]:
                 qty = item.get("quantity", 1)
                 name = item.get("item", "Unknown")
@@ -446,37 +227,37 @@ Return JSON only."""
                 line = f"  • {qty}x {name}"
                 if notes:
                     line += f" ({notes})"
-                summary_lines.append(line)
+                lines.append(line)
         
         if data["special_instructions"]:
-            summary_lines.append(f"\n📝 Instructions: {data['special_instructions']}")
+            lines.append(f"\n📝 Instructions: {data['special_instructions']}")
         
         if data["payment_method"]:
-            summary_lines.append(f"💳 Payment: {data['payment_method']}")
+            lines.append(f"💳 Payment: {data['payment_method']}")
         
         if data["delivery_time"]:
-            summary_lines.append(f"⏰ Delivery: {data['delivery_time']}")
+            lines.append(f"⏰ Delivery: {data['delivery_time']}")
         
         if data["total_price"]:
-            summary_lines.append(f"💰 Total: {data['total_price']}")
+            lines.append(f"💰 Total: {data['total_price']}")
         
-        summary_lines.append("=" * 50)
+        lines.append("=" * 50)
         
-        return "\n".join(summary_lines)
+        return "\n".join(lines)
     
     def is_order_complete(self) -> bool:
         """Check if all essential order information is captured."""
         essential_fields = ["customer_name", "phone_number", "order_items"]
         return all(
-            self._order_data.get(field) and 
-            (not isinstance(self._order_data[field], list) or len(self._order_data[field]) > 0)
+            self._sent_data.get(field) and 
+            (not isinstance(self._sent_data[field], list) or len(self._sent_data[field]) > 0)
             for field in essential_fields
         )
     
     def reset(self):
         """Reset order data for new call."""
         self._conversation_buffer.clear()
-        self._order_data = {
+        self._sent_data = {
             "customer_name": None,
             "phone_number": None,
             "delivery_address": None,
@@ -484,9 +265,7 @@ Return JSON only."""
             "special_instructions": None,
             "payment_method": None,
             "delivery_time": None,
-            "total_price": None,
-            "order_status": "in_progress",
-            "timestamp": None
+            "total_price": None
         }
     
     async def shutdown(self):
