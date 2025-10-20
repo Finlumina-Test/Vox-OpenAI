@@ -4,7 +4,7 @@ import base64
 import asyncio
 import aiohttp
 import numpy as np
-import time    
+import time
 from scipy.signal import resample
 from typing import Dict, Optional, List, Callable
 from collections import deque
@@ -416,11 +416,9 @@ class TranscriptionService:
         """Check if transcript is a duplicate of recent transcriptions."""
         transcript_lower = transcript.lower().strip()
         
-        # Check against last transcript
         if source == "Caller":
             if transcript_lower == self._caller_last_transcript.lower():
                 return True
-            # Check if very similar to recent transcripts
             for prev in self._caller_transcript_history:
                 if self._similarity(transcript_lower, prev) > 0.85:
                     return True
@@ -438,7 +436,6 @@ class TranscriptionService:
         if not s1 or not s2:
             return 0.0
         
-        # Simple word-based similarity
         words1 = set(s1.split())
         words2 = set(s2.split())
         
@@ -450,7 +447,7 @@ class TranscriptionService:
         
         return len(intersection) / len(union) if union else 0.0
     
-   async def _transcribe_audio(self, mulaw_bytes: bytes, source: str) -> str:
+    async def _transcribe_audio(self, mulaw_bytes: bytes, source: str) -> str:
         """
         Convert µ-law 8kHz to PCM16 16kHz and transcribe.
         Forces English script output for ANY language (Urdu, Punjabi, English).
@@ -471,10 +468,7 @@ class TranscriptionService:
             form = aiohttp.FormData()
             form.add_field("file", wav_io, filename="audio.wav", content_type="audio/wav")
             form.add_field("model", "whisper-1")
-            # ✅ REMOVED language parameter - let Whisper auto-detect
-            # ✅ Use verbose_json to get detected language info
             form.add_field("response_format", "verbose_json")
-            # ✅ Add prompt to encourage romanized/English script for South Asian languages
             form.add_field("prompt", "Transcribe in English script: pizza, biryani, delivery, order, customer")
             
             async with aiohttp.ClientSession() as session:
@@ -489,7 +483,6 @@ class TranscriptionService:
                     detected_lang = data.get("language", "unknown")
                     
                     if transcript:
-                        # Log with detected language for debugging
                         Log.info(f"[{source}] 📝 [{detected_lang}] {transcript}")
                         return transcript
                     
