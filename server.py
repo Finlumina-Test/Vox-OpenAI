@@ -57,7 +57,7 @@ async def handle_transcription_update(transcription_data: Dict[str, Any], call_s
         "messageType": "transcription",
         "speaker": transcription_data["speaker"],
         "text": transcription_data["text"],
-        "timestamp": transcription_data["timestamp"],
+        "timestamp": transcription_data.get("timestamp") or int(time.time() * 1000),  # ✅ Use provided or current in ms
         "callSid": call_sid,
     }
     
