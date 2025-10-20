@@ -232,28 +232,46 @@ async def handle_media_stream(websocket: WebSocket):
     
     order_extractor.set_update_callback(send_order_update)
     
-    # ✅ Unified transcription callback with dual-source handling
-    async def handle_transcription_with_extraction(transcription_data: Dict[str, Any]):
+    # ✅ OpenAI native transcript callback (ONLY goes to dashboard)
+    async def handle_openai_transcript(transcription_data: Dict[str, Any]):
         """
-        Handle transcription from multiple sources:
-        - Caller: Whisper transcription
-        - AI: OpenAI native (for dashboard)
-        - AI_whisper: Whisper transcription (for order extraction only)
+        Handle OpenAI native transcripts (Caller + AI).
+        Goes to DASHBOARD only - clean, fast, no duplicates.
         """
         speaker = transcription_data["speaker"]
+        text = transcription_data["text"]
         
-        # Only send to dashboard if NOT from Whisper's AI transcription
-        # (OpenAI's native transcript goes to dashboard instead)
-        if speaker != "AI_whisper":
-            payload = {
-                "messageType": "transcription",
-                "speaker": "AI" if speaker == "AI_whisper" else speaker,  # Normalize
-                "text": transcription_data["text"],
-                "timestamp": transcription_data.get("timestamp") or int(time.time() * 1000),  # ✅ Use milliseconds for better sorting
-                "callSid": current_call_sid,
-            }
-            broadcast_to_dashboards_nonblocking(payload, current_call_sid)
+        # Send to dashboard
+        payload = {
+            "messageType": "transcription",
+            "speaker": speaker,
+            "text": text,
+            "timestamp": transcription_data.get("timestamp") or int(time.time() * 1000),
+            "callSid": current_call_sid,
+        }
+        broadcast_to_dashboards_nonblocking(payload, current_call_sid)
         
+        # Also extract for orders
+        try:
+            order_extractor.add_transcript(speaker, text)
+        except Exception as e:
+            Log.error(f"[OrderExtraction] Error: {e}")
+    
+    # ✅ Whisper callback (ONLY for order extraction backup)
+    async def handle_whisper_for_orders(transcription_data: Dict[str, Any]):
+        """
+        Whisper transcription - ONLY for order extraction.
+        Does NOT go to dashboard (OpenAI native handles that).
+        """
+        speaker = transcription_data["speaker"]
+        text = transcription_data["text"]
+        
+        # Only extract orders, don't send to dashboard
+        try:
+            normalized_speaker = "AI" if speaker == "AI_whisper" else speaker
+            order_extractor.add_transcript(normalized_speaker, text)
+        except Exception as e:
+            Log.error(f"[OrderExtraction] Error: {e}")    
         # Extract order information from ALL transcripts (including AI_whisper)
         try:
             order_extractor.add_transcript(
@@ -270,9 +288,10 @@ async def handle_media_stream(websocket: WebSocket):
             await handle_audio_stream(audio_data, current_call_sid)
     
     # Set up callbacks for transcription system
+    # Set up callbacks
     openai_service.whisper_service.set_audio_callback(handle_audio_with_call_id)
-    openai_service.whisper_service.set_word_callback(handle_transcription_with_extraction)  # ALL Whisper transcripts
-    openai_service.ai_transcript_callback = handle_transcription_with_extraction  # OpenAI native (for dashboard)
+    openai_service.whisper_service.set_word_callback(handle_whisper_for_orders)  # ✅ Whisper for orders only
+    openai_service.transcript_callback = handle_openai_transcript  # ✅ OpenAI native for dashboard
 
     try:
         # Connect to OpenAI
@@ -372,10 +391,11 @@ async def handle_media_stream(websocket: WebSocket):
             except Exception:
                 pass
 
-        async def handle_other_openai_event(response: dict):
+       async def handle_other_openai_event(response: dict):
             openai_service.process_event_for_logging(response)
             
-            # ✅ Extract AI transcript from OpenAI native (for dashboard display)
+            # ✅ Extract transcripts from OpenAI native (goes to dashboard)
+            await openai_service.extract_and_emit_caller_transcript(response)
             await openai_service.extract_and_emit_ai_transcript(response)
 
         async def openai_receiver():
