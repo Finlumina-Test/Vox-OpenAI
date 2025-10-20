@@ -526,4 +526,4 @@ class TranscriptionService:
             Log.info("TranscriptionService shutdown complete")
                 
         except Exception as e:
-            Log.error(f"Shutdown error: {e}"
+            Log.error(f"Shutdown error: {e}")
