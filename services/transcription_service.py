@@ -16,12 +16,10 @@ class TranscriptionService:
     """
     Real-time transcription service with strict sequential audio delivery.
     
-    Key Features:
-    - Sequential audio playback (no overlap possible)
-    - 1.0s gap ONLY for Caller->AI transitions
-    - NO gaps for AI->Caller (natural conversation flow)
-    - Voice Activity Detection (VAD) to prevent backlog
-    - Async lock ensures one chunk completes before next starts
+    FIXES:
+    - Aggressive silence detection to prevent hallucinations
+    - Millisecond timestamps for proper frontend sorting
+    - Silent chunk purging to prevent delays
     """
     OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
     
@@ -34,22 +32,30 @@ class TranscriptionService:
     SPEAKER_SILENCE_THRESHOLD = 0.3  # If no chunks for 0.3s, speaker is done
     SPEAKER_TRANSITION_DELAY = 1.0   # 1 SECOND gap for Caller->AI
     
-    # Voice Activity Detection
-    VAD_ENERGY_THRESHOLD = 1000
-    VAD_ZCR_THRESHOLD = 0.1
-    VAD_CONSECUTIVE_SPEECH = 3
-    VAD_CONSECUTIVE_SILENCE = 5
-    VAD_LOOKBACK_CHUNKS = 10
+    # ✅ AGGRESSIVE Voice Activity Detection (prevent hallucinations)
+    VAD_ENERGY_THRESHOLD = 2500  # ⬆️ Increased from 1000 (stricter)
+    VAD_ZCR_THRESHOLD = 0.15     # ⬆️ Increased from 0.1 (stricter)
+    VAD_CONSECUTIVE_SPEECH = 4   # ⬆️ Increased from 3 (need 4 speech chunks)
+    VAD_CONSECUTIVE_SILENCE = 3  # ⬇️ Decreased from 5 (faster silence detection)
+    VAD_LOOKBACK_CHUNKS = 8      # ⬇️ Decreased from 10 (less history)
+    
+    # ✅ SILENCE PURGING (prevent long gaps)
+    MAX_SILENCE_DURATION = 0.5   # Purge silence older than 0.5s
+    MIN_SPEECH_DURATION = 0.3    # Need at least 0.3s of speech before transcribing
     
     # Transcription settings
-    MIN_AUDIO_DURATION = 0.8
-    SILENCE_TIMEOUT = 0.5
+    MIN_AUDIO_DURATION = 1.0     # ⬆️ Increased from 0.8s (less frequent transcription)
+    SILENCE_TIMEOUT = 0.6        # ⬆️ Increased from 0.5s (wait longer for more context)
     MAX_BUFFER_DURATION = 3.0
     
     def __init__(self):
         # Transcription buffers
         self._caller_buffer: bytearray = bytearray()
         self._ai_buffer: bytearray = bytearray()
+        
+        # ✅ Track speech vs silence chunks separately
+        self._caller_speech_buffer: bytearray = bytearray()
+        self._caller_silence_duration: float = 0.0
         
         # Unified audio queue
         self._unified_audio_queue: asyncio.Queue = asyncio.Queue()
@@ -115,13 +121,20 @@ class TranscriptionService:
         return duration_seconds
     
     def _detect_speech(self, mulaw_bytes: bytes) -> bool:
-        """Voice Activity Detection using energy and zero-crossing rate."""
+        """
+        ✅ AGGRESSIVE Voice Activity Detection using energy and zero-crossing rate.
+        Higher thresholds = less hallucinations
+        """
         try:
             pcm16 = self._mulaw_to_pcm16(mulaw_bytes)
             
+            # Calculate energy (power)
             energy = np.sum(pcm16.astype(np.float64) ** 2)
+            
+            # Calculate zero-crossing rate
             zcr = np.sum(np.abs(np.diff(np.sign(pcm16)))) / (2 * len(pcm16))
             
+            # ✅ BOTH conditions must be true (stricter)
             has_speech = (energy > self.VAD_ENERGY_THRESHOLD and 
                          zcr > self.VAD_ZCR_THRESHOLD)
             
@@ -132,21 +145,26 @@ class TranscriptionService:
             return False
     
     def _update_vad_state(self, has_speech: bool, audio_bytes: bytes) -> bool:
-        """Update VAD state machine and determine if chunk should be streamed."""
+        """
+        ✅ Update VAD state machine with stricter requirements.
+        Returns True only when confident there's real speech.
+        """
         self._caller_chunk_history.append(audio_bytes)
         
         if has_speech:
             self._caller_speech_chunks_count += 1
             self._caller_silence_chunks_count = 0
             
+            # ✅ Need 4 consecutive speech chunks to confirm speaking
             if not self._caller_is_speaking and self._caller_speech_chunks_count >= self.VAD_CONSECUTIVE_SPEECH:
                 self._caller_is_speaking = True
-                Log.info("[VAD] 🎤 Caller started speaking")
+                Log.info("[VAD] 🎤 Caller started speaking (confirmed)")
                 return True
         else:
             self._caller_silence_chunks_count += 1
             self._caller_speech_chunks_count = 0
             
+            # ✅ Only 3 silent chunks needed to stop (faster)
             if self._caller_is_speaking and self._caller_silence_chunks_count >= self.VAD_CONSECUTIVE_SILENCE:
                 self._caller_is_speaking = False
                 Log.info("[VAD] 🔇 Caller stopped speaking")
@@ -227,9 +245,12 @@ class TranscriptionService:
     
     async def transcribe_realtime(self, audio_input, source: str = "Unknown") -> str:
         """
-        Process incoming audio with Voice Activity Detection.
+        ✅ Process incoming audio with AGGRESSIVE VAD and silence purging.
         
-        🎯 KEY: Only stream caller audio when actually speaking!
+        KEY FIXES:
+        - Only transcribe when >0.3s of real speech detected
+        - Purge silent chunks older than 0.5s to prevent gaps
+        - Track speech vs silence separately
         """
         try:
             if isinstance(audio_input, str):
@@ -242,22 +263,41 @@ class TranscriptionService:
                 return ""
             
             should_stream = True
+            chunk_duration = self._calculate_chunk_duration(audio_bytes)
             
             # Apply VAD to caller audio only
             if source == "Caller":
                 has_speech = self._detect_speech(audio_bytes)
                 should_stream = self._update_vad_state(has_speech, audio_bytes)
                 
-                await self._add_to_caller_buffer(audio_bytes)
+                # ✅ Track speech vs silence separately
+                if has_speech:
+                    self._caller_speech_buffer.extend(audio_bytes)
+                    self._caller_silence_duration = 0.0  # Reset silence timer
+                else:
+                    self._caller_silence_duration += chunk_duration
+                    
+                    # ✅ PURGE old silence to prevent long gaps
+                    if self._caller_silence_duration > self.MAX_SILENCE_DURATION:
+                        # Clear the silence buffer, keep only speech
+                        if len(self._caller_speech_buffer) > 0:
+                            self._caller_buffer = bytearray(self._caller_speech_buffer)
+                            self._caller_speech_buffer.clear()
+                        self._caller_silence_duration = 0.0
+                        Log.debug("[Caller] 🗑️ Purged old silence chunks")
                 
-                # Flush history when starting to speak
+                # ✅ Only add to buffer if it's real speech
+                if has_speech:
+                    await self._add_to_caller_buffer(audio_bytes)
+                
+                # Flush history when starting to speak (for smooth audio)
                 if should_stream and self._caller_speech_chunks_count == self.VAD_CONSECUTIVE_SPEECH:
                     for hist_chunk in list(self._caller_chunk_history)[:-1]:
                         hist_b64 = base64.b64encode(hist_chunk).decode('ascii')
                         hist_packet = {
                             "speaker": source,
                             "audio": hist_b64,
-                            "timestamp": int(time.time()),
+                            "timestamp": int(time.time() * 1000),  # ✅ Milliseconds
                             "size": len(hist_chunk)
                         }
                         await self._unified_audio_queue.put(hist_packet)
@@ -267,7 +307,7 @@ class TranscriptionService:
                 audio_packet = {
                     "speaker": source,
                     "audio": original_base64,
-                    "timestamp": int(time.time()),
+                    "timestamp": int(time.time() * 1000),  # ✅ Milliseconds for proper sorting
                     "size": len(audio_bytes)
                 }
                 await self._unified_audio_queue.put(audio_packet)
@@ -313,12 +353,23 @@ class TranscriptionService:
             )
     
     async def _monitor_caller_buffer(self):
-        """Monitor caller buffer for transcription."""
+        """
+        ✅ Monitor caller buffer with stricter transcription requirements.
+        Only transcribe when we have real speech content.
+        """
         while not self._shutdown:
             try:
                 await asyncio.sleep(0.1)
                 
                 buffer_duration = len(self._caller_buffer) / 8000.0
+                
+                # ✅ Check speech buffer duration (ignore silence)
+                speech_duration = len(self._caller_speech_buffer) / 8000.0
+                
+                # ✅ Need minimum speech duration (not just total duration)
+                if speech_duration < self.MIN_SPEECH_DURATION:
+                    continue
+                
                 if buffer_duration < self.MIN_AUDIO_DURATION:
                     continue
                 
@@ -354,14 +405,16 @@ class TranscriptionService:
                 )
                 
                 if should_transcribe and not self._ai_processing:
-                    await self._transcribe_buffer("AI")
+                    await self._transcribe_buffer("AI_whisper")  # Keep AI_whisper tag for order extraction
                     
             except Exception as e:
                 Log.error(f"[AI monitor] error: {e}")
                 break
     
     async def _transcribe_buffer(self, source: str):
-        """Transcribe accumulated buffer."""
+        """
+        ✅ Transcribe accumulated buffer with MILLISECOND timestamps.
+        """
         if source == "Caller":
             if self._caller_processing or len(self._caller_buffer) == 0:
                 return
@@ -370,6 +423,7 @@ class TranscriptionService:
             try:
                 audio_data = bytes(self._caller_buffer)
                 self._caller_buffer.clear()
+                self._caller_speech_buffer.clear()  # ✅ Clear speech buffer too
                 
                 transcript = await self._transcribe_audio(audio_data, source)
                 
@@ -381,13 +435,13 @@ class TranscriptionService:
                         await self.transcription_callback({
                             "speaker": source,
                             "text": transcript,
-                            "timestamp": int(time.time())
+                            "timestamp": int(time.time() * 1000)  # ✅ MILLISECONDS for proper sorting
                         })
                 
             finally:
                 self._caller_processing = False
                 
-        elif source == "AI":
+        elif source == "AI_whisper":
             if self._ai_processing or len(self._ai_buffer) == 0:
                 return
             self._ai_processing = True
@@ -406,7 +460,7 @@ class TranscriptionService:
                         await self.transcription_callback({
                             "speaker": source,
                             "text": transcript,
-                            "timestamp": int(time.time())
+                            "timestamp": int(time.time() * 1000)  # ✅ MILLISECONDS
                         })
                 
             finally:
@@ -449,12 +503,24 @@ class TranscriptionService:
     
     async def _transcribe_audio(self, mulaw_bytes: bytes, source: str) -> str:
         """
-        Convert µ-law 8kHz to PCM16 16kHz and transcribe.
-        Forces English script output for ANY language (Urdu, Punjabi, English).
+        ✅ Convert µ-law 8kHz to PCM16 16kHz and transcribe.
+        Enhanced prompt to reduce hallucinations.
         """
         try:
+            # ✅ Skip transcription if buffer is too small (likely just noise)
+            duration = len(mulaw_bytes) / 8000.0
+            if duration < 0.5:  # Less than 0.5s
+                Log.debug(f"[{source}] Skipping transcription - too short ({duration:.2f}s)")
+                return ""
+            
             pcm16 = self._mulaw_to_pcm16(mulaw_bytes)
             pcm16_16k = self._resample_pcm16(pcm16, 8000, 16000)
+            
+            # ✅ Check if audio is too quiet (likely silence/noise)
+            rms = np.sqrt(np.mean(pcm16_16k.astype(np.float64) ** 2))
+            if rms < 500:  # Very quiet audio
+                Log.debug(f"[{source}] Skipping transcription - too quiet (RMS: {rms:.0f})")
+                return ""
             
             wav_io = io.BytesIO()
             with wave.open(wav_io, "wb") as wf:
@@ -469,7 +535,9 @@ class TranscriptionService:
             form.add_field("file", wav_io, filename="audio.wav", content_type="audio/wav")
             form.add_field("model", "whisper-1")
             form.add_field("response_format", "verbose_json")
-            form.add_field("prompt", "Transcribe in English script: pizza, biryani, delivery, order, customer")
+            
+            # ✅ Enhanced prompt to reduce hallucinations
+            form.add_field("prompt", "Only transcribe clear speech. If unclear, return empty. Common words: pizza, biryani, delivery, order, address, phone")
             
             async with aiohttp.ClientSession() as session:
                 async with session.post(self.OPENAI_API_URL, headers=headers, data=form) as resp:
@@ -481,6 +549,18 @@ class TranscriptionService:
                     data = await resp.json()
                     transcript = (data.get("text") or "").strip()
                     detected_lang = data.get("language", "unknown")
+                    
+                    # ✅ Filter out common Whisper hallucinations
+                    hallucination_phrases = [
+                        "thank you", "thanks for watching", "please subscribe",
+                        "like and subscribe", "see you next time", "bye bye",
+                        ".", "..", "...", "okay", "um", "uh", "hmm"
+                    ]
+                    
+                    transcript_lower = transcript.lower()
+                    if any(phrase in transcript_lower for phrase in hallucination_phrases) and len(transcript) < 20:
+                        Log.debug(f"[{source}] Filtered hallucination: {transcript}")
+                        return ""
                     
                     if transcript:
                         Log.info(f"[{source}] 📝 [{detected_lang}] {transcript}")
