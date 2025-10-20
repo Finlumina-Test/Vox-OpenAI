@@ -450,10 +450,10 @@ class TranscriptionService:
         
         return len(intersection) / len(union) if union else 0.0
     
-    async def _transcribe_audio(self, mulaw_bytes: bytes, source: str) -> str:
+   async def _transcribe_audio(self, mulaw_bytes: bytes, source: str) -> str:
         """
         Convert µ-law 8kHz to PCM16 16kHz and transcribe.
-        Uses standard Whisper for consistent English script output.
+        Forces English script output for ANY language (Urdu, Punjabi, English).
         """
         try:
             pcm16 = self._mulaw_to_pcm16(mulaw_bytes)
@@ -471,8 +471,11 @@ class TranscriptionService:
             form = aiohttp.FormData()
             form.add_field("file", wav_io, filename="audio.wav", content_type="audio/wav")
             form.add_field("model", "whisper-1")
-            form.add_field("language", "en")
+            # ✅ REMOVED language parameter - let Whisper auto-detect
+            # ✅ Use verbose_json to get detected language info
             form.add_field("response_format", "verbose_json")
+            # ✅ Add prompt to encourage romanized/English script for South Asian languages
+            form.add_field("prompt", "Transcribe in English script: pizza, biryani, delivery, order, customer")
             
             async with aiohttp.ClientSession() as session:
                 async with session.post(self.OPENAI_API_URL, headers=headers, data=form) as resp:
@@ -483,9 +486,11 @@ class TranscriptionService:
                     
                     data = await resp.json()
                     transcript = (data.get("text") or "").strip()
+                    detected_lang = data.get("language", "unknown")
                     
                     if transcript:
-                        Log.info(f"[{source}] 📝 {transcript}")
+                        # Log with detected language for debugging
+                        Log.info(f"[{source}] 📝 [{detected_lang}] {transcript}")
                         return transcript
                     
                     return ""
