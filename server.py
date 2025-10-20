@@ -44,7 +44,7 @@ async def handle_audio_stream(audio_data: Dict[str, Any], call_sid: str):
         "messageType": "audio",
         "speaker": audio_data["speaker"],
         "audio": audio_data["audio"],
-        "timestamp": audio_data["timestamp"],
+        "timestamp": int(time.time() * 1000),  # ✅ Milliseconds
         "callSid": call_sid,
     }
     
@@ -127,18 +127,22 @@ async def dashboard_stream(websocket: WebSocket):
 async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None):
     """
     Broadcast to dashboard clients with call filtering.
-    
-    Args:
-        payload: Message to broadcast
-        call_sid: If provided, only send to clients subscribed to this call (or ALL)
+    ✅ ALWAYS use MILLISECONDS for timestamps
     """
     try:
+        # ✅ Ensure timestamp is in milliseconds
         if "timestamp" not in payload or payload["timestamp"] is None:
-            payload["timestamp"] = int(time.time())
+            payload["timestamp"] = int(time.time() * 1000)  # ✅ Milliseconds
         else:
-            payload["timestamp"] = int(float(payload["timestamp"]))
+            # ✅ If timestamp exists, ensure it's in milliseconds
+            ts = float(payload["timestamp"])
+            # Check if it's in seconds (< year 3000 in seconds = 32503680000)
+            if ts < 32503680000:
+                payload["timestamp"] = int(ts * 1000)  # Convert to milliseconds
+            else:
+                payload["timestamp"] = int(ts)  # Already in milliseconds
     except Exception:
-        payload["timestamp"] = int(time.time())
+        payload["timestamp"] = int(time.time() * 1000)  # ✅ Milliseconds fallback
 
     # Ensure call_sid is in payload
     if call_sid and "callSid" not in payload:
@@ -164,7 +168,6 @@ async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None)
     
     for c in to_remove:
         dashboard_clients.discard(c)
-
 
 def broadcast_to_dashboards_nonblocking(payload: Dict[str, Any], call_sid: Optional[str] = None):
     """Fire-and-forget broadcast with call filtering."""
@@ -222,7 +225,7 @@ async def handle_media_stream(websocket: WebSocket):
         payload = {
             "messageType": "orderUpdate",
             "orderData": order_data,
-            "timestamp": int(time.time()),
+            "timestamp": int(time.time() * 1000),  # ✅ Milliseconds
             "callSid": current_call_sid,
         }
         broadcast_to_dashboards_nonblocking(payload, current_call_sid)
@@ -316,7 +319,7 @@ async def handle_media_stream(websocket: WebSocket):
                     "messageType": "text",
                     "speaker": "Caller",
                     "text": data["text"].strip(),
-                    "timestamp": data.get("timestamp") or int(time.time()),
+                    "timestamp": data.get("timestamp") or int(time.time() * 1000),  # ✅ Milliseconds
                     "callSid": current_call_sid,
                 }
                 broadcast_to_dashboards_nonblocking(txt_obj, current_call_sid)
@@ -427,7 +430,7 @@ async def handle_media_stream(websocket: WebSocket):
                     "messageType": "orderComplete",
                     "orderData": final_order,
                     "summary": final_summary,
-                    "timestamp": int(time.time()),
+                    "timestamp": int(time.time() * 1000),  # ✅ Milliseconds
                     "callSid": current_call_sid,
                 }, current_call_sid)
         except Exception:
