@@ -169,6 +169,7 @@ async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None)
     for c in to_remove:
         dashboard_clients.discard(c)
 
+
 def broadcast_to_dashboards_nonblocking(payload: Dict[str, Any], call_sid: Optional[str] = None):
     """Fire-and-forget broadcast with call filtering."""
     asyncio.create_task(_do_broadcast(payload, call_sid))
@@ -288,7 +289,6 @@ async def handle_media_stream(websocket: WebSocket):
             await handle_audio_stream(audio_data, current_call_sid)
     
     # Set up callbacks for transcription system
-    # Set up callbacks
     openai_service.whisper_service.set_audio_callback(handle_audio_with_call_id)
     openai_service.whisper_service.set_word_callback(handle_whisper_for_orders)  # ✅ Whisper for orders only
     openai_service.transcript_callback = handle_openai_transcript  # ✅ OpenAI native for dashboard
@@ -391,7 +391,7 @@ async def handle_media_stream(websocket: WebSocket):
             except Exception:
                 pass
 
-       async def handle_other_openai_event(response: dict):
+        async def handle_other_openai_event(response: dict):
             openai_service.process_event_for_logging(response)
             
             # ✅ Extract transcripts from OpenAI native (goes to dashboard)
