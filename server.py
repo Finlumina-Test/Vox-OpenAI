@@ -44,7 +44,7 @@ async def handle_audio_stream(audio_data: Dict[str, Any], call_sid: str):
         "messageType": "audio",
         "speaker": audio_data["speaker"],
         "audio": audio_data["audio"],
-        "timestamp": int(time.time() * 1000),  # ✅ Milliseconds
+        "timestamp": int(time.time() * 1000),  # ✅ CHANGED: milliseconds
         "callSid": call_sid,
     }
     
