@@ -246,7 +246,7 @@ async def handle_media_stream(websocket: WebSocket):
                 "messageType": "transcription",
                 "speaker": "AI" if speaker == "AI_whisper" else speaker,  # Normalize
                 "text": transcription_data["text"],
-                "timestamp": transcription_data["timestamp"],
+                "timestamp": transcription_data.get("timestamp") or int(time.time() * 1000),  # ✅ Use milliseconds for better sorting
                 "callSid": current_call_sid,
             }
             broadcast_to_dashboards_nonblocking(payload, current_call_sid)
