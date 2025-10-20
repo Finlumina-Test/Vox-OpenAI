@@ -1,5 +1,6 @@
 import json
 import asyncio
+import time
 from typing import Optional, Dict, Any
 from config import Config
 from services.log_utils import Log
@@ -437,7 +438,7 @@ class OpenAIService:
                                     await self.ai_transcript_callback({
                                         "speaker": "AI",
                                         "text": transcript.strip(),
-                                        "timestamp": int(asyncio.get_event_loop().time())
+                                        "timestamp": int(time.time() * 1000)  # ✅ Milliseconds for consistency
                                     })
                                 
                                 return  # Found and processed transcript
