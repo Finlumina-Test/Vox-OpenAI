@@ -27,7 +27,7 @@ class OpenAIEventHandler:
     @staticmethod
     def is_audio_delta_event(event: Dict[str, Any]) -> bool:
         """Check if event is an audio delta from OpenAI."""
-        return (event.get('type') == 'response.output_audio.delta' and 
+        return (event.get('type') == 'response.audio.delta' and 
                 'delta' in event)
     
     @staticmethod
@@ -71,11 +71,12 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio"], 
+                "output_modalities": ["audio", "text"],  # ✅ Enable text output for transcripts
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
-                        "turn_detection": {"type": "server_vad"}
+                        "turn_detection": {"type": "server_vad"},
+                        "transcription": {"model": "whisper-1"}  # ✅ Enable caller transcription
                     },
                     "output": {
                         "format": {"type": "audio/pcmu"}
@@ -204,11 +205,11 @@ class OpenAIConversationManager:
 
 class OpenAIService:
     """
-    Unified service for OpenAI Realtime API with sequential audio streaming:
+    Unified service for OpenAI Realtime API with native transcription:
     - Manages sessions, greetings, event logging
-    - Extracts assistant & caller transcripts
+    - Extracts BOTH caller & AI transcripts from OpenAI (no Whisper for dashboard)
     - Handles tool calls, interruptions, and goodbyes
-    - Sequential audio delivery prevents overlapping chunks
+    - Whisper ONLY used for order extraction (accuracy backup)
     """
 
     def __init__(self):
@@ -223,8 +224,8 @@ class OpenAIService:
         self._goodbye_item_id: Optional[str] = None
         self._goodbye_watchdog: Optional[asyncio.Task] = None
         
-        # Callback for AI transcripts from OpenAI (for dashboard UI)
-        self.ai_transcript_callback: Optional[callable] = None
+        # ✅ Single callback for ALL transcripts (caller + AI) - goes to dashboard
+        self.transcript_callback: Optional[callable] = None
 
     # --- SESSION & GREETING ---
     async def initialize_session(self, connection_manager) -> None:
@@ -326,7 +327,7 @@ class OpenAIService:
         if not (self._pending_goodbye and self._goodbye_audio_heard):
             return False
         etype = event.get('type')
-        if etype == 'response.output_audio.done':
+        if etype == 'response.audio.done':
             return True
         if etype == 'response.done':
             if not self._goodbye_item_id:
@@ -334,7 +335,7 @@ class OpenAIService:
                 for item in (resp.get('output') or []):
                     if isinstance(item, dict) and item.get('type') == 'message' and item.get('role') == 'assistant':
                         for c in (item.get('content') or []):
-                            if isinstance(c, dict) and c.get('type') == 'output_audio':
+                            if isinstance(c, dict) and c.get('type') == 'audio':
                                 return True
                 return False
             resp = event.get('response') or {}
@@ -398,17 +399,45 @@ class OpenAIService:
             self._goodbye_watchdog.cancel()
         self._goodbye_watchdog = None
 
-    # --- TRANSCRIPT EXTRACTION (OpenAI Native for Dashboard) ---
-    async def extract_and_emit_ai_transcript(self, event: Dict[str, Any]) -> None:
+    # --- TRANSCRIPT EXTRACTION (OpenAI Native ONLY for Dashboard) ---
+    
+    async def extract_and_emit_caller_transcript(self, event: Dict[str, Any]) -> None:
         """
-        Extract AI transcript from OpenAI's native response.done event.
-        This is used for DASHBOARD display (clean, fast, native language).
-        Whisper transcription still happens for order extraction accuracy.
+        ✅ Extract CALLER transcript from OpenAI native transcription.
+        Event: conversation.item.input_audio_transcription.completed
+        This goes to DASHBOARD only (fast, clean).
         """
         try:
             etype = event.get("type", "")
             
-            # Only process response.done events
+            if etype == "conversation.item.input_audio_transcription.completed":
+                transcript = event.get("transcript", "").strip()
+                
+                if transcript:
+                    Log.info(f"[Caller OpenAI] 📝 {transcript}")
+                    
+                    # Send to dashboard
+                    if self.transcript_callback:
+                        await self.transcript_callback({
+                            "speaker": "Caller",
+                            "text": transcript,
+                            "timestamp": int(time.time() * 1000)
+                        })
+                    
+                    return
+                    
+        except Exception as e:
+            Log.debug(f"[openai] Caller transcript error: {e}")
+    
+    async def extract_and_emit_ai_transcript(self, event: Dict[str, Any]) -> None:
+        """
+        ✅ Extract AI transcript from OpenAI native response.
+        Event: response.done
+        This goes to DASHBOARD only (fast, clean).
+        """
+        try:
+            etype = event.get("type", "")
+            
             if etype != "response.done":
                 return
             
@@ -426,25 +455,25 @@ class OpenAIService:
                         if not isinstance(c, dict):
                             continue
                             
-                        # Extract transcript from output_audio
-                        if c.get("type") == "output_audio":
+                        # Extract transcript from audio content
+                        if c.get("type") == "audio":
                             transcript = c.get("transcript")
                             
                             if transcript and isinstance(transcript, str) and transcript.strip():
-                                Log.info(f"[AI Native] 📝 {transcript}")
+                                Log.info(f"[AI OpenAI] 📝 {transcript}")
                                 
-                                # Emit via callback (goes to dashboard)
-                                if self.ai_transcript_callback:
-                                    await self.ai_transcript_callback({
+                                # Send to dashboard
+                                if self.transcript_callback:
+                                    await self.transcript_callback({
                                         "speaker": "AI",
                                         "text": transcript.strip(),
-                                        "timestamp": int(time.time() * 1000)  # ✅ Milliseconds for consistency
+                                        "timestamp": int(time.time() * 1000)
                                     })
                                 
-                                return  # Found and processed transcript
+                                return
                                 
         except Exception as e:
-            Log.debug(f"[openai] AI transcript extract error: {e}")
+            Log.debug(f"[openai] AI transcript error: {e}")
 
     # --- AUDIO EVENTS ---
     def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
