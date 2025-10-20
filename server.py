@@ -234,13 +234,21 @@ async def handle_media_stream(websocket: WebSocket):
     order_extractor.set_update_callback(send_order_update)
     
     # ✅ OpenAI native transcript callback (ONLY goes to dashboard)
+    # ✅ OpenAI native transcript callback (ONLY goes to dashboard)
     async def handle_openai_transcript(transcription_data: Dict[str, Any]):
         """
         Handle OpenAI native transcripts (Caller + AI).
         Goes to DASHBOARD only - clean, fast, no duplicates.
         """
-        speaker = transcription_data["speaker"]
-        text = transcription_data["text"]
+        # ✅ FIX: Add null check
+        if not transcription_data or not isinstance(transcription_data, dict):
+            return
+        
+        speaker = transcription_data.get("speaker")
+        text = transcription_data.get("text")
+        
+        if not speaker or not text:
+            return
         
         # Send to dashboard
         payload = {
@@ -255,6 +263,29 @@ async def handle_media_stream(websocket: WebSocket):
         # Also extract for orders
         try:
             order_extractor.add_transcript(speaker, text)
+        except Exception as e:
+            Log.error(f"[OrderExtraction] Error: {e}")
+    
+    # ✅ Whisper callback (ONLY for order extraction backup)
+    async def handle_whisper_for_orders(transcription_data: Dict[str, Any]):
+        """
+        Whisper transcription - ONLY for order extraction.
+        Does NOT go to dashboard (OpenAI native handles that).
+        """
+        # ✅ FIX: Add null check
+        if not transcription_data or not isinstance(transcription_data, dict):
+            return
+        
+        speaker = transcription_data.get("speaker")
+        text = transcription_data.get("text")
+        
+        if not speaker or not text:
+            return
+        
+        # Only extract orders, don't send to dashboard
+        try:
+            normalized_speaker = "AI" if speaker == "AI_whisper" else speaker
+            order_extractor.add_transcript(normalized_speaker, text)
         except Exception as e:
             Log.error(f"[OrderExtraction] Error: {e}")
     
