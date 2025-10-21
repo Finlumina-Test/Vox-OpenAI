@@ -1,4 +1,4 @@
-# server.py (FIXED: AI audio playback + better caller audio handling)
+# server.py (FIXED: OpenAI transcription, audio streaming to dashboard)
 import os
 import json
 import time
@@ -36,22 +36,22 @@ dashboard_clients: Set[DashboardClient] = set()
 
 
 # ---------------------------
-# Timed audio streaming with proper delays
+# Audio streaming to dashboard
 # ---------------------------
-async def handle_audio_stream(audio_data: Dict[str, Any], call_sid: str):
-    """Handle raw audio chunks with proper timing."""
+async def stream_audio_to_dashboard(audio_data: Dict[str, Any], call_sid: str):
+    """Stream raw audio chunks to dashboard for playback."""
     payload = {
         "messageType": "audio",
         "speaker": audio_data["speaker"],
-        "audio": audio_data["audio"],
+        "audio": audio_data["audio"],  # Base64 encoded
         "timestamp": int(time.time() * 1000),
         "callSid": call_sid,
     }
     await _do_broadcast(payload, call_sid)
 
 
-async def handle_transcription_update(transcription_data: Dict[str, Any], call_sid: str):
-    """Handle completed transcription phrases."""
+async def stream_transcription_to_dashboard(transcription_data: Dict[str, Any], call_sid: str):
+    """Stream transcription to dashboard."""
     payload = {
         "messageType": "transcription",
         "speaker": transcription_data["speaker"],
@@ -118,7 +118,7 @@ async def dashboard_stream(websocket: WebSocket):
 
 
 # ---------------------------
-# Broadcasting functions with call filtering
+# Broadcasting functions
 # ---------------------------
 async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None):
     """Broadcast to dashboard clients with call filtering."""
@@ -203,6 +203,7 @@ async def handle_media_stream(websocket: WebSocket):
     current_call_sid: Optional[str] = None
 
     async def send_order_update(order_data: Dict[str, Any]):
+        """Send order updates to dashboard."""
         payload = {
             "messageType": "orderUpdate",
             "orderData": order_data,
@@ -214,12 +215,20 @@ async def handle_media_stream(websocket: WebSocket):
     order_extractor.set_update_callback(send_order_update)
 
     async def handle_openai_transcript(transcription_data: Dict[str, Any]):
+        """
+        Handle transcripts from OpenAI Realtime API.
+        Send to: Dashboard + Order Extraction
+        """
         if not transcription_data or not isinstance(transcription_data, dict):
             return
+        
         speaker = transcription_data.get("speaker")
         text = transcription_data.get("text")
+        
         if not speaker or not text:
             return
+
+        # Send to dashboard
         payload = {
             "messageType": "transcription",
             "speaker": speaker,
@@ -228,32 +237,14 @@ async def handle_media_stream(websocket: WebSocket):
             "callSid": current_call_sid,
         }
         broadcast_to_dashboards_nonblocking(payload, current_call_sid)
+
+        # Send to order extraction
         try:
             order_extractor.add_transcript(speaker, text)
         except Exception as e:
             Log.error(f"[OrderExtraction] Error: {e}")
 
-    async def handle_whisper_for_orders(transcription_data: Dict[str, Any]):
-        if not transcription_data or not isinstance(transcription_data, dict):
-            return
-        speaker = transcription_data.get("speaker")
-        text = transcription_data.get("text")
-        if not speaker or not text:
-            return
-        try:
-            normalized_speaker = "AI" if speaker == "AI_whisper" else speaker
-            order_extractor.add_transcript(normalized_speaker, text)
-        except Exception as e:
-            Log.error(f"[OrderExtraction] Error: {e}")
-
-    async def handle_audio_with_call_id(audio_data: Dict[str, Any]):
-        """Send audio to dashboard for playback."""
-        if current_call_sid:
-            await handle_audio_stream(audio_data, current_call_sid)
-
-    # Set up callbacks
-    openai_service.whisper_service.set_audio_callback(handle_audio_with_call_id)
-    openai_service.whisper_service.set_word_callback(handle_whisper_for_orders)
+    # Set transcript callback for OpenAI
     openai_service.transcript_callback = handle_openai_transcript
 
     try:
@@ -267,58 +258,33 @@ async def handle_media_stream(websocket: WebSocket):
                 payload_b64 = media.get("payload")
                 
                 if payload_b64:
-                    # Send CALLER audio to dashboard (Twilio raw audio)
+                    # ✅ Send CALLER audio to dashboard (raw mulaw)
                     try:
-                        asyncio.create_task(handle_audio_with_call_id({
+                        asyncio.create_task(stream_audio_to_dashboard({
                             "speaker": "Caller",
-                            "audio": payload_b64  # Base64 encoded mulaw audio
-                        }))
+                            "audio": payload_b64  # Base64 mulaw
+                        }, current_call_sid))
                     except Exception as e:
-                        log_nonblocking(Log.error, f"[Caller audio broadcast] failed: {e}")
-                    
-                    # Send to Whisper for transcription (order extraction backup)
-                    try:
-                        asyncio.create_task(
-                            openai_service.whisper_service.transcribe_realtime(
-                                payload_b64, source="Caller"
-                            )
-                        )
-                    except Exception as e:
-                        log_nonblocking(Log.error, f"[Caller Whisper] failed: {e}")
+                        log_nonblocking(Log.error, f"[Caller audio→dashboard] failed: {e}")
 
-                    # Send to OpenAI for processing
+                    # ✅ Send to OpenAI for processing (main flow)
                     if connection_manager.is_openai_connected():
                         try:
                             audio_message = audio_service.process_incoming_audio(data)
                             if audio_message:
                                 await connection_manager.send_to_openai(audio_message)
                         except Exception as e:
-                            log_nonblocking(Log.error, f"[media->OpenAI] failed: {e}")
-
-            # Handle text messages
-            if "text" in data and isinstance(data["text"], str) and data["text"].strip():
-                txt_obj = {
-                    "messageType": "text",
-                    "speaker": "Caller",
-                    "text": data["text"].strip(),
-                    "timestamp": data.get("timestamp") or int(time.time() * 1000),
-                    "callSid": current_call_sid,
-                }
-                broadcast_to_dashboards_nonblocking(txt_obj, current_call_sid)
+                            log_nonblocking(Log.error, f"[Caller→OpenAI] failed: {e}")
 
         async def handle_audio_delta(response: dict):
             """
-            ✅ FIXED: Handle AI audio properly
-            - Extract delta correctly (it's already base64)
-            - Send to Twilio for playback
-            - Send to dashboard for monitoring
-            - Send to Whisper for order extraction
+            Handle AI audio from OpenAI Realtime API.
+            Send to: Twilio + Dashboard
             """
             try:
                 if response.get('type') != 'response.output_audio.delta':
                     return
 
-                # ✅ Extract delta - it's already base64 encoded
                 delta = response.get('delta')
                 if not delta:
                     return
@@ -340,39 +306,32 @@ async def handle_media_stream(websocket: WebSocket):
                             mark_msg = audio_service.create_mark_message(stream_sid)
                             await connection_manager.send_to_twilio(mark_msg)
                     except Exception as e:
-                        log_nonblocking(Log.error, f"[AI->Twilio] failed: {e}")
+                        log_nonblocking(Log.error, f"[AI→Twilio] failed: {e}")
 
                 # ✅ Send to Dashboard (for monitoring)
                 try:
-                    asyncio.create_task(handle_audio_with_call_id({
+                    asyncio.create_task(stream_audio_to_dashboard({
                         "speaker": "AI",
                         "audio": delta  # Already base64
-                    }))
+                    }, current_call_sid))
                     Log.info(f"[AI Audio] 📊 Sent to dashboard")
                 except Exception as e:
-                    log_nonblocking(Log.error, f"[AI->Dashboard] failed: {e}")
-
-                # ✅ Send to Whisper (for order extraction)
-                try:
-                    asyncio.create_task(
-                        openai_service.whisper_service.transcribe_realtime(
-                            delta, source="AI_whisper"
-                        )
-                    )
-                    Log.info(f"[AI Audio] 🎤 Sent to Whisper")
-                except Exception as e:
-                    log_nonblocking(Log.error, f"[AI->Whisper] failed: {e}")
+                    log_nonblocking(Log.error, f"[AI→Dashboard] failed: {e}")
 
             except Exception as e:
                 log_nonblocking(Log.error, f"[audio-delta] failed: {e}")
 
         async def handle_other_openai_event(response: dict):
+            """Handle other OpenAI events (logging, tracking, transcription)."""
             openai_service.process_event_for_logging(response)
             openai_service.track_item_creation(response)
+            
+            # Extract transcriptions from OpenAI
             await openai_service.extract_and_emit_caller_transcript(response)
             await openai_service.extract_and_emit_ai_transcript(response)
 
         async def openai_receiver():
+            """Receive events from OpenAI."""
             await connection_manager.receive_from_openai(
                 handle_audio_delta,
                 None,
@@ -380,6 +339,7 @@ async def handle_media_stream(websocket: WebSocket):
             )
 
         async def renew_openai_session():
+            """Renew OpenAI session periodically."""
             while True:
                 await asyncio.sleep(getattr(Config, "REALTIME_SESSION_RENEW_SECONDS", 1200))
                 try:
@@ -392,16 +352,19 @@ async def handle_media_stream(websocket: WebSocket):
                     Log.error(f"Session renewal failed: {e}")
 
         async def on_start_cb(stream_sid: str):
+            """Handle Twilio stream start."""
             nonlocal current_call_sid
             current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
             Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
 
         async def on_mark_cb():
+            """Handle Twilio mark event."""
             try:
                 audio_service.handle_mark_event()
             except Exception:
                 pass
 
+        # Run all tasks
         await asyncio.gather(
             connection_manager.receive_from_twilio(handle_media_event, on_start_cb, on_mark_cb),
             openai_receiver(),
@@ -412,6 +375,7 @@ async def handle_media_stream(websocket: WebSocket):
         Log.error(f"Error in media stream handler: {e}")
 
     finally:
+        # Final order summary
         try:
             final_summary = order_extractor.get_order_summary()
             Log.info(f"\n{final_summary}")
@@ -427,13 +391,9 @@ async def handle_media_stream(websocket: WebSocket):
         except Exception:
             pass
 
+        # Cleanup
         try:
             await order_extractor.shutdown()
-        except Exception:
-            pass
-
-        try:
-            await openai_service.whisper_service.shutdown()
         except Exception:
             pass
 
