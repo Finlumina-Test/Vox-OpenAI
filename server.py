@@ -250,6 +250,8 @@ async def handle_media_stream(websocket: WebSocket):
         except Exception as e:
             Log.error(f"[OrderExtraction] Error: {e}")
 
+    openai_service.transcript_callback = handle_openai_transcript
+
     # Whisper callback for order extraction (BACKUP source)
     async def handle_whisper_for_orders(transcription_data: Dict[str, Any]):
         """
@@ -276,9 +278,7 @@ async def handle_media_stream(websocket: WebSocket):
             Log.error(f"[Whisper→Orders] Error: {e}")
 
     # Set callbacks
-    openai_service.transcript_callback = handle_openai_transcript
-    
-    if whisper_service:
+        if whisper_service:
         # Whisper only sends transcripts to order extraction
         whisper_service.set_word_callback(handle_whisper_for_orders)
 
