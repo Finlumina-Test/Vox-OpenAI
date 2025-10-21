@@ -22,7 +22,7 @@ class OpenAIEventHandler:
     @staticmethod
     def is_audio_delta_event(event: Dict[str, Any]) -> bool:
         """Check if event is an audio delta from OpenAI."""
-        return (event.get('type') == 'response.audio.delta' and 
+        return (event.get('type') == 'response.output_audio.delta' and 
                 'delta' in event)
     
     @staticmethod
