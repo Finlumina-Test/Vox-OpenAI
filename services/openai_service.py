@@ -48,26 +48,24 @@ class OpenAISessionManager:
     Configures and initializes OpenAI Realtime API sessions.
     """
     
-    @staticmethod
+       @staticmethod
     def create_session_update() -> Dict[str, Any]:
         """
         Create a session update message for OpenAI Realtime API.
+        
+        Returns:
+            Dictionary containing session configuration
         """
         session = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio"],
+                "output_modalities": ["audio"], 
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
-                        "turn_detection": {"type": "server_vad"},
-                        "transcription": {
-                            "model": "whisper-1",
-                            "language": "en",  # ✅ Force English romanization
-                            "prompt": "Transcribe in Roman/Latin script only. Use Roman Urdu for Urdu words (e.g., 'shukriya'), Roman Punjabi for Punjabi (e.g., 'ki haal hai'), keep English as-is."
-                        }
+                        "turn_detection": {"type": "server_vad"}
                     },
                     "output": {
                         "format": {"type": "audio/pcmu"}
