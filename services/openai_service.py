@@ -71,7 +71,7 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio", "text"],  # ✅ Enable text output for transcripts
+                "output_modalities": ["audio"],  # ✅ Enable text output for transcripts
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
