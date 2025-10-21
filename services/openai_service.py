@@ -71,12 +71,12 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio"],  # ✅ Audio only (transcripts come from audio content) # ✅ Enable text output for transcripts
+                "output_modalities": ["audio"],
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": {"type": "server_vad"},
-                        "transcription": {"model": "whisper-1"}  # ✅ Enable caller transcription
+                        "transcription": {"model": "whisper-1"}
                     },
                     "output": {
                         "format": {"type": "audio/pcmu"}
@@ -327,7 +327,7 @@ class OpenAIService:
         if not (self._pending_goodbye and self._goodbye_audio_heard):
             return False
         etype = event.get('type')
-        if etype == 'response.audio.done':
+        if etype == 'response.output_audio.done':
             return True
         if etype == 'response.done':
             if not self._goodbye_item_id:
@@ -335,7 +335,7 @@ class OpenAIService:
                 for item in (resp.get('output') or []):
                     if isinstance(item, dict) and item.get('type') == 'message' and item.get('role') == 'assistant':
                         for c in (item.get('content') or []):
-                            if isinstance(c, dict) and c.get('type') == 'audio':
+                            if isinstance(c, dict) and c.get('type') == 'output_audio':
                                 return True
                 return False
             resp = event.get('response') or {}
@@ -455,8 +455,8 @@ class OpenAIService:
                         if not isinstance(c, dict):
                             continue
                             
-                        # Extract transcript from audio content
-                        if c.get("type") == "audio":
+                        # Extract transcript from output_audio content
+                        if c.get("type") == "output_audio":
                             transcript = c.get("transcript")
                             
                             if transcript and isinstance(transcript, str) and transcript.strip():
