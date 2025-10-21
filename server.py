@@ -328,7 +328,7 @@ async def handle_media_stream(websocket: WebSocket):
             Send to: Twilio + Dashboard + Whisper (for order extraction)
             """
             try:
-                if response.get('type') != 'response.output_audio.delta':
+                if response.get('type') != 'response.audio.delta':
                     return
 
                 delta = response.get('delta')
