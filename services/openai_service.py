@@ -12,11 +12,6 @@ from services.order_extraction_service import OrderExtractionService
 class OpenAIEventHandler:
     """
     Interprets and processes events received from the OpenAI Realtime API.
-    
-    - Determines which events should be logged.
-    - Identifies and extracts audio deltas, speech start events, and item IDs from event payloads.
-    
-    Used by higher-level services to make sense of incoming OpenAI events and route them appropriately.
     """
     
     @staticmethod
@@ -51,20 +46,12 @@ class OpenAIEventHandler:
 class OpenAISessionManager:
     """
     Configures and initializes OpenAI Realtime API sessions.
-    
-    - Generates session update messages specifying model, audio formats, and system instructions.
-    - Creates the initial conversation item (for AI-first greetings) and triggers responses.
-    
-    Ensures consistent and correct session setup for all OpenAI interactions.
     """
     
     @staticmethod
     def create_session_update() -> Dict[str, Any]:
         """
         Create a session update message for OpenAI Realtime API.
-        
-        Returns:
-            Dictionary containing session configuration
         """
         session = {
             "type": "session.update",
@@ -76,7 +63,11 @@ class OpenAISessionManager:
                     "input": {
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": {"type": "server_vad"},
-                        "transcription": {"model": "whisper-1"}
+                        "transcription": {
+                            "model": "whisper-1",
+                            "language": "en",  # ✅ Force English romanization
+                            "prompt": "Transcribe in Roman/Latin script only. Use Roman Urdu for Urdu words (e.g., 'shukriya'), Roman Punjabi for Punjabi (e.g., 'ki haal hai'), keep English as-is."
+                        }
                     },
                     "output": {
                         "format": {"type": "audio/pcmu"}
@@ -103,12 +94,7 @@ class OpenAISessionManager:
     
     @staticmethod
     def create_initial_conversation_item() -> Dict[str, Any]:
-        """
-        Create an initial conversation item for AI-first interactions.
-        
-        Returns:
-            Dictionary containing initial conversation setup
-        """
+        """Create an initial conversation item for AI-first interactions."""
         return {
             "type": "conversation.item.create",
             "item": {
@@ -125,38 +111,16 @@ class OpenAISessionManager:
     
     @staticmethod
     def create_response_trigger() -> Dict[str, Any]:
-        """
-        Create a response trigger message.
-        
-        Returns:
-            Dictionary to trigger OpenAI response generation
-        """
+        """Create a response trigger message."""
         return {"type": "response.create"}
 
 
 class OpenAIConversationManager:
-    """
-    Manages conversation flow and interruption logic for OpenAI sessions.
-    
-    - Creates truncation events to interrupt/cut off ongoing AI responses.
-    - Determines when interruptions should be processed based on marks and timing.
-    - Calculates elapsed time for precise truncation.
-    
-    Used by the main service to support real-time, interactive voice experiences.
-    """
+    """Manages conversation flow and interruption logic for OpenAI sessions."""
     
     @staticmethod
     def create_truncate_event(item_id: str, audio_end_ms: int) -> Dict[str, Any]:
-        """
-        Create a conversation item truncation event.
-        
-        Args:
-            item_id: ID of the item to truncate
-            audio_end_ms: Timestamp where to truncate the audio
-            
-        Returns:
-            Dictionary containing truncation command
-        """
+        """Create a conversation item truncation event."""
         return {
             "type": "conversation.item.truncate",
             "item_id": item_id,
@@ -170,17 +134,7 @@ class OpenAIConversationManager:
         mark_queue: list,
         response_start_timestamp: Optional[int]
     ) -> bool:
-        """
-        Determine if an interruption should be processed.
-        
-        Args:
-            last_assistant_item: ID of the last assistant response
-            mark_queue: Queue of pending marks
-            response_start_timestamp: When the current response started
-            
-        Returns:
-            True if interruption should be handled
-        """
+        """Determine if an interruption should be processed."""
         return (last_assistant_item is not None and 
                 len(mark_queue) > 0 and 
                 response_start_timestamp is not None)
@@ -190,16 +144,7 @@ class OpenAIConversationManager:
         current_timestamp: int,
         response_start_timestamp: int
     ) -> int:
-        """
-        Calculate the elapsed time for audio truncation.
-        
-        Args:
-            current_timestamp: Current media timestamp
-            response_start_timestamp: When the response started
-            
-        Returns:
-            Elapsed time in milliseconds
-        """
+        """Calculate the elapsed time for audio truncation."""
         return current_timestamp - response_start_timestamp
 
 
@@ -224,8 +169,11 @@ class OpenAIService:
         self._goodbye_item_id: Optional[str] = None
         self._goodbye_watchdog: Optional[asyncio.Task] = None
         
-        # ✅ Single callback for ALL transcripts (caller + AI) - goes to dashboard
+        # ✅ Transcript callback for dashboard
         self.transcript_callback: Optional[callable] = None
+        
+        # ✅ Track item creation timestamps for proper ordering
+        self._item_timestamps: Dict[str, int] = {}
 
     # --- SESSION & GREETING ---
     async def initialize_session(self, connection_manager) -> None:
@@ -401,19 +349,45 @@ class OpenAIService:
 
     # --- TRANSCRIPT EXTRACTION (OpenAI Native ONLY for Dashboard) ---
     
+    def track_item_creation(self, event: Dict[str, Any]) -> None:
+        """
+        Track when items are created to get proper timestamps.
+        Called for: input_audio_buffer.committed, conversation.item.created
+        """
+        try:
+            etype = event.get("type", "")
+            
+            if etype == "input_audio_buffer.committed":
+                item_id = event.get("item_id")
+                if item_id:
+                    self._item_timestamps[item_id] = int(time.time() * 1000)
+                    
+            elif etype == "conversation.item.created":
+                item = event.get("item") or {}
+                item_id = item.get("id")
+                if item_id:
+                    self._item_timestamps[item_id] = int(time.time() * 1000)
+                    
+        except Exception as e:
+            Log.debug(f"[timestamp tracking] error: {e}")
+    
     async def extract_and_emit_caller_transcript(self, event: Dict[str, Any]) -> None:
         """
         ✅ Extract CALLER transcript from OpenAI native transcription.
         Event: conversation.item.input_audio_transcription.completed
-        This goes to DASHBOARD only (fast, clean).
+        This goes to DASHBOARD only (fast, clean, Roman script).
         """
         try:
             etype = event.get("type", "")
             
             if etype == "conversation.item.input_audio_transcription.completed":
+                item_id = event.get("item_id")
                 transcript = event.get("transcript", "").strip()
                 
                 if transcript:
+                    # ✅ Use tracked timestamp for proper ordering
+                    timestamp = self._item_timestamps.get(item_id, int(time.time() * 1000))
+                    
                     Log.info(f"[Caller OpenAI] 📝 {transcript}")
                     
                     # Send to dashboard
@@ -421,7 +395,7 @@ class OpenAIService:
                         await self.transcript_callback({
                             "speaker": "Caller",
                             "text": transcript,
-                            "timestamp": int(time.time() * 1000)
+                            "timestamp": timestamp
                         })
                     
                     return
@@ -449,6 +423,7 @@ class OpenAIService:
                     continue
                     
                 if item.get("type") == "message" and item.get("role") == "assistant":
+                    item_id = item.get("id")
                     content = item.get("content") or []
                     
                     for c in content:
@@ -460,6 +435,9 @@ class OpenAIService:
                             transcript = c.get("transcript")
                             
                             if transcript and isinstance(transcript, str) and transcript.strip():
+                                # ✅ Use tracked timestamp for proper ordering
+                                timestamp = self._item_timestamps.get(item_id, int(time.time() * 1000))
+                                
                                 Log.info(f"[AI OpenAI] 📝 {transcript}")
                                 
                                 # Send to dashboard
@@ -467,7 +445,7 @@ class OpenAIService:
                                     await self.transcript_callback({
                                         "speaker": "AI",
                                         "text": transcript.strip(),
-                                        "timestamp": int(time.time() * 1000)
+                                        "timestamp": timestamp
                                     })
                                 
                                 return
