@@ -1,4 +1,4 @@
-# server.py (multi-call capable with dual transcription system)
+# server.py (FIXED: AI audio playback + better caller audio handling)
 import os
 import json
 import time
@@ -44,7 +44,7 @@ async def handle_audio_stream(audio_data: Dict[str, Any], call_sid: str):
         "messageType": "audio",
         "speaker": audio_data["speaker"],
         "audio": audio_data["audio"],
-        "timestamp": int(time.time() * 1000),  # ✅ CHANGED: milliseconds
+        "timestamp": int(time.time() * 1000),
         "callSid": call_sid,
     }
     await _do_broadcast(payload, call_sid)
@@ -247,9 +247,11 @@ async def handle_media_stream(websocket: WebSocket):
             Log.error(f"[OrderExtraction] Error: {e}")
 
     async def handle_audio_with_call_id(audio_data: Dict[str, Any]):
+        """Send audio to dashboard for playback."""
         if current_call_sid:
             await handle_audio_stream(audio_data, current_call_sid)
 
+    # Set up callbacks
     openai_service.whisper_service.set_audio_callback(handle_audio_with_call_id)
     openai_service.whisper_service.set_word_callback(handle_whisper_for_orders)
     openai_service.transcript_callback = handle_openai_transcript
@@ -259,10 +261,22 @@ async def handle_media_stream(websocket: WebSocket):
         await openai_service.initialize_session(connection_manager)
 
         async def handle_media_event(data: dict):
+            """Process incoming Twilio media events."""
             if data.get("event") == "media":
                 media = data.get("media") or {}
                 payload_b64 = media.get("payload")
+                
                 if payload_b64:
+                    # Send CALLER audio to dashboard (Twilio raw audio)
+                    try:
+                        asyncio.create_task(handle_audio_with_call_id({
+                            "speaker": "Caller",
+                            "audio": payload_b64  # Base64 encoded mulaw audio
+                        }))
+                    except Exception as e:
+                        log_nonblocking(Log.error, f"[Caller audio broadcast] failed: {e}")
+                    
+                    # Send to Whisper for transcription (order extraction backup)
                     try:
                         asyncio.create_task(
                             openai_service.whisper_service.transcribe_realtime(
@@ -270,16 +284,18 @@ async def handle_media_stream(websocket: WebSocket):
                             )
                         )
                     except Exception as e:
-                        log_nonblocking(Log.error, f"[Caller processing] failed: {e}")
+                        log_nonblocking(Log.error, f"[Caller Whisper] failed: {e}")
 
+                    # Send to OpenAI for processing
                     if connection_manager.is_openai_connected():
                         try:
                             audio_message = audio_service.process_incoming_audio(data)
                             if audio_message:
                                 await connection_manager.send_to_openai(audio_message)
                         except Exception as e:
-                            log_nonblocking(Log.error, f"[media] failed to send incoming audio: {e}")
+                            log_nonblocking(Log.error, f"[media->OpenAI] failed: {e}")
 
+            # Handle text messages
             if "text" in data and isinstance(data["text"], str) and data["text"].strip():
                 txt_obj = {
                     "messageType": "text",
@@ -291,50 +307,62 @@ async def handle_media_stream(websocket: WebSocket):
                 broadcast_to_dashboards_nonblocking(txt_obj, current_call_sid)
 
         async def handle_audio_delta(response: dict):
+            """
+            ✅ FIXED: Handle AI audio properly
+            - Extract delta correctly (it's already base64)
+            - Send to Twilio for playback
+            - Send to dashboard for monitoring
+            - Send to Whisper for order extraction
+            """
             try:
-                if response.get('type') == 'response.audio.delta':
-                    Log.info(f"[DEBUG] 🔊 Audio delta received! Size: {len(response.get('delta', ''))}")
+                if response.get('type') != 'response.audio.delta':
+                    return
 
-                audio_data = openai_service.extract_audio_response_data(response) or {}
-                delta = audio_data.get("delta")
-                if delta:
-                    Log.info(f"[DEBUG] 🎵 Extracted delta, size: {len(delta) if isinstance(delta, str) else 'bytes'}")
+                # ✅ Extract delta - it's already base64 encoded
+                delta = response.get('delta')
+                if not delta:
+                    return
 
-                    if isinstance(delta, (bytes, bytearray)):
-                        delta_bytes = bytes(delta)
-                    elif isinstance(delta, str):
-                        try:
-                            delta_bytes = base64.b64decode(delta)
-                            Log.info(f"[DEBUG] ✅ Decoded delta to {len(delta_bytes)} bytes")
-                        except Exception as e:
-                            Log.error(f"[DEBUG] ❌ Failed to decode delta: {e}")
-                            delta_bytes = None
-                    else:
-                        delta_bytes = None
+                Log.info(f"[AI Audio] 🔊 Received delta: {len(delta)} chars")
 
-                    if delta_bytes:
-                        asyncio.create_task(
-                            openai_service.whisper_service.transcribe_realtime(
-                                delta_bytes, source="AI_whisper"
-                            )
+                # ✅ Send to Twilio (for phone playback)
+                stream_sid = getattr(connection_manager.state, "stream_sid", None)
+                if stream_sid:
+                    try:
+                        audio_message = audio_service.process_outgoing_audio(
+                            response, stream_sid
                         )
+                        if audio_message:
+                            await connection_manager.send_to_twilio(audio_message)
+                            Log.info(f"[AI Audio] 📞 Sent to Twilio")
+                            
+                            # Send mark for sync
+                            mark_msg = audio_service.create_mark_message(stream_sid)
+                            await connection_manager.send_to_twilio(mark_msg)
+                    except Exception as e:
+                        log_nonblocking(Log.error, f"[AI->Twilio] failed: {e}")
 
-                        if getattr(connection_manager.state, "stream_sid", None):
-                            try:
-                                audio_message = audio_service.process_outgoing_audio(
-                                    response, connection_manager.state.stream_sid
-                                )
-                                if audio_message:
-                                    Log.info(f"[DEBUG] 📤 Sending audio to Twilio")
-                                    await connection_manager.send_to_twilio(audio_message)
-                                    mark_msg = audio_service.create_mark_message(
-                                        connection_manager.state.stream_sid
-                                    )
-                                    await connection_manager.send_to_twilio(mark_msg)
-                            except Exception as e:
-                                log_nonblocking(Log.error, f"[audio->twilio] failed: {e}")
-                    else:
-                        Log.error("[DEBUG] ❌ No delta_bytes to send!")
+                # ✅ Send to Dashboard (for monitoring)
+                try:
+                    asyncio.create_task(handle_audio_with_call_id({
+                        "speaker": "AI",
+                        "audio": delta  # Already base64
+                    }))
+                    Log.info(f"[AI Audio] 📊 Sent to dashboard")
+                except Exception as e:
+                    log_nonblocking(Log.error, f"[AI->Dashboard] failed: {e}")
+
+                # ✅ Send to Whisper (for order extraction)
+                try:
+                    asyncio.create_task(
+                        openai_service.whisper_service.transcribe_realtime(
+                            delta, source="AI_whisper"
+                        )
+                    )
+                    Log.info(f"[AI Audio] 🎤 Sent to Whisper")
+                except Exception as e:
+                    log_nonblocking(Log.error, f"[AI->Whisper] failed: {e}")
+
             except Exception as e:
                 log_nonblocking(Log.error, f"[audio-delta] failed: {e}")
 
