@@ -315,7 +315,7 @@ async def handle_media_stream(websocket: WebSocket):
             - Send to Whisper for order extraction
             """
             try:
-                if response.get('type') != 'response.audio.delta':
+                if response.get('type') != 'response.output_audio.delta':
                     return
 
                 # ✅ Extract delta - it's already base64 encoded
