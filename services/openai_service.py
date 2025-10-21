@@ -47,8 +47,8 @@ class OpenAISessionManager:
     """
     Configures and initializes OpenAI Realtime API sessions.
     """
-    
-       @staticmethod
+
+    @staticmethod
     def create_session_update() -> Dict[str, Any]:
         """
         Create a session update message for OpenAI Realtime API.
