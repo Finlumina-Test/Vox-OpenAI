@@ -1,4 +1,4 @@
-# server.py (FIXED: OpenAI transcription, audio streaming to dashboard)
+# server.py (HYBRID: OpenAI transcripts to dashboard, Whisper for order extraction)
 import os
 import json
 import time
@@ -20,6 +20,14 @@ from services import (
     AudioService,
 )
 from services.log_utils import Log
+
+# Import Whisper ONLY for order extraction
+try:
+    from services.transcription_service import TranscriptionService
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+    Log.warning("Whisper service not available - order extraction may be less accurate")
 
 
 # ---------------------------
@@ -48,18 +56,6 @@ async def stream_audio_to_dashboard(audio_data: Dict[str, Any], call_sid: str):
         "callSid": call_sid,
     }
     await _do_broadcast(payload, call_sid)
-
-
-async def stream_transcription_to_dashboard(transcription_data: Dict[str, Any], call_sid: str):
-    """Stream transcription to dashboard."""
-    payload = {
-        "messageType": "transcription",
-        "speaker": transcription_data["speaker"],
-        "text": transcription_data["text"],
-        "timestamp": transcription_data.get("timestamp") or int(time.time() * 1000),
-        "callSid": call_sid,
-    }
-    broadcast_to_dashboards_nonblocking(payload, call_sid)
 
 
 app = FastAPI()
@@ -202,6 +198,12 @@ async def handle_media_stream(websocket: WebSocket):
 
     current_call_sid: Optional[str] = None
 
+    # Initialize Whisper ONLY for order extraction (if available)
+    whisper_service = None
+    if WHISPER_AVAILABLE:
+        whisper_service = TranscriptionService()
+        Log.info("🎤 Whisper service initialized for order extraction")
+
     async def send_order_update(order_data: Dict[str, Any]):
         """Send order updates to dashboard."""
         payload = {
@@ -217,7 +219,10 @@ async def handle_media_stream(websocket: WebSocket):
     async def handle_openai_transcript(transcription_data: Dict[str, Any]):
         """
         Handle transcripts from OpenAI Realtime API.
-        Send to: Dashboard + Order Extraction
+        
+        Flow:
+        1. Send to Dashboard (for display)
+        2. Send to Order Extraction (as backup/primary)
         """
         if not transcription_data or not isinstance(transcription_data, dict):
             return
@@ -228,7 +233,7 @@ async def handle_media_stream(websocket: WebSocket):
         if not speaker or not text:
             return
 
-        # Send to dashboard
+        # ✅ Send to dashboard
         payload = {
             "messageType": "transcription",
             "speaker": speaker,
@@ -238,14 +243,44 @@ async def handle_media_stream(websocket: WebSocket):
         }
         broadcast_to_dashboards_nonblocking(payload, current_call_sid)
 
-        # Send to order extraction
+        # ✅ Send to order extraction (PRIMARY source)
         try:
             order_extractor.add_transcript(speaker, text)
+            Log.info(f"[OpenAI→Orders] {speaker}: {text[:50]}...")
         except Exception as e:
             Log.error(f"[OrderExtraction] Error: {e}")
 
-    # Set transcript callback for OpenAI
+    # Whisper callback for order extraction (BACKUP source)
+    async def handle_whisper_for_orders(transcription_data: Dict[str, Any]):
+        """
+        Handle Whisper transcripts ONLY for order extraction.
+        This provides multilingual backup if OpenAI misses something.
+        """
+        if not transcription_data or not isinstance(transcription_data, dict):
+            return
+        
+        speaker = transcription_data.get("speaker")
+        text = transcription_data.get("text")
+        
+        if not speaker or not text:
+            return
+
+        # Normalize speaker name
+        normalized_speaker = "AI" if "AI" in speaker else "Caller"
+        
+        try:
+            # Send to order extraction (BACKUP source)
+            order_extractor.add_transcript(normalized_speaker, text)
+            Log.info(f"[Whisper→Orders] {normalized_speaker}: {text[:50]}...")
+        except Exception as e:
+            Log.error(f"[Whisper→Orders] Error: {e}")
+
+    # Set callbacks
     openai_service.transcript_callback = handle_openai_transcript
+    
+    if whisper_service:
+        # Whisper only sends transcripts to order extraction
+        whisper_service.set_word_callback(handle_whisper_for_orders)
 
     try:
         await connection_manager.connect_to_openai()
@@ -267,7 +302,18 @@ async def handle_media_stream(websocket: WebSocket):
                     except Exception as e:
                         log_nonblocking(Log.error, f"[Caller audio→dashboard] failed: {e}")
 
-                    # ✅ Send to OpenAI for processing (main flow)
+                    # ✅ Send to Whisper for order extraction (multilingual backup)
+                    if whisper_service:
+                        try:
+                            asyncio.create_task(
+                                whisper_service.transcribe_realtime(
+                                    payload_b64, source="Caller"
+                                )
+                            )
+                        except Exception as e:
+                            log_nonblocking(Log.error, f"[Caller→Whisper] failed: {e}")
+
+                    # ✅ Send to OpenAI for processing (main conversation flow)
                     if connection_manager.is_openai_connected():
                         try:
                             audio_message = audio_service.process_incoming_audio(data)
@@ -279,7 +325,7 @@ async def handle_media_stream(websocket: WebSocket):
         async def handle_audio_delta(response: dict):
             """
             Handle AI audio from OpenAI Realtime API.
-            Send to: Twilio + Dashboard
+            Send to: Twilio + Dashboard + Whisper (for order extraction)
             """
             try:
                 if response.get('type') != 'response.output_audio.delta':
@@ -318,17 +364,41 @@ async def handle_media_stream(websocket: WebSocket):
                 except Exception as e:
                     log_nonblocking(Log.error, f"[AI→Dashboard] failed: {e}")
 
+                # ✅ Send to Whisper for order extraction (multilingual backup)
+                if whisper_service:
+                    try:
+                        asyncio.create_task(
+                            whisper_service.transcribe_realtime(
+                                delta, source="AI_whisper"
+                            )
+                        )
+                        Log.info(f"[AI Audio] 🎤 Sent to Whisper")
+                    except Exception as e:
+                        log_nonblocking(Log.error, f"[AI→Whisper] failed: {e}")
+
             except Exception as e:
                 log_nonblocking(Log.error, f"[audio-delta] failed: {e}")
 
         async def handle_other_openai_event(response: dict):
             """Handle other OpenAI events (logging, tracking, transcription)."""
-            openai_service.process_event_for_logging(response)
-            openai_service.track_item_creation(response)
+            try:
+                openai_service.process_event_for_logging(response)
+            except Exception as e:
+                Log.debug(f"[OpenAI logging] error: {e}")
+            
+            # Track item creation if method exists
+            if hasattr(openai_service, 'track_item_creation'):
+                try:
+                    openai_service.track_item_creation(response)
+                except Exception as e:
+                    Log.debug(f"[OpenAI tracking] error: {e}")
             
             # Extract transcriptions from OpenAI
-            await openai_service.extract_and_emit_caller_transcript(response)
-            await openai_service.extract_and_emit_ai_transcript(response)
+            try:
+                await openai_service.extract_and_emit_caller_transcript(response)
+                await openai_service.extract_and_emit_ai_transcript(response)
+            except Exception as e:
+                Log.debug(f"[OpenAI transcription] error: {e}")
 
         async def openai_receiver():
             """Receive events from OpenAI."""
@@ -396,6 +466,12 @@ async def handle_media_stream(websocket: WebSocket):
             await order_extractor.shutdown()
         except Exception:
             pass
+
+        if whisper_service:
+            try:
+                await whisper_service.shutdown()
+            except Exception:
+                pass
 
         try:
             await connection_manager.close_openai_connection()
