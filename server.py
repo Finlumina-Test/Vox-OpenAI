@@ -191,6 +191,10 @@ async def handle_media_stream(websocket: WebSocket):
     audio_service = AudioService()
     order_extractor = OrderExtractionService()
 
+    # ✅ Prevent 'NoneType' object is not callable' errors
+    openai_service.transcript_callback = lambda x: None
+    openai_service.dashboard_callback = lambda x: None
+
     current_call_sid: Optional[str] = None
 
     async def send_order_update(order_data: Dict[str, Any]):
