@@ -133,11 +133,40 @@ Return ONLY valid JSON. Example:
                     json=payload
                 ) as resp:
                     if resp.status != 200:
-                        Log.error(f"[OrderExtraction] API failed: {resp.status}")
+                        error_text = await resp.text()
+                        Log.error(f"[OrderExtraction] API failed: {resp.status} - {error_text}")
                         return
                     
-                    data = await resp.json()
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    # ✅ FIX: Robust null checking for order extraction
+                    try:
+                        data = await resp.json()
+                    except Exception as e:
+                        Log.error(f"[OrderExtraction] JSON decode failed: {e}")
+                        return
+                    
+                    if not data or not isinstance(data, dict):
+                        Log.error(f"[OrderExtraction] Invalid response data type")
+                        return
+                    
+                    choices = data.get("choices")
+                    if not choices or not isinstance(choices, list) or len(choices) == 0:
+                        Log.error(f"[OrderExtraction] No choices in response")
+                        return
+                    
+                    first_choice = choices[0]
+                    if not isinstance(first_choice, dict):
+                        Log.error(f"[OrderExtraction] Invalid choice format")
+                        return
+                    
+                    message = first_choice.get("message")
+                    if not message or not isinstance(message, dict):
+                        Log.error(f"[OrderExtraction] No message in choice")
+                        return
+                    
+                    content = message.get("content", "")
+                    if not content or not isinstance(content, str):
+                        Log.error(f"[OrderExtraction] Empty or invalid content")
+                        return
                     
                     try:
                         content = content.strip()
@@ -200,7 +229,7 @@ Return ONLY valid JSON. Example:
                         Log.error(f"[OrderExtraction] JSON parse error: {e}")
             
         except Exception as e:
-            Log.error(f"[OrderExtraction] Error: {e}")
+            Log.error(f"[OrderExtraction] Unexpected error: {e}")
     
     def get_current_order(self) -> Dict[str, Any]:
         """Get all extracted order data."""
