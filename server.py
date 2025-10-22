@@ -220,20 +220,6 @@ async def handle_media_stream(websocket: WebSocket):
     # Track call_sid for this connection
     current_call_sid: Optional[str] = None
     
-    # ✅ Set callback for order updates WITH call_sid
-    async def send_order_update(order_data: Dict[str, Any]):
-        """Send order updates to dashboard."""
-        payload = {
-            "messageType": "orderUpdate",
-            "orderData": order_data,
-            "timestamp": int(time.time() * 1000),  # ✅ Milliseconds
-            "callSid": current_call_sid,
-        }
-        broadcast_to_dashboards_nonblocking(payload, current_call_sid)
-    
-    order_extractor.set_update_callback(send_order_update)
-    
-    # ✅ OpenAI native transcript callback (ONLY goes to dashboard)
     # ✅ OpenAI native transcript callback (ONLY goes to dashboard)
     async def handle_openai_transcript(transcription_data: Dict[str, Any]):
         """
@@ -286,30 +272,6 @@ async def handle_media_stream(websocket: WebSocket):
         try:
             normalized_speaker = "AI" if speaker == "AI_whisper" else speaker
             order_extractor.add_transcript(normalized_speaker, text)
-        except Exception as e:
-            Log.error(f"[OrderExtraction] Error: {e}")
-    
-    # ✅ Whisper callback (ONLY for order extraction backup)
-    async def handle_whisper_for_orders(transcription_data: Dict[str, Any]):
-        """
-        Whisper transcription - ONLY for order extraction.
-        Does NOT go to dashboard (OpenAI native handles that).
-        """
-        speaker = transcription_data["speaker"]
-        text = transcription_data["text"]
-        
-        # Only extract orders, don't send to dashboard
-        try:
-            normalized_speaker = "AI" if speaker == "AI_whisper" else speaker
-            order_extractor.add_transcript(normalized_speaker, text)
-        except Exception as e:
-            Log.error(f"[OrderExtraction] Error: {e}")    
-        # Extract order information from ALL transcripts (including AI_whisper)
-        try:
-            order_extractor.add_transcript(
-                "AI" if speaker == "AI_whisper" else speaker,  # Normalize for extraction
-                transcription_data["text"]
-            )
         except Exception as e:
             Log.error(f"[OrderExtraction] Error: {e}")
     
@@ -453,6 +415,19 @@ async def handle_media_stream(websocket: WebSocket):
             # ✅ Capture call_sid when stream starts
             current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
             Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
+            
+            # ✅ FIX: Set order update callback HERE (after call_sid is available)
+            async def send_order_update(order_data: Dict[str, Any]):
+                """Send order updates to dashboard."""
+                payload = {
+                    "messageType": "orderUpdate",
+                    "orderData": order_data,
+                    "timestamp": int(time.time() * 1000),
+                    "callSid": current_call_sid,
+                }
+                broadcast_to_dashboards_nonblocking(payload, current_call_sid)
+            
+            order_extractor.set_update_callback(send_order_update)
 
         async def on_mark_cb():
             try:
