@@ -71,12 +71,12 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio"],  # Audio includes embedded transcripts
+                "output_modalities": ["audio"],  # ✅ Audio only (transcripts come from audio content) # ✅ Enable text output for transcripts
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
-                        "turn_detection": {"type": "server_vad"}
-                        # ✅ NO transcription here - OpenAI provides it automatically in response.done
+                        "turn_detection": {"type": "server_vad"},
+                        "transcription": {"model": "whisper-1"}  # ✅ Enable caller transcription
                     },
                     "output": {
                         "format": {"type": "audio/pcmu"}
@@ -216,6 +216,8 @@ class OpenAIService:
         self.session_manager = OpenAISessionManager()
         self.conversation_manager = OpenAIConversationManager()
         self.event_handler = OpenAIEventHandler()
+        self.whisper_service = TranscriptionService()
+        self.order_extractor = OrderExtractionService()
         self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
         self._pending_goodbye: bool = False
         self._goodbye_audio_heard: bool = False
@@ -414,20 +416,18 @@ class OpenAIService:
                 if transcript:
                     Log.info(f"[Caller OpenAI] 📝 {transcript}")
                     
-                    # ✅ Send to dashboard with safety check
-                    if self.transcript_callback and callable(self.transcript_callback):
+                    # Send to dashboard
+                    if self.transcript_callback:
                         await self.transcript_callback({
                             "speaker": "Caller",
                             "text": transcript,
                             "timestamp": int(time.time() * 1000)
                         })
-                    else:
-                        Log.warning("[Caller] transcript_callback not set or not callable")
                     
                     return
                     
         except Exception as e:
-            Log.error(f"[openai] Caller transcript error: {e}")
+            Log.debug(f"[openai] Caller transcript error: {e}")
     
     async def extract_and_emit_ai_transcript(self, event: Dict[str, Any]) -> None:
         """
@@ -462,20 +462,18 @@ class OpenAIService:
                             if transcript and isinstance(transcript, str) and transcript.strip():
                                 Log.info(f"[AI OpenAI] 📝 {transcript}")
                                 
-                                # ✅ Send to dashboard with safety check
-                                if self.transcript_callback and callable(self.transcript_callback):
+                                # Send to dashboard
+                                if self.transcript_callback:
                                     await self.transcript_callback({
                                         "speaker": "AI",
                                         "text": transcript.strip(),
                                         "timestamp": int(time.time() * 1000)
                                     })
-                                else:
-                                    Log.warning("[AI] transcript_callback not set or not callable")
                                 
                                 return
                                 
         except Exception as e:
-            Log.error(f"[openai] AI transcript error: {e}")
+            Log.debug(f"[openai] AI transcript error: {e}")
 
     # --- AUDIO EVENTS ---
     def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
