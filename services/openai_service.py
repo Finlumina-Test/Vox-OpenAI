@@ -316,4 +316,61 @@ async def handle_media_stream(websocket: WebSocket):
         async def on_start_cb(stream_sid: str):
             nonlocal current_call_sid
             current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
-            Log.event("Twilio Start", {"
+            Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
+
+        async def on_mark_cb():
+            try:
+                audio_service.handle_mark_event()
+            except Exception:
+                pass
+
+        await asyncio.gather(
+            connection_manager.receive_from_twilio(handle_media_event, on_start_cb, on_mark_cb),
+            openai_receiver(),
+            renew_openai_session(),
+        )
+
+    except Exception as e:
+        Log.error(f"Error in media stream handler: {e}")
+    finally:
+        # Log final order summary
+        try:
+            final_summary = order_extractor.get_order_summary()
+            Log.info(f"\n{final_summary}")
+            
+            # Send final order
+            final_order = order_extractor.get_current_order()
+            if any(final_order.values()):
+                broadcast_to_dashboards_nonblocking({
+                    "messageType": "orderComplete",
+                    "orderData": final_order,
+                    "summary": final_summary,
+                    "timestamp": int(time.time() * 1000),
+                    "callSid": current_call_sid,
+                }, current_call_sid)
+        except Exception:
+            pass
+        
+        try:
+            await order_extractor.shutdown()
+        except Exception:
+            pass
+        
+        try:
+            await connection_manager.close_openai_connection()
+        except Exception:
+            pass
+
+# ---------------------------
+# Proper entry point for Render + production
+# ---------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", getattr(Config, "PORT", 8000))),
+        log_level="info",
+        reload=False,
+    )
