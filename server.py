@@ -1,4 +1,4 @@
-# server.py (OpenAI Realtime for transcription; dashboard + order extraction)
+# server.py (multi-call capable with dual transcription system)
 import os
 import json
 import time
@@ -36,18 +36,32 @@ dashboard_clients: Set[DashboardClient] = set()
 
 
 # ---------------------------
-# Audio streaming to dashboard
+# Timed audio streaming with proper delays
 # ---------------------------
-async def stream_audio_to_dashboard(audio_data: Dict[str, Any], call_sid: str):
-    """Stream raw audio chunks to dashboard for playback."""
+async def handle_audio_stream(audio_data: Dict[str, Any], call_sid: str):
+    """Handle raw audio chunks with proper timing."""
     payload = {
         "messageType": "audio",
-        "speaker": audio_data.get("speaker"),
-        "audio": audio_data.get("audio"),  # Base64 encoded
-        "timestamp": int(time.time() * 1000),
+        "speaker": audio_data["speaker"],
+        "audio": audio_data["audio"],
+        "timestamp": int(time.time() * 1000),  # ✅ CHANGED: milliseconds
         "callSid": call_sid,
     }
+    
     await _do_broadcast(payload, call_sid)
+
+
+async def handle_transcription_update(transcription_data: Dict[str, Any], call_sid: str):
+    """Handle completed transcription phrases."""
+    payload = {
+        "messageType": "transcription",
+        "speaker": transcription_data["speaker"],
+        "text": transcription_data["text"],
+        "timestamp": transcription_data.get("timestamp") or int(time.time() * 1000),  # ✅ Use provided or current in ms
+        "callSid": call_sid,
+    }
+    
+    broadcast_to_dashboards_nonblocking(payload, call_sid)
 
 
 app = FastAPI()
@@ -108,50 +122,61 @@ async def dashboard_stream(websocket: WebSocket):
 
 
 # ---------------------------
-# Broadcasting functions
+# Broadcasting functions with call filtering
 # ---------------------------
 async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None):
-    """Broadcast to dashboard clients with call filtering."""
+    """
+    Broadcast to dashboard clients with call filtering.
+    ✅ ALWAYS use MILLISECONDS for timestamps
+    """
     try:
+        # ✅ Ensure timestamp is in milliseconds
         if "timestamp" not in payload or payload["timestamp"] is None:
-            payload["timestamp"] = int(time.time() * 1000)
+            payload["timestamp"] = int(time.time() * 1000)  # ✅ Milliseconds
         else:
+            # ✅ If timestamp exists, ensure it's in milliseconds
             ts = float(payload["timestamp"])
-            # If it looks like seconds, convert to ms
+            # Check if it's in seconds (< year 3000 in seconds = 32503680000)
             if ts < 32503680000:
-                payload["timestamp"] = int(ts * 1000)
+                payload["timestamp"] = int(ts * 1000)  # Convert to milliseconds
             else:
-                payload["timestamp"] = int(ts)
+                payload["timestamp"] = int(ts)  # Already in milliseconds
     except Exception:
-        payload["timestamp"] = int(time.time() * 1000)
+        payload["timestamp"] = int(time.time() * 1000)  # ✅ Milliseconds fallback
 
+    # Ensure call_sid is in payload
     if call_sid and "callSid" not in payload:
         payload["callSid"] = call_sid
 
     text = json.dumps(payload)
     to_remove = []
-
+    
     for client in list(dashboard_clients):
         try:
+            # Send if: client wants ALL calls OR client wants THIS specific call
             should_send = (
-                client.call_sid is None or
-                client.call_sid == call_sid
+                client.call_sid is None or  # Client wants all calls
+                client.call_sid == call_sid  # Client wants this call
             )
+            
             if should_send:
                 await client.websocket.send_text(text)
+                
         except Exception as e:
             Log.debug(f"Failed to send to client: {e}")
             to_remove.append(client)
-
+    
     for c in to_remove:
         dashboard_clients.discard(c)
 
 
 def broadcast_to_dashboards_nonblocking(payload: Dict[str, Any], call_sid: Optional[str] = None):
+    """Fire-and-forget broadcast with call filtering."""
     asyncio.create_task(_do_broadcast(payload, call_sid))
 
 
 def log_nonblocking(func, msg):
+    """Fire-and-forget logging (non-blocking)."""
     asyncio.create_task(_run_log(func, msg))
 
 
@@ -186,40 +211,46 @@ async def handle_media_stream(websocket: WebSocket):
     Log.header("Client connected")
     await websocket.accept()
 
+    # ✅ Each connection gets its own instances (isolated per call)
     connection_manager = WebSocketConnectionManager(websocket)
     openai_service = OpenAIService()
     audio_service = AudioService()
     order_extractor = OrderExtractionService()
-
-    # ✅ Prevent 'NoneType' object is not callable' errors
-    openai_service.transcript_callback = lambda x: None
-    openai_service.dashboard_callback = lambda x: None
-
+    
+    # Track call_sid for this connection
     current_call_sid: Optional[str] = None
-
+    
+    # ✅ Set callback for order updates WITH call_sid
     async def send_order_update(order_data: Dict[str, Any]):
         """Send order updates to dashboard."""
         payload = {
             "messageType": "orderUpdate",
             "orderData": order_data,
-            "timestamp": int(time.time() * 1000),
+            "timestamp": int(time.time() * 1000),  # ✅ Milliseconds
             "callSid": current_call_sid,
         }
         broadcast_to_dashboards_nonblocking(payload, current_call_sid)
-
+    
     order_extractor.set_update_callback(send_order_update)
-
+    
+    # ✅ OpenAI native transcript callback (ONLY goes to dashboard)
+    # ✅ OpenAI native transcript callback (ONLY goes to dashboard)
     async def handle_openai_transcript(transcription_data: Dict[str, Any]):
-        """Handle transcripts from OpenAI Realtime API (Caller + AI)."""
+        """
+        Handle OpenAI native transcripts (Caller + AI).
+        Goes to DASHBOARD only - clean, fast, no duplicates.
+        """
+        # ✅ FIX: Add null check
         if not transcription_data or not isinstance(transcription_data, dict):
             return
-
+        
         speaker = transcription_data.get("speaker")
         text = transcription_data.get("text")
-
+        
         if not speaker or not text:
             return
-
+        
+        # Send to dashboard
         payload = {
             "messageType": "transcription",
             "speaker": speaker,
@@ -228,135 +259,181 @@ async def handle_media_stream(websocket: WebSocket):
             "callSid": current_call_sid,
         }
         broadcast_to_dashboards_nonblocking(payload, current_call_sid)
-
+        
+        # Also extract for orders
         try:
             order_extractor.add_transcript(speaker, text)
-            Log.info(f"[OpenAI→Orders] {speaker}: {text[:50]}...")
         except Exception as e:
             Log.error(f"[OrderExtraction] Error: {e}")
-
-    # Assign OpenAI transcript callback safely (avoid NoneType callable)
-    if callable(getattr(openai_service, "transcript_callback", None)):
-        openai_service.transcript_callback = handle_openai_transcript
-    else:
-        # Always set it to ensure OpenAIService will call a valid function
-        openai_service.transcript_callback = handle_openai_transcript
+    
+    # ✅ Whisper callback (ONLY for order extraction backup)
+    async def handle_whisper_for_orders(transcription_data: Dict[str, Any]):
+        """
+        Whisper transcription - ONLY for order extraction.
+        Does NOT go to dashboard (OpenAI native handles that).
+        """
+        # ✅ FIX: Add null check
+        if not transcription_data or not isinstance(transcription_data, dict):
+            return
+        
+        speaker = transcription_data.get("speaker")
+        text = transcription_data.get("text")
+        
+        if not speaker or not text:
+            return
+        
+        # Only extract orders, don't send to dashboard
+        try:
+            normalized_speaker = "AI" if speaker == "AI_whisper" else speaker
+            order_extractor.add_transcript(normalized_speaker, text)
+        except Exception as e:
+            Log.error(f"[OrderExtraction] Error: {e}")
+    
+    # ✅ Whisper callback (ONLY for order extraction backup)
+    async def handle_whisper_for_orders(transcription_data: Dict[str, Any]):
+        """
+        Whisper transcription - ONLY for order extraction.
+        Does NOT go to dashboard (OpenAI native handles that).
+        """
+        speaker = transcription_data["speaker"]
+        text = transcription_data["text"]
+        
+        # Only extract orders, don't send to dashboard
+        try:
+            normalized_speaker = "AI" if speaker == "AI_whisper" else speaker
+            order_extractor.add_transcript(normalized_speaker, text)
+        except Exception as e:
+            Log.error(f"[OrderExtraction] Error: {e}")    
+        # Extract order information from ALL transcripts (including AI_whisper)
+        try:
+            order_extractor.add_transcript(
+                "AI" if speaker == "AI_whisper" else speaker,  # Normalize for extraction
+                transcription_data["text"]
+            )
+        except Exception as e:
+            Log.error(f"[OrderExtraction] Error: {e}")
+    
+    # ✅ Audio callback with call_sid
+    async def handle_audio_with_call_id(audio_data: Dict[str, Any]):
+        """Wrapper to add call_sid to audio streams."""
+        if current_call_sid:
+            await handle_audio_stream(audio_data, current_call_sid)
+    
+    # Set up callbacks for transcription system
+    openai_service.whisper_service.set_audio_callback(handle_audio_with_call_id)
+    openai_service.whisper_service.set_word_callback(handle_whisper_for_orders)  # ✅ Whisper for orders only
+    openai_service.transcript_callback = handle_openai_transcript  # ✅ OpenAI native for dashboard
 
     try:
-        await connection_manager.connect_to_openai()
-        await openai_service.initialize_session(connection_manager)
+        # Connect to OpenAI
+        try:
+            await connection_manager.connect_to_openai()
+        except Exception as e:
+            Log.error(f"OpenAI connection failed: {e}")
+            await connection_manager.close_openai_connection()
+            return
 
+        try:
+            await openai_service.initialize_session(connection_manager)
+        except Exception as e:
+            Log.error(f"OpenAI session initialization failed: {e}")
+            await connection_manager.close_openai_connection()
+            return
+
+        # Twilio -> Server handler
         async def handle_media_event(data: dict):
-            """Process incoming Twilio media events."""
             if data.get("event") == "media":
                 media = data.get("media") or {}
                 payload_b64 = media.get("payload")
-
                 if payload_b64:
-                    # Stream caller audio (base64) to dashboard for live playback
                     try:
-                        asyncio.create_task(stream_audio_to_dashboard({
-                            "speaker": "Caller",
-                            "audio": payload_b64
-                        }, current_call_sid))
+                        # Transcribe caller audio with Whisper
+                        asyncio.create_task(
+                            openai_service.whisper_service.transcribe_realtime(
+                                payload_b64, source="Caller"
+                            )
+                        )
                     except Exception as e:
-                        log_nonblocking(Log.error, f"[Caller audio→dashboard] failed: {e}")
+                        log_nonblocking(Log.error, f"[Caller processing] failed: {e}")
 
-                    # Send audio to OpenAI Realtime (converted by audio_service)
                     if connection_manager.is_openai_connected():
                         try:
                             audio_message = audio_service.process_incoming_audio(data)
                             if audio_message:
                                 await connection_manager.send_to_openai(audio_message)
                         except Exception as e:
-                            log_nonblocking(Log.error, f"[Caller→OpenAI] failed: {e}")
+                            log_nonblocking(Log.error, f"[media] failed to send incoming audio: {e}")
 
-            # Handle optional textual messages (some Twilio paths send text)
             if "text" in data and isinstance(data["text"], str) and data["text"].strip():
                 txt_obj = {
                     "messageType": "text",
                     "speaker": "Caller",
                     "text": data["text"].strip(),
-                    "timestamp": data.get("timestamp") or int(time.time() * 1000),
+                    "timestamp": data.get("timestamp") or int(time.time() * 1000),  # ✅ Milliseconds
                     "callSid": current_call_sid,
                 }
                 broadcast_to_dashboards_nonblocking(txt_obj, current_call_sid)
 
+        # OpenAI -> Twilio handler
         async def handle_audio_delta(response: dict):
-            """Handle AI audio from OpenAI Realtime API (response.audio.delta)."""
             try:
-                # Minimal guard: only process audio.delta events
-                if response.get("type") != "response.audio.delta":
-                    return
+                audio_data = openai_service.extract_audio_response_data(response) or {}
+                delta = audio_data.get("delta")
+                if delta:
+                    if isinstance(delta, (bytes, bytearray)):
+                        delta_bytes = bytes(delta)
+                    elif isinstance(delta, str):
+                        try:
+                            delta_bytes = base64.b64decode(delta)
+                        except Exception:
+                            delta_bytes = None
+                    else:
+                        delta_bytes = None
 
-                # delta might be base64 or raw depending on your OpenAI->connection_manager implementation
-                # Here we attempt to fetch a usable audio blob/string
-                delta = response.get("delta")
-                if not delta:
-                    # Try helper if available
-                    helper = getattr(openai_service, "extract_audio_response_data", None)
-                    if callable(helper):
-                        audio_data = helper(response) or {}
-                        delta = audio_data.get("delta")
-                if not delta:
-                    return
+                    if delta_bytes:
+                        # ✅ Transcribe AI audio with Whisper for order extraction accuracy
+                        # This catches network issues, audio glitches, pronunciation variations
+                        asyncio.create_task(
+                            openai_service.whisper_service.transcribe_realtime(
+                                delta_bytes, source="AI_whisper"  # Different tag to prevent dashboard display
+                            )
+                        )
 
-                # Send AI audio to Twilio (if stream_sid present)
-                stream_sid = getattr(connection_manager.state, "stream_sid", None)
-                if stream_sid:
-                    try:
-                        audio_message = audio_service.process_outgoing_audio(response, stream_sid)
-                        if audio_message:
-                            await connection_manager.send_to_twilio(audio_message)
-                            # send mark after audio chunk if needed
-                            mark_msg = audio_service.create_mark_message(stream_sid)
-                            await connection_manager.send_to_twilio(mark_msg)
-                    except Exception as e:
-                        log_nonblocking(Log.error, f"[AI→Twilio] failed: {e}")
-
-                # Send AI audio delta to dashboard for playback (non-blocking)
-                try:
-                    asyncio.create_task(stream_audio_to_dashboard({
-                        "speaker": "AI",
-                        "audio": delta
-                    }, current_call_sid))
-                except Exception as e:
-                    log_nonblocking(Log.error, f"[AI→Dashboard] failed: {e}")
+                    if getattr(connection_manager.state, "stream_sid", None):
+                        try:
+                            audio_message = audio_service.process_outgoing_audio(
+                                response, connection_manager.state.stream_sid
+                            )
+                            if audio_message:
+                                await connection_manager.send_to_twilio(audio_message)
+                                mark_msg = audio_service.create_mark_message(
+                                    connection_manager.state.stream_sid
+                                )
+                                await connection_manager.send_to_twilio(mark_msg)
+                        except Exception as e:
+                            log_nonblocking(Log.error, f"[audio->twilio] failed: {e}")
 
             except Exception as e:
                 log_nonblocking(Log.error, f"[audio-delta] failed: {e}")
 
+        async def handle_speech_started():
+            try:
+                await connection_manager.send_mark_to_twilio()
+            except Exception:
+                pass
+
         async def handle_other_openai_event(response: dict):
-            """Handle other OpenAI events (logging, transcripts, item tracking)."""
-            try:
-                openai_service.process_event_for_logging(response)
-            except Exception as e:
-                Log.debug(f"[OpenAI logging] error: {e}")
-
-            if hasattr(openai_service, "track_item_creation"):
-                try:
-                    openai_service.track_item_creation(response)
-                except Exception as e:
-                    Log.debug(f"[OpenAI tracking] error: {e}")
-
-            # Transcripts (OpenAI native) -> dashboard and orders
-            try:
-                # Call extraction functions safely (they are coroutines)
-                extractor1 = getattr(openai_service, "extract_and_emit_caller_transcript", None)
-                extractor2 = getattr(openai_service, "extract_and_emit_ai_transcript", None)
-                if callable(extractor1):
-                    await extractor1(response)
-                if callable(extractor2):
-                    await extractor2(response)
-            except Exception as e:
-                Log.debug(f"[OpenAI transcription] error: {e}")
+            openai_service.process_event_for_logging(response)
+            
+            # ✅ Extract transcripts from OpenAI native (goes to dashboard)
+            await openai_service.extract_and_emit_caller_transcript(response)
+            await openai_service.extract_and_emit_ai_transcript(response)
 
         async def openai_receiver():
-            # Pass None for speech-started handler if you don't have a handler
             await connection_manager.receive_from_openai(
                 handle_audio_delta,
-                None,
-                handle_other_openai_event
+                handle_speech_started,
+                handle_other_openai_event,
             )
 
         async def renew_openai_session():
@@ -373,7 +450,8 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def on_start_cb(stream_sid: str):
             nonlocal current_call_sid
-            current_call_sid = getattr(connection_manager.state, "call_sid", stream_sid)
+            # ✅ Capture call_sid when stream starts
+            current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
             Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
 
         async def on_mark_cb():
@@ -390,39 +468,46 @@ async def handle_media_stream(websocket: WebSocket):
 
     except Exception as e:
         Log.error(f"Error in media stream handler: {e}")
-
     finally:
+        # ✅ Log final order summary
         try:
             final_summary = order_extractor.get_order_summary()
             Log.info(f"\n{final_summary}")
+            
+            # Send final order
             final_order = order_extractor.get_current_order()
             if any(final_order.values()):
                 broadcast_to_dashboards_nonblocking({
                     "messageType": "orderComplete",
                     "orderData": final_order,
                     "summary": final_summary,
-                    "timestamp": int(time.time() * 1000),
+                    "timestamp": int(time.time() * 1000),  # ✅ Milliseconds
                     "callSid": current_call_sid,
                 }, current_call_sid)
         except Exception:
             pass
-
+        
         try:
             await order_extractor.shutdown()
         except Exception:
             pass
-
+        
+        try:
+            await openai_service.whisper_service.shutdown()
+        except Exception:
+            pass
+        
         try:
             await connection_manager.close_openai_connection()
         except Exception:
             pass
 
-
 # ---------------------------
-# Entry point
+# Proper entry point for Render + production
 # ---------------------------
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
