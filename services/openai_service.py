@@ -1,376 +1,428 @@
-# server.py (No Whisper - OpenAI Native Transcription Only)
-import os
 import json
-import time
-import base64
 import asyncio
-from typing import Set, Optional, Dict, Any
-
-from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import JSONResponse
-from fastapi.websockets import WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from services.order_extraction_service import OrderExtractionService
-
+import time
+from typing import Optional, Dict, Any
 from config import Config
-from services import (
-    WebSocketConnectionManager,
-    TwilioService,
-    OpenAIService,
-    AudioService,
-)
 from services.log_utils import Log
 
 
-# ---------------------------
-# Multi-call dashboard tracking
-# ---------------------------
-class DashboardClient:
-    """Track dashboard websocket with optional call filtering."""
-    def __init__(self, websocket: WebSocket, call_sid: Optional[str] = None):
-        self.websocket = websocket
-        self.call_sid = call_sid  # None = subscribe to ALL calls
-
-
-dashboard_clients: Set[DashboardClient] = set()
-
-
-# ---------------------------
-# Broadcasting functions with call filtering
-# ---------------------------
-async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None):
-    """Broadcast to dashboard clients with call filtering."""
-    try:
-        if "timestamp" not in payload or payload["timestamp"] is None:
-            payload["timestamp"] = int(time.time() * 1000)
-        else:
-            payload["timestamp"] = int(float(payload["timestamp"]))
-    except Exception:
-        payload["timestamp"] = int(time.time() * 1000)
-
-    if call_sid and "callSid" not in payload:
-        payload["callSid"] = call_sid
-
-    text = json.dumps(payload)
-    to_remove = []
+class OpenAIEventHandler:
+    """
+    Interprets and processes events received from the OpenAI Realtime API.
+    """
     
-    for client in list(dashboard_clients):
-        try:
-            should_send = (
-                client.call_sid is None or
-                client.call_sid == call_sid
-            )
-            
-            if should_send:
-                await client.websocket.send_text(text)
-                
-        except Exception as e:
-            Log.debug(f"Failed to send to client: {e}")
-            to_remove.append(client)
+    @staticmethod
+    def should_log_event(event_type: str) -> bool:
+        """Check if an event type should be logged."""
+        return event_type in Config.LOG_EVENT_TYPES
     
-    for c in to_remove:
-        dashboard_clients.discard(c)
-
-
-def broadcast_to_dashboards_nonblocking(payload: Dict[str, Any], call_sid: Optional[str] = None):
-    """Fire-and-forget broadcast with call filtering."""
-    asyncio.create_task(_do_broadcast(payload, call_sid))
-
-
-def log_nonblocking(func, msg):
-    """Fire-and-forget logging (non-blocking)."""
-    asyncio.create_task(_run_log(func, msg))
-
-
-async def _run_log(func, msg):
-    try:
-        func(msg)
-    except Exception:
-        pass
-
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ---------------------------
-# Dashboard websocket
-# ---------------------------
-@app.websocket("/dashboard-stream")
-async def dashboard_stream(websocket: WebSocket):
-    await websocket.accept()
-    DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN")
-    client_call_id: Optional[str] = None
-
-    if DASHBOARD_TOKEN:
-        provided = websocket.query_params.get("token") or websocket.headers.get("x-dashboard-token")
-        if provided != DASHBOARD_TOKEN:
-            await websocket.close(code=4003)
-            return
-
-    try:
-        msg = await asyncio.wait_for(websocket.receive_text(), timeout=5)
-        data = json.loads(msg)
-        client_call_id = data.get("callId")
-        Log.info(f"Dashboard client subscribed to call: {client_call_id or 'ALL'}")
-    except (asyncio.TimeoutError, json.JSONDecodeError, KeyError):
-        Log.info("Dashboard client subscribed to ALL calls")
-        client_call_id = None
-
-    client = DashboardClient(websocket, client_call_id)
-    dashboard_clients.add(client)
-    Log.info(f"Dashboard connected. Total clients: {len(dashboard_clients)}")
+    @staticmethod
+    def is_audio_delta_event(event: Dict[str, Any]) -> bool:
+        """Check if event is an audio delta from OpenAI."""
+        return (event.get('type') == 'response.output_audio.delta' and 
+                'delta' in event)
     
-    try:
-        while True:
-            try:
-                await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
-            except asyncio.TimeoutError:
-                try:
-                    await websocket.send_text(json.dumps({"type": "ping"}))
-                except Exception:
-                    break
-    except WebSocketDisconnect:
-        pass
-    finally:
-        dashboard_clients.discard(client)
-        Log.info(f"Dashboard disconnected. Total clients: {len(dashboard_clients)}")
-
-
-# ---------------------------
-# Simple health endpoint
-# ---------------------------
-@app.get("/", response_class=JSONResponse)
-async def index_page():
-    return {"message": "Twilio Media Stream Server is running!"}
-
-
-# ---------------------------
-# Twilio incoming-call TwiML
-# ---------------------------
-@app.api_route("/incoming-call", methods=["GET", "POST"])
-async def handle_incoming_call(request: Request):
-    return TwilioService.create_incoming_call_response(request)
-
-
-# ---------------------------
-# Media stream: Twilio <-> OpenAI <-> Dashboard
-# ---------------------------
-@app.websocket("/media-stream")
-async def handle_media_stream(websocket: WebSocket):
-    Log.header("Client connected")
-    await websocket.accept()
-
-    # Each connection gets its own instances (isolated per call)
-    connection_manager = WebSocketConnectionManager(websocket)
-    openai_service = OpenAIService()
-    audio_service = AudioService()
-    order_extractor = OrderExtractionService()
+    @staticmethod
+    def is_speech_started_event(event: Dict[str, Any]) -> bool:
+        """Check if event indicates user speech has started."""
+        return event.get('type') == 'input_audio_buffer.speech_started'
     
-    # Track call_sid for this connection
-    current_call_sid: Optional[str] = None
+    @staticmethod
+    def extract_audio_delta(event: Dict[str, Any]) -> Optional[str]:
+        """Extract audio delta from OpenAI event."""
+        if OpenAIEventHandler.is_audio_delta_event(event):
+            return event.get('delta')
+        return None
     
-    # Set callback for order updates WITH call_sid
-    async def send_order_update(order_data: Dict[str, Any]):
-        """Send order updates to dashboard."""
-        payload = {
-            "messageType": "orderUpdate",
-            "orderData": order_data,
-            "timestamp": int(time.time() * 1000),
-            "callSid": current_call_sid,
+    @staticmethod
+    def extract_item_id(event: Dict[str, Any]) -> Optional[str]:
+        """Extract item ID from OpenAI event."""
+        return event.get('item_id')
+
+
+class OpenAISessionManager:
+    """
+    Configures and initializes OpenAI Realtime API sessions.
+    """
+    
+    @staticmethod
+    def create_session_update() -> Dict[str, Any]:
+        """Create a session update message for OpenAI Realtime API."""
+        session = {
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "model": "gpt-realtime-mini-2025-10-06",
+                "output_modalities": ["audio"], 
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcmu"},
+                        "turn_detection": {"type": "server_vad"}
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcmu"}
+                    }
+                },
+                "instructions": Config.SYSTEM_MESSAGE,
+                # ✅ Enable input audio transcription
+                "input_audio_transcription": {
+                    "model": "whisper-1"
+                },
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "end_call",
+                        "description": "Politely end the phone call when the caller says goodbye or requests to end the conversation.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "reason": {"type": "string", "description": "Brief reason for ending, e.g., user said bye."}
+                            },
+                            "required": []
+                        }
+                    }
+                ]
+            }
         }
-        broadcast_to_dashboards_nonblocking(payload, current_call_sid)
+        return session
     
-    order_extractor.set_update_callback(send_order_update)
-    
-    # ✅ Unified transcription callback (OpenAI native only)
-    async def handle_transcription_with_extraction(transcription_data: Dict[str, Any]):
-        """
-        Handle transcription from OpenAI Realtime API.
-        Both Caller and AI transcripts come from OpenAI.
-        """
-        speaker = transcription_data["speaker"]
-        
-        # Send to dashboard
-        payload = {
-            "messageType": "transcription",
-            "speaker": speaker,
-            "text": transcription_data["text"],
-            "timestamp": transcription_data.get("timestamp") or int(time.time() * 1000),
-            "callSid": current_call_sid,
+    @staticmethod
+    def create_initial_conversation_item() -> Dict[str, Any]:
+        """Create an initial conversation item for AI-first interactions."""
+        return {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Greet the user with 'Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?'"
+                    }
+                ]
+            }
         }
-        broadcast_to_dashboards_nonblocking(payload, current_call_sid)
-        
-        # Extract order information
-        try:
-            order_extractor.add_transcript(
-                speaker,
-                transcription_data["text"]
-            )
-        except Exception as e:
-            Log.error(f"[OrderExtraction] Error: {e}")
     
-    # Set up callbacks for OpenAI native transcription
-    openai_service.caller_transcript_callback = handle_transcription_with_extraction  # Caller from OpenAI
-    openai_service.ai_transcript_callback = handle_transcription_with_extraction      # AI from OpenAI
+    @staticmethod
+    def create_response_trigger() -> Dict[str, Any]:
+        """Create a response trigger message."""
+        return {"type": "response.create"}
 
-    try:
-        # Connect to OpenAI
-        try:
-            await connection_manager.connect_to_openai()
-        except Exception as e:
-            Log.error(f"OpenAI connection failed: {e}")
-            await connection_manager.close_openai_connection()
-            return
 
-        try:
-            await openai_service.initialize_session(connection_manager)
-        except Exception as e:
-            Log.error(f"OpenAI session initialization failed: {e}")
-            await connection_manager.close_openai_connection()
-            return
+class OpenAIConversationManager:
+    """
+    Manages conversation flow and interruption logic for OpenAI sessions.
+    """
+    
+    @staticmethod
+    def create_truncate_event(item_id: str, audio_end_ms: int) -> Dict[str, Any]:
+        """Create a conversation item truncation event."""
+        return {
+            "type": "conversation.item.truncate",
+            "item_id": item_id,
+            "content_index": 0,
+            "audio_end_ms": audio_end_ms
+        }
+    
+    @staticmethod
+    def should_handle_interruption(
+        last_assistant_item: Optional[str],
+        mark_queue: list,
+        response_start_timestamp: Optional[int]
+    ) -> bool:
+        """Determine if an interruption should be processed."""
+        return (last_assistant_item is not None and 
+                len(mark_queue) > 0 and 
+                response_start_timestamp is not None)
+    
+    @staticmethod
+    def calculate_truncation_time(
+        current_timestamp: int,
+        response_start_timestamp: int
+    ) -> int:
+        """Calculate the elapsed time for audio truncation."""
+        return current_timestamp - response_start_timestamp
 
-        # Twilio -> Server handler
-        async def handle_media_event(data: dict):
-            if data.get("event") == "media":
-                if connection_manager.is_openai_connected():
-                    try:
-                        audio_message = audio_service.process_incoming_audio(data)
-                        if audio_message:
-                            await connection_manager.send_to_openai(audio_message)
-                    except Exception as e:
-                        log_nonblocking(Log.error, f"[media] failed to send incoming audio: {e}")
 
-            if "text" in data and isinstance(data["text"], str) and data["text"].strip():
-                txt_obj = {
-                    "messageType": "text",
-                    "speaker": "Caller",
-                    "text": data["text"].strip(),
-                    "timestamp": data.get("timestamp") or int(time.time() * 1000),
-                    "callSid": current_call_sid,
-                }
-                broadcast_to_dashboards_nonblocking(txt_obj, current_call_sid)
+class OpenAIService:
+    """
+    Unified service for OpenAI Realtime API.
+    Uses OpenAI's native transcription for BOTH caller and AI.
+    No external Whisper calls needed!
+    """
 
-        # OpenAI -> Twilio handler
-        async def handle_audio_delta(response: dict):
+    def __init__(self):
+        self.session_manager = OpenAISessionManager()
+        self.conversation_manager = OpenAIConversationManager()
+        self.event_handler = OpenAIEventHandler()
+        self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
+        self._pending_goodbye: bool = False
+        self._goodbye_audio_heard: bool = False
+        self._goodbye_item_id: Optional[str] = None
+        self._goodbye_watchdog: Optional[asyncio.Task] = None
+        
+        # Callbacks for transcripts
+        self.caller_transcript_callback: Optional[callable] = None
+        self.ai_transcript_callback: Optional[callable] = None
+
+    # --- SESSION & GREETING ---
+    async def initialize_session(self, connection_manager) -> None:
+        session_update = self.session_manager.create_session_update()
+        Log.json('Sending session update', session_update)
+        await connection_manager.send_to_openai(session_update)
+
+    async def send_initial_greeting(self, connection_manager) -> None:
+        initial_item = self.session_manager.create_initial_conversation_item()
+        response_trigger = self.session_manager.create_response_trigger()
+        await connection_manager.send_to_openai(initial_item)
+        await connection_manager.send_to_openai(response_trigger)
+
+    # --- EVENT LOGGING & TOOL CALLS ---
+    def process_event_for_logging(self, event: Dict[str, Any]) -> None:
+        if self.event_handler.should_log_event(event.get('type', '')):
+            Log.event(f"Received event: {event['type']}", event)
+
+    def is_tool_call(self, event: Dict[str, Any]) -> bool:
+        etype = event.get('type')
+        if etype in ('response.function_call.arguments.delta', 'response.function_call.completed'):
+            return True
+        if etype == 'response.done':
+            resp = event.get('response') or {}
+            output = resp.get('output') or []
+            for item in output:
+                if isinstance(item, dict) and item.get('type') == 'function_call':
+                    return True
+        return False
+
+    def accumulate_tool_call(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        etype = event.get('type')
+        if etype == 'response.function_call.arguments.delta':
+            call_id = event.get('call_id') or event.get('id') or 'default'
+            delta = event.get('delta', '')
+            buf = self._pending_tool_calls.setdefault(call_id, {"args": "", "name": event.get('name')})
+            buf["args"] += delta
+            return None
+        if etype == 'response.function_call.completed':
+            call_id = event.get('call_id') or event.get('id') or 'default'
+            payload = self._pending_tool_calls.pop(call_id, None)
+            if payload is None:
+                return None
             try:
-                audio_data = openai_service.extract_audio_response_data(response) or {}
-                delta = audio_data.get("delta")
-                
-                if delta and getattr(connection_manager.state, "stream_sid", None):
+                args = json.loads(payload["args"]) if payload["args"] else {}
+            except Exception:
+                args = {"_raw": payload["args"]}
+            return {"name": payload.get('name') or event.get('name'), "arguments": args}
+        if etype == 'response.done':
+            resp = event.get('response') or {}
+            output = resp.get('output') or []
+            for item in output:
+                if isinstance(item, dict) and item.get('type') == 'function_call':
+                    name = item.get('name')
+                    raw_args = item.get('arguments')
                     try:
-                        audio_message = audio_service.process_outgoing_audio(
-                            response, connection_manager.state.stream_sid
-                        )
-                        if audio_message:
-                            await connection_manager.send_to_twilio(audio_message)
-                            mark_msg = audio_service.create_mark_message(
-                                connection_manager.state.stream_sid
-                            )
-                            await connection_manager.send_to_twilio(mark_msg)
-                    except Exception as e:
-                        log_nonblocking(Log.error, f"[audio->twilio] failed: {e}")
+                        args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                    except Exception:
+                        args = {"_raw": raw_args}
+                    return {"name": name, "arguments": args}
+        return None
 
+    async def maybe_handle_tool_call(self, connection_manager, tool_call: Dict[str, Any]) -> bool:
+        if not tool_call:
+            return False
+        name = tool_call.get('name')
+        if name != 'end_call':
+            return False
+
+        args = tool_call.get('arguments') or {}
+        reason = args.get('reason') if isinstance(args, dict) else None
+        farewell = Config.build_end_call_farewell(reason)
+
+        if self._pending_goodbye:
+            Log.info("End-call already pending; ignoring duplicate request")
+            return False
+
+        Log.info("Queueing farewell response before hangup")
+        await self._send_goodbye_response(connection_manager, farewell)
+        self._pending_goodbye = True
+        self._goodbye_audio_heard = False
+        self._goodbye_item_id = None
+        self._start_goodbye_watchdog(connection_manager)
+        return True
+
+    async def _send_goodbye_response(self, connection_manager, text: str) -> None:
+        try:
+            await connection_manager.send_to_openai({
+                "type": "response.create",
+                "response": {"instructions": text}
+            })
+        except Exception as e:
+            Log.error(f"Failed to queue goodbye response: {e}")
+            self._pending_goodbye = True
+            self._goodbye_audio_heard = False
+
+    # --- GOODBYE HANDLING ---
+    def should_finalize_on_event(self, event: Dict[str, Any]) -> bool:
+        if not (self._pending_goodbye and self._goodbye_audio_heard):
+            return False
+        etype = event.get('type')
+        if etype == 'response.output_audio.done':
+            return True
+        if etype == 'response.done':
+            if not self._goodbye_item_id:
+                resp = event.get('response') or {}
+                for item in (resp.get('output') or []):
+                    if isinstance(item, dict) and item.get('type') == 'message' and item.get('role') == 'assistant':
+                        for c in (item.get('content') or []):
+                            if isinstance(c, dict) and c.get('type') == 'output_audio':
+                                return True
+                return False
+            resp = event.get('response') or {}
+            for item in (resp.get('output') or []):
+                if isinstance(item, dict) and item.get('id') == self._goodbye_item_id:
+                    return True
+        return False
+
+    async def finalize_goodbye(self, connection_manager) -> None:
+        self._pending_goodbye = False
+        self._goodbye_audio_heard = False
+        self._goodbye_item_id = None
+        self._cancel_goodbye_watchdog()
+        try:
+            await asyncio.sleep(getattr(Config, 'END_CALL_GRACE_SECONDS', 0.5))
+        except Exception:
+            pass
+        if Config.has_twilio_credentials():
+            try:
+                from twilio.rest import Client
+                client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
+                call_sid = getattr(connection_manager.state, 'call_sid', None)
+                if call_sid:
+                    Log.event("Completing call via Twilio REST", {"callSid": call_sid})
+                    client.calls(call_sid).update(status='completed')
             except Exception as e:
-                log_nonblocking(Log.error, f"[audio-delta] failed: {e}")
+                Log.error(f"Optional Twilio REST hangup failed: {e}")
+        try:
+            await connection_manager.close_twilio_connection(reason="assistant completed")
+        except Exception:
+            pass
 
-        async def handle_speech_started():
-            try:
-                await connection_manager.send_mark_to_twilio()
-            except Exception:
-                pass
+    def is_goodbye_pending(self) -> bool:
+        return self._pending_goodbye
 
-        async def handle_other_openai_event(response: dict):
-            openai_service.process_event_for_logging(response)
-            
-            # ✅ Extract transcripts from OpenAI native events
-            await openai_service.extract_caller_transcript(response)  # Caller transcript
-            await openai_service.extract_ai_transcript(response)       # AI transcript
+    def mark_goodbye_audio_heard(self, item_id: Optional[str]) -> None:
+        if self._pending_goodbye:
+            self._goodbye_audio_heard = True
+            if item_id and not self._goodbye_item_id:
+                self._goodbye_item_id = item_id
+            self._cancel_goodbye_watchdog()
 
-        async def openai_receiver():
-            await connection_manager.receive_from_openai(
-                handle_audio_delta,
-                handle_speech_started,
-                handle_other_openai_event,
-            )
-
-        async def renew_openai_session():
-            while True:
-                await asyncio.sleep(getattr(Config, "REALTIME_SESSION_RENEW_SECONDS", 1200))
+    def _start_goodbye_watchdog(self, connection_manager) -> None:
+        self._cancel_goodbye_watchdog()
+        try:
+            timeout = getattr(Config, 'END_CALL_WATCHDOG_SECONDS', 4)
+            async def _watch():
                 try:
-                    Log.info("Renewing OpenAI session…")
-                    await connection_manager.close_openai_connection()
-                    await connection_manager.connect_to_openai()
-                    await openai_service.initialize_session(connection_manager)
-                    Log.info("Session renewed successfully.")
-                except Exception as e:
-                    Log.error(f"Session renewal failed: {e}")
+                    await asyncio.sleep(timeout)
+                    if self._pending_goodbye and not self._goodbye_audio_heard:
+                        Log.info("Goodbye audio not detected in time; finalizing call")
+                        await self.finalize_goodbye(connection_manager)
+                except Exception:
+                    pass
+            self._goodbye_watchdog = asyncio.create_task(_watch())
+        except Exception:
+            self._goodbye_watchdog = None
 
-        async def on_start_cb(stream_sid: str):
-            nonlocal current_call_sid
-            current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
-            Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
+    def _cancel_goodbye_watchdog(self) -> None:
+        if self._goodbye_watchdog and not self._goodbye_watchdog.done():
+            self._goodbye_watchdog.cancel()
+        self._goodbye_watchdog = None
 
-        async def on_mark_cb():
-            try:
-                audio_service.handle_mark_event()
-            except Exception:
-                pass
-
-        await asyncio.gather(
-            connection_manager.receive_from_twilio(handle_media_event, on_start_cb, on_mark_cb),
-            openai_receiver(),
-            renew_openai_session(),
-        )
-
-    except Exception as e:
-        Log.error(f"Error in media stream handler: {e}")
-    finally:
-        # Log final order summary
+    # --- TRANSCRIPT EXTRACTION (OpenAI Native for BOTH) ---
+    async def extract_caller_transcript(self, event: Dict[str, Any]) -> None:
+        """
+        Extract CALLER transcript from OpenAI's native transcription.
+        Event: conversation.item.input_audio_transcription.completed
+        """
         try:
-            final_summary = order_extractor.get_order_summary()
-            Log.info(f"\n{final_summary}")
+            etype = event.get("type", "")
             
-            # Send final order
-            final_order = order_extractor.get_current_order()
-            if any(final_order.values()):
-                broadcast_to_dashboards_nonblocking({
-                    "messageType": "orderComplete",
-                    "orderData": final_order,
-                    "summary": final_summary,
-                    "timestamp": int(time.time() * 1000),
-                    "callSid": current_call_sid,
-                }, current_call_sid)
-        except Exception:
-            pass
-        
-        try:
-            await order_extractor.shutdown()
-        except Exception:
-            pass
-        
-        try:
-            await connection_manager.close_openai_connection()
-        except Exception:
-            pass
+            # ✅ NEW: Handle caller transcription from OpenAI
+            if etype == "conversation.item.input_audio_transcription.completed":
+                transcript = event.get("transcript")
+                
+                if transcript and isinstance(transcript, str) and transcript.strip():
+                    Log.info(f"[Caller] 📝 {transcript}")
+                    
+                    if self.caller_transcript_callback:
+                        await self.caller_transcript_callback({
+                            "speaker": "Caller",
+                            "text": transcript.strip(),
+                            "timestamp": int(time.time() * 1000)
+                        })
+                    return
+                    
+        except Exception as e:
+            Log.debug(f"[openai] Caller transcript extract error: {e}")
 
-# ---------------------------
-# Proper entry point for Render + production
-# ---------------------------
-if __name__ == "__main__":
-    import uvicorn
+    async def extract_ai_transcript(self, event: Dict[str, Any]) -> None:
+        """
+        Extract AI transcript from OpenAI's native response.done event.
+        """
+        try:
+            etype = event.get("type", "")
+            
+            if etype != "response.done":
+                return
+            
+            resp = event.get("response") or {}
+            output = resp.get("output") or []
+            
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                    
+                if item.get("type") == "message" and item.get("role") == "assistant":
+                    content = item.get("content") or []
+                    
+                    for c in content:
+                        if not isinstance(c, dict):
+                            continue
+                            
+                        if c.get("type") == "output_audio":
+                            transcript = c.get("transcript")
+                            
+                            if transcript and isinstance(transcript, str) and transcript.strip():
+                                Log.info(f"[AI] 📝 {transcript}")
+                                
+                                if self.ai_transcript_callback:
+                                    await self.ai_transcript_callback({
+                                        "speaker": "AI",
+                                        "text": transcript.strip(),
+                                        "timestamp": int(time.time() * 1000)
+                                    })
+                                
+                                return
+                                
+        except Exception as e:
+            Log.debug(f"[openai] AI transcript extract error: {e}")
 
-    uvicorn.run(
-        "server:app",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", getattr(Config, "PORT", 8000))),
-        log_level="info",
-        reload=False,
-    )
+    # --- AUDIO EVENTS ---
+    def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.event_handler.is_audio_delta_event(event):
+            return None
+        return {'delta': self.event_handler.extract_audio_delta(event),
+                'item_id': self.event_handler.extract_item_id(event)}
+
+    def is_speech_started(self, event: Dict[str, Any]) -> bool:
+        return self.event_handler.is_speech_started_event(event)
+
+    # --- INTERRUPTION HANDLING ---
+    async def handle_interruption(self, connection_manager, current_timestamp: int, response_start_timestamp: int, last_assistant_item: str) -> None:
+        elapsed_time = self.conversation_manager.calculate_truncation_time(current_timestamp, response_start_timestamp)
+        if Config.SHOW_TIMING_MATH:
+            print(f"Truncating item {last_assistant_item} at {elapsed_time}ms")
+        truncate_event = self.conversation_manager.create_truncate_event(last_assistant_item, elapsed_time)
+        await connection_manager.send_to_openai(truncate_event)
+
+    def should_process_interruption(self, last_assistant_item: Optional[str], mark_queue: list, response_start_timestamp: Optional[int]) -> bool:
+        return self.conversation_manager.should_handle_interruption(last_assistant_item, mark_queue, response_start_timestamp)
