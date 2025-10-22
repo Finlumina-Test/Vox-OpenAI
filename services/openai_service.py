@@ -4,19 +4,11 @@ import time
 from typing import Optional, Dict, Any
 from config import Config
 from services.log_utils import Log
-from services.transcription_service import TranscriptionService
-from services.order_extraction_service import OrderExtractionService
-
 
 
 class OpenAIEventHandler:
     """
     Interprets and processes events received from the OpenAI Realtime API.
-    
-    - Determines which events should be logged.
-    - Identifies and extracts audio deltas, speech start events, and item IDs from event payloads.
-    
-    Used by higher-level services to make sense of incoming OpenAI events and route them appropriately.
     """
     
     @staticmethod
@@ -27,7 +19,7 @@ class OpenAIEventHandler:
     @staticmethod
     def is_audio_delta_event(event: Dict[str, Any]) -> bool:
         """Check if event is an audio delta from OpenAI."""
-        return (event.get('type') == 'response.audio.delta' and 
+        return (event.get('type') == 'response.output_audio.delta' and 
                 'delta' in event)
     
     @staticmethod
@@ -51,38 +43,31 @@ class OpenAIEventHandler:
 class OpenAISessionManager:
     """
     Configures and initializes OpenAI Realtime API sessions.
-    
-    - Generates session update messages specifying model, audio formats, and system instructions.
-    - Creates the initial conversation item (for AI-first greetings) and triggers responses.
-    
-    Ensures consistent and correct session setup for all OpenAI interactions.
     """
     
     @staticmethod
     def create_session_update() -> Dict[str, Any]:
-        """
-        Create a session update message for OpenAI Realtime API.
-        
-        Returns:
-            Dictionary containing session configuration
-        """
+        """Create a session update message for OpenAI Realtime API."""
         session = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio"],  # ✅ Audio only (transcripts come from audio content) # ✅ Enable text output for transcripts
+                "output_modalities": ["audio"], 
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
-                        "turn_detection": {"type": "server_vad"},
-                        "transcription": {"model": "whisper-1"}  # ✅ Enable caller transcription
+                        "turn_detection": {"type": "server_vad"}
                     },
                     "output": {
                         "format": {"type": "audio/pcmu"}
                     }
                 },
                 "instructions": Config.SYSTEM_MESSAGE,
+                # ✅ Enable input audio transcription
+                "input_audio_transcription": {
+                    "model": "whisper-1"
+                },
                 "tools": [
                     {
                         "type": "function",
@@ -103,12 +88,7 @@ class OpenAISessionManager:
     
     @staticmethod
     def create_initial_conversation_item() -> Dict[str, Any]:
-        """
-        Create an initial conversation item for AI-first interactions.
-        
-        Returns:
-            Dictionary containing initial conversation setup
-        """
+        """Create an initial conversation item for AI-first interactions."""
         return {
             "type": "conversation.item.create",
             "item": {
@@ -125,38 +105,18 @@ class OpenAISessionManager:
     
     @staticmethod
     def create_response_trigger() -> Dict[str, Any]:
-        """
-        Create a response trigger message.
-        
-        Returns:
-            Dictionary to trigger OpenAI response generation
-        """
+        """Create a response trigger message."""
         return {"type": "response.create"}
 
 
 class OpenAIConversationManager:
     """
     Manages conversation flow and interruption logic for OpenAI sessions.
-    
-    - Creates truncation events to interrupt/cut off ongoing AI responses.
-    - Determines when interruptions should be processed based on marks and timing.
-    - Calculates elapsed time for precise truncation.
-    
-    Used by the main service to support real-time, interactive voice experiences.
     """
     
     @staticmethod
     def create_truncate_event(item_id: str, audio_end_ms: int) -> Dict[str, Any]:
-        """
-        Create a conversation item truncation event.
-        
-        Args:
-            item_id: ID of the item to truncate
-            audio_end_ms: Timestamp where to truncate the audio
-            
-        Returns:
-            Dictionary containing truncation command
-        """
+        """Create a conversation item truncation event."""
         return {
             "type": "conversation.item.truncate",
             "item_id": item_id,
@@ -170,17 +130,7 @@ class OpenAIConversationManager:
         mark_queue: list,
         response_start_timestamp: Optional[int]
     ) -> bool:
-        """
-        Determine if an interruption should be processed.
-        
-        Args:
-            last_assistant_item: ID of the last assistant response
-            mark_queue: Queue of pending marks
-            response_start_timestamp: When the current response started
-            
-        Returns:
-            True if interruption should be handled
-        """
+        """Determine if an interruption should be processed."""
         return (last_assistant_item is not None and 
                 len(mark_queue) > 0 and 
                 response_start_timestamp is not None)
@@ -190,42 +140,30 @@ class OpenAIConversationManager:
         current_timestamp: int,
         response_start_timestamp: int
     ) -> int:
-        """
-        Calculate the elapsed time for audio truncation.
-        
-        Args:
-            current_timestamp: Current media timestamp
-            response_start_timestamp: When the response started
-            
-        Returns:
-            Elapsed time in milliseconds
-        """
+        """Calculate the elapsed time for audio truncation."""
         return current_timestamp - response_start_timestamp
 
 
 class OpenAIService:
     """
-    Unified service for OpenAI Realtime API with native transcription:
-    - Manages sessions, greetings, event logging
-    - Extracts BOTH caller & AI transcripts from OpenAI (no Whisper for dashboard)
-    - Handles tool calls, interruptions, and goodbyes
-    - Whisper ONLY used for order extraction (accuracy backup)
+    Unified service for OpenAI Realtime API.
+    Uses OpenAI's native transcription for BOTH caller and AI.
+    No external Whisper calls needed!
     """
 
     def __init__(self):
         self.session_manager = OpenAISessionManager()
         self.conversation_manager = OpenAIConversationManager()
         self.event_handler = OpenAIEventHandler()
-        self.whisper_service = TranscriptionService()
-        self.order_extractor = OrderExtractionService()
         self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
         self._pending_goodbye: bool = False
         self._goodbye_audio_heard: bool = False
         self._goodbye_item_id: Optional[str] = None
         self._goodbye_watchdog: Optional[asyncio.Task] = None
         
-        # ✅ Single callback for ALL transcripts (caller + AI) - goes to dashboard
-        self.transcript_callback: Optional[callable] = None
+        # Callbacks for transcripts
+        self.caller_transcript_callback: Optional[callable] = None
+        self.ai_transcript_callback: Optional[callable] = None
 
     # --- SESSION & GREETING ---
     async def initialize_session(self, connection_manager) -> None:
@@ -327,7 +265,7 @@ class OpenAIService:
         if not (self._pending_goodbye and self._goodbye_audio_heard):
             return False
         etype = event.get('type')
-        if etype == 'response.audio.done':
+        if etype == 'response.output_audio.done':
             return True
         if etype == 'response.done':
             if not self._goodbye_item_id:
@@ -335,7 +273,7 @@ class OpenAIService:
                 for item in (resp.get('output') or []):
                     if isinstance(item, dict) and item.get('type') == 'message' and item.get('role') == 'assistant':
                         for c in (item.get('content') or []):
-                            if isinstance(c, dict) and c.get('type') == 'audio':
+                            if isinstance(c, dict) and c.get('type') == 'output_audio':
                                 return True
                 return False
             resp = event.get('response') or {}
@@ -399,41 +337,36 @@ class OpenAIService:
             self._goodbye_watchdog.cancel()
         self._goodbye_watchdog = None
 
-    # --- TRANSCRIPT EXTRACTION (OpenAI Native ONLY for Dashboard) ---
-    
-    async def extract_and_emit_caller_transcript(self, event: Dict[str, Any]) -> None:
+    # --- TRANSCRIPT EXTRACTION (OpenAI Native for BOTH) ---
+    async def extract_caller_transcript(self, event: Dict[str, Any]) -> None:
         """
-        ✅ Extract CALLER transcript from OpenAI native transcription.
+        Extract CALLER transcript from OpenAI's native transcription.
         Event: conversation.item.input_audio_transcription.completed
-        This goes to DASHBOARD only (fast, clean).
         """
         try:
             etype = event.get("type", "")
             
+            # ✅ NEW: Handle caller transcription from OpenAI
             if etype == "conversation.item.input_audio_transcription.completed":
-                transcript = event.get("transcript", "").strip()
+                transcript = event.get("transcript")
                 
-                if transcript:
-                    Log.info(f"[Caller OpenAI] 📝 {transcript}")
+                if transcript and isinstance(transcript, str) and transcript.strip():
+                    Log.info(f"[Caller] 📝 {transcript}")
                     
-                    # Send to dashboard
-                    if self.transcript_callback:
-                        await self.transcript_callback({
+                    if self.caller_transcript_callback:
+                        await self.caller_transcript_callback({
                             "speaker": "Caller",
-                            "text": transcript,
+                            "text": transcript.strip(),
                             "timestamp": int(time.time() * 1000)
                         })
-                    
                     return
                     
         except Exception as e:
-            Log.debug(f"[openai] Caller transcript error: {e}")
-    
-    async def extract_and_emit_ai_transcript(self, event: Dict[str, Any]) -> None:
+            Log.debug(f"[openai] Caller transcript extract error: {e}")
+
+    async def extract_ai_transcript(self, event: Dict[str, Any]) -> None:
         """
-        ✅ Extract AI transcript from OpenAI native response.
-        Event: response.done
-        This goes to DASHBOARD only (fast, clean).
+        Extract AI transcript from OpenAI's native response.done event.
         """
         try:
             etype = event.get("type", "")
@@ -455,16 +388,14 @@ class OpenAIService:
                         if not isinstance(c, dict):
                             continue
                             
-                        # Extract transcript from audio content
-                        if c.get("type") == "audio":
+                        if c.get("type") == "output_audio":
                             transcript = c.get("transcript")
                             
                             if transcript and isinstance(transcript, str) and transcript.strip():
-                                Log.info(f"[AI OpenAI] 📝 {transcript}")
+                                Log.info(f"[AI] 📝 {transcript}")
                                 
-                                # Send to dashboard
-                                if self.transcript_callback:
-                                    await self.transcript_callback({
+                                if self.ai_transcript_callback:
+                                    await self.ai_transcript_callback({
                                         "speaker": "AI",
                                         "text": transcript.strip(),
                                         "timestamp": int(time.time() * 1000)
@@ -473,7 +404,7 @@ class OpenAIService:
                                 return
                                 
         except Exception as e:
-            Log.debug(f"[openai] AI transcript error: {e}")
+            Log.debug(f"[openai] AI transcript extract error: {e}")
 
     # --- AUDIO EVENTS ---
     def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
