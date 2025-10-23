@@ -1,4 +1,4 @@
-# server.py (Complete - Audio + OpenAI Native Transcription)
+# server.py (Multi-call with OpenAI native transcription + audio streaming)
 import os
 import json
 import time
@@ -19,6 +19,7 @@ from services import (
     OpenAIService,
     AudioService,
 )
+from services.transcription_service import TranscriptionService
 from services.log_utils import Log
 
 
@@ -29,7 +30,7 @@ class DashboardClient:
     """Track dashboard websocket with optional call filtering."""
     def __init__(self, websocket: WebSocket, call_sid: Optional[str] = None):
         self.websocket = websocket
-        self.call_sid = call_sid
+        self.call_sid = call_sid  # None = subscribe to ALL calls
 
 
 dashboard_clients: Set[DashboardClient] = set()
@@ -76,17 +77,6 @@ async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None)
 
 def broadcast_to_dashboards_nonblocking(payload: Dict[str, Any], call_sid: Optional[str] = None):
     asyncio.create_task(_do_broadcast(payload, call_sid))
-
-
-def log_nonblocking(func, msg):
-    asyncio.create_task(_run_log(func, msg))
-
-
-async def _run_log(func, msg):
-    try:
-        func(msg)
-    except Exception:
-        pass
 
 
 app = FastAPI()
@@ -172,11 +162,29 @@ async def handle_media_stream(websocket: WebSocket):
     openai_service = OpenAIService()
     audio_service = AudioService()
     order_extractor = OrderExtractionService()
+    transcription_service = TranscriptionService()
     
     current_call_sid: Optional[str] = None
 
-    # ✅ Callback for OpenAI native transcription
+    # ✅ Audio streaming callback (sends to dashboard)
+    async def handle_audio_stream(audio_data: Dict[str, Any]):
+        """Send audio chunks to dashboard with proper timing."""
+        if current_call_sid:
+            payload = {
+                "messageType": "audio",
+                "speaker": audio_data["speaker"],
+                "audio": audio_data["audio"],
+                "timestamp": audio_data.get("timestamp", int(time.time() * 1000)),
+                "callSid": current_call_sid,
+            }
+            await _do_broadcast(payload, current_call_sid)
+
+    # Set audio callback for dashboard streaming
+    transcription_service.set_audio_callback(handle_audio_stream)
+
+    # ✅ OpenAI native transcript callback
     async def handle_openai_transcript(transcription_data: Dict[str, Any]):
+        """Handle transcripts from OpenAI's native transcription."""
         if not transcription_data or not isinstance(transcription_data, dict):
             return
         
@@ -185,6 +193,7 @@ async def handle_media_stream(websocket: WebSocket):
         if not speaker or not text:
             return
         
+        # Send to dashboard
         payload = {
             "messageType": "transcription",
             "speaker": speaker,
@@ -194,16 +203,18 @@ async def handle_media_stream(websocket: WebSocket):
         }
         broadcast_to_dashboards_nonblocking(payload, current_call_sid)
 
+        # Update order extraction
         try:
             order_extractor.add_transcript(speaker, text)
         except Exception as e:
             Log.error(f"[OrderExtraction] Error: {e}")
 
-    # Set up OpenAI native transcription callbacks
+    # Set up OpenAI transcription callbacks
     openai_service.caller_transcript_callback = handle_openai_transcript
     openai_service.ai_transcript_callback = handle_openai_transcript
 
     try:
+        # Connect to OpenAI
         try:
             await connection_manager.connect_to_openai()
         except Exception as e:
@@ -218,26 +229,12 @@ async def handle_media_stream(websocket: WebSocket):
             await connection_manager.close_openai_connection()
             return
 
-        # Twilio -> Server handler
         async def handle_media_event(data: dict):
+            """Handle incoming media from Twilio."""
             if data.get("event") == "media":
                 media = data.get("media") or {}
                 payload_b64 = media.get("payload")
-                
                 if payload_b64:
-                    # ✅ Send caller audio to dashboard
-                    try:
-                        audio_payload = {
-                            "messageType": "audio",
-                            "speaker": "Caller",
-                            "audio": payload_b64,
-                            "timestamp": int(time.time() * 1000),
-                            "callSid": current_call_sid,
-                        }
-                        broadcast_to_dashboards_nonblocking(audio_payload, current_call_sid)
-                    except Exception as e:
-                        log_nonblocking(Log.error, f"[caller audio broadcast] failed: {e}")
-                    
                     # Send to OpenAI for processing
                     if connection_manager.is_openai_connected():
                         try:
@@ -245,29 +242,22 @@ async def handle_media_stream(websocket: WebSocket):
                             if audio_message:
                                 await connection_manager.send_to_openai(audio_message)
                         except Exception as e:
-                            log_nonblocking(Log.error, f"[media] failed to send incoming audio: {e}")
+                            Log.error(f"[media] failed to send to OpenAI: {e}")
+                    
+                    # Stream caller audio to dashboard (with VAD)
+                    try:
+                        await transcription_service.stream_audio_chunk(payload_b64, source="Caller")
+                    except Exception as e:
+                        Log.error(f"[media] failed to stream caller audio: {e}")
 
-        # OpenAI -> Twilio handler
         async def handle_audio_delta(response: dict):
+            """Handle audio response from OpenAI."""
             try:
                 audio_data = openai_service.extract_audio_response_data(response) or {}
                 delta = audio_data.get("delta")
                 
                 if delta:
-                    # ✅ Send AI audio to dashboard
-                    try:
-                        audio_payload = {
-                            "messageType": "audio",
-                            "speaker": "AI",
-                            "audio": delta,
-                            "timestamp": int(time.time() * 1000),
-                            "callSid": current_call_sid,
-                        }
-                        broadcast_to_dashboards_nonblocking(audio_payload, current_call_sid)
-                    except Exception as e:
-                        log_nonblocking(Log.error, f"[AI audio broadcast] failed: {e}")
-                    
-                    # Send to Twilio for playback
+                    # Send to Twilio
                     if getattr(connection_manager.state, "stream_sid", None):
                         try:
                             audio_message = audio_service.process_outgoing_audio(
@@ -280,24 +270,32 @@ async def handle_media_stream(websocket: WebSocket):
                                 )
                                 await connection_manager.send_to_twilio(mark_msg)
                         except Exception as e:
-                            log_nonblocking(Log.error, f"[audio->twilio] failed: {e}")
+                            Log.error(f"[audio->twilio] failed: {e}")
+                    
+                    # Stream AI audio to dashboard
+                    try:
+                        await transcription_service.stream_audio_chunk(delta, source="AI")
+                    except Exception as e:
+                        Log.error(f"[audio->dashboard] failed: {e}")
+                        
             except Exception as e:
-                log_nonblocking(Log.error, f"[audio-delta] failed: {e}")
+                Log.error(f"[audio-delta] failed: {e}")
 
         async def handle_speech_started():
+            """Handle user speech interruption."""
             try:
                 await connection_manager.send_mark_to_twilio()
             except Exception:
                 pass
 
         async def handle_other_openai_event(response: dict):
+            """Handle other OpenAI events (transcription, etc)."""
             openai_service.process_event_for_logging(response)
-            
-            # ✅ Extract transcripts from OpenAI native events
             await openai_service.extract_caller_transcript(response)
             await openai_service.extract_ai_transcript(response)
 
         async def openai_receiver():
+            """Receive and process OpenAI events."""
             await connection_manager.receive_from_openai(
                 handle_audio_delta,
                 handle_speech_started,
@@ -305,6 +303,7 @@ async def handle_media_stream(websocket: WebSocket):
             )
 
         async def renew_openai_session():
+            """Periodically renew OpenAI session."""
             while True:
                 await asyncio.sleep(getattr(Config, "REALTIME_SESSION_RENEW_SECONDS", 1200))
                 try:
@@ -317,11 +316,11 @@ async def handle_media_stream(websocket: WebSocket):
                     Log.error(f"Session renewal failed: {e}")
 
         async def on_start_cb(stream_sid: str):
+            """Handle Twilio stream start."""
             nonlocal current_call_sid
             current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
             Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
 
-            # Set up order extraction callback
             async def send_order_update(order_data: Dict[str, Any]):
                 payload = {
                     "messageType": "orderUpdate",
@@ -334,11 +333,13 @@ async def handle_media_stream(websocket: WebSocket):
             order_extractor.set_update_callback(send_order_update)
 
         async def on_mark_cb():
+            """Handle Twilio mark event."""
             try:
                 audio_service.handle_mark_event()
             except Exception:
                 pass
 
+        # Run all tasks concurrently
         await asyncio.gather(
             connection_manager.receive_from_twilio(handle_media_event, on_start_cb, on_mark_cb),
             openai_receiver(),
@@ -348,6 +349,7 @@ async def handle_media_stream(websocket: WebSocket):
     except Exception as e:
         Log.error(f"Error in media stream handler: {e}")
     finally:
+        # Final order summary
         try:
             final_summary = order_extractor.get_order_summary()
             Log.info(f"\n{final_summary}")
@@ -360,6 +362,12 @@ async def handle_media_stream(websocket: WebSocket):
                     "timestamp": int(time.time() * 1000),
                     "callSid": current_call_sid,
                 }, current_call_sid)
+        except Exception:
+            pass
+
+        # Cleanup
+        try:
+            await transcription_service.shutdown()
         except Exception:
             pass
 
