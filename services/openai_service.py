@@ -63,7 +63,7 @@ class OpenAISessionManager:
                         "turn_detection": {"type": "server_vad"},
                         "transcription": {
                             "model": "gpt-4o-mini-transcribe",
-                            "language": "ur"  # 👈 Explicitly force Urdu/Hindi transcription mode
+                            "language": "en"  # 👈 Explicitly force Urdu/Hindi transcription mode
                         }
                     },
                     "output": {"format": {"type": "audio/pcmu"}}
