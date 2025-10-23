@@ -10,17 +10,20 @@ from services.log_utils import Log
 
 class OrderExtractionService:
     """
-    Extracts structured order information from restaurant phone calls.
+    Enhanced order extraction using FULL conversation context (Caller + AI).
     
-    ✅ FIXES:
-    1. Properly handles item deletions/corrections
-    2. Sends incremental updates (only what changed)
-    3. Validates extracted data quality
+    ✅ KEY IMPROVEMENTS:
+    1. Uses BOTH Caller AND AI transcripts for better context
+    2. AI confirmations/repetitions validate extracted information
+    3. More accurate extraction with conversational understanding
+    4. Handles corrections and clarifications naturally
+    5. Better extraction for Urdu/Punjabi Roman script
     """
     
     OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
     
     def __init__(self):
+        # Store FULL conversation (Caller + AI)
         self._conversation_buffer: List[Dict[str, str]] = []
         
         # Track current order state (ground truth)
@@ -36,7 +39,7 @@ class OrderExtractionService:
         }
         
         self._last_extraction_time: float = 0
-        self._extraction_interval: float = 5.0
+        self._extraction_interval: float = 5.0  # Extract every 5 seconds
         self._extraction_task: Optional[asyncio.Task] = None
         self._shutdown: bool = False
         
@@ -48,7 +51,11 @@ class OrderExtractionService:
         self.update_callback = callback
     
     def add_transcript(self, speaker: str, text: str):
-        """Add transcript and trigger extraction."""
+        """
+        Add transcript from EITHER Caller OR AI.
+        
+        ✅ Both speakers are tracked for better context!
+        """
         if not text or not text.strip():
             return
         
@@ -58,9 +65,13 @@ class OrderExtractionService:
             "timestamp": datetime.now().isoformat()
         })
         
+        Log.info(f"[OrderExtraction] Added {speaker}: {text.strip()[:50]}...")
+        
+        # Keep last 50 messages
         if len(self._conversation_buffer) > 50:
             self._conversation_buffer = self._conversation_buffer[-50:]
         
+        # Trigger extraction if enough time has passed
         current_time = asyncio.get_event_loop().time()
         if current_time - self._last_extraction_time >= self._extraction_interval:
             self._trigger_extraction()
@@ -94,9 +105,60 @@ class OrderExtractionService:
         
         return bool(re.search(r'\d', price))
     
+    def get_order_summary(self) -> str:
+        """Get human-readable order summary."""
+        summary_parts = ["=== ORDER SUMMARY ==="]
+        
+        if self._current_order.get("customer_name"):
+            summary_parts.append(f"Customer: {self._current_order['customer_name']}")
+        
+        if self._current_order.get("phone_number"):
+            summary_parts.append(f"Phone: {self._current_order['phone_number']}")
+        
+        if self._current_order.get("delivery_address"):
+            summary_parts.append(f"Address: {self._current_order['delivery_address']}")
+        
+        if self._current_order.get("order_items"):
+            summary_parts.append("\nItems:")
+            for item in self._current_order["order_items"]:
+                qty = item.get("quantity", 1)
+                name = item.get("item", "Unknown")
+                notes = item.get("notes", "")
+                item_str = f"  - {qty}x {name}"
+                if notes:
+                    item_str += f" ({notes})"
+                summary_parts.append(item_str)
+        
+        if self._current_order.get("special_instructions"):
+            summary_parts.append(f"\nInstructions: {self._current_order['special_instructions']}")
+        
+        if self._current_order.get("payment_method"):
+            summary_parts.append(f"Payment: {self._current_order['payment_method']}")
+        
+        if self._current_order.get("delivery_time"):
+            summary_parts.append(f"Delivery Time: {self._current_order['delivery_time']}")
+        
+        if self._current_order.get("total_price"):
+            summary_parts.append(f"Total: {self._current_order['total_price']}")
+        
+        summary_parts.append("=" * 30)
+        return "\n".join(summary_parts)
+    
+    def get_current_order(self) -> Dict[str, Any]:
+        """Get current order state."""
+        return self._current_order.copy()
+    
+    async def shutdown(self):
+        """Gracefully shutdown."""
+        self._shutdown = True
+        if self._extraction_task and not self._extraction_task.done():
+            self._extraction_task.cancel()
+    
     async def _extract_order_info(self):
         """
-        Extract structured order information using GPT.
+        Extract structured order information using GPT-4o-mini.
+        
+        ✅ ENHANCED: Uses FULL conversation including AI responses for better context.
         """
         try:
             self._last_extraction_time = asyncio.get_event_loop().time()
@@ -104,6 +166,7 @@ class OrderExtractionService:
             if len(self._conversation_buffer) < 2:
                 return
             
+            # Build full conversation with BOTH Caller and AI
             conversation_text = "\n".join([
                 f"{msg['speaker']}: {msg['text']}" 
                 for msg in self._conversation_buffer
@@ -111,26 +174,95 @@ class OrderExtractionService:
             
             system_prompt = """You are an AI that extracts structured order information from restaurant phone call transcripts.
 
-CRITICAL RULES:
-1. Extract ONLY explicitly confirmed information
-2. Return null for anything not clearly mentioned
-3. Return the COMPLETE current order state (not incremental changes)
-4. If customer corrects an item, return the corrected version ONLY
-5. If customer removes an item, exclude it from order_items
-6. Ignore background noise, filler words, and unclear statements
+🔥 CRITICAL RULES:
 
-Fields to extract:
-- customer_name
-- phone_number
-- delivery_address
-- order_items (list of {"item": "name", "quantity": number, "notes": "optional"})
-- special_instructions
-- payment_method
-- delivery_time
-- total_price
+1. DUAL TRANSCRIPT INPUT:
+   - You receive transcripts from BOTH the Caller AND the AI assistant
+   - Use AI responses to CONFIRM and VALIDATE customer information
+   - AI confirmations are HIGH confidence signals
 
-Return ONLY valid JSON.
-"""
+2. AI CONFIRMATION SIGNALS:
+   - When AI says "So you want X", extract X as confirmed
+   - When AI says "Your address is Y", extract Y as HIGH confidence
+   - When AI says "Your phone number is Z", extract Z as HIGH confidence
+   - When AI repeats back information, that's STRONG validation
+
+3. URDU/PUNJABI/ENGLISH MIXED LANGUAGE:
+   - Caller transcripts are in Roman/Latin script (e.g., "mera naam Ali hai")
+   - Extract names and addresses as written in Roman script
+   - Convert to proper capitalization where appropriate
+   - Understand phonetic Urdu/Punjabi in English letters
+
+4. EXTRACTION PRIORITY:
+   - AI confirmations > Caller statements
+   - Repeated information > Single mentions
+   - Recent corrections > Old information
+
+5. COMPLETE STATE RESPONSE:
+   - Return the COMPLETE current order state (not incremental changes)
+   - If customer corrects an item, return the corrected version ONLY
+   - If customer removes an item, exclude it from order_items
+   - Extract ONLY explicitly confirmed information
+   - Return null for anything not clearly mentioned
+
+6. QUALITY FILTERS:
+   - Ignore background noise, filler words, and unclear statements
+   - If AI asks "Is that correct?" wait for caller's response before extracting
+   - Don't extract from questions, only from confirmations
+
+FIELDS TO EXTRACT:
+{
+  "customer_name": "Full name (Roman script, proper capitalization)",
+  "phone_number": "Contact number (validate format: 10+ digits)",
+  "delivery_address": "Complete delivery address (Roman script)",
+  "order_items": [
+    {
+      "item": "Item name (capitalize properly)",
+      "quantity": number,
+      "notes": "Optional special requests"
+    }
+  ],
+  "special_instructions": "Any special delivery/preparation requests",
+  "payment_method": "cash/card/online/etc",
+  "delivery_time": "When customer wants delivery",
+  "total_price": "Total order amount (with currency if mentioned)"
+}
+
+CONVERSATION EXAMPLES:
+
+Example 1:
+Caller: "mera naam Ali hai"
+AI: "Thank you, Ali. What would you like to order?"
+→ Extract: {"customer_name": "Ali"}
+
+Example 2:
+Caller: "do zinger burger"
+AI: "Okay, two zinger burgers. Anything else?"
+→ Extract: {"order_items": [{"item": "Zinger Burger", "quantity": 2}]}
+
+Example 3:
+Caller: "mera address DHA Phase 5 hai"
+AI: "Got it, DHA Phase 5. What's your contact number?"
+→ Extract: {"delivery_address": "DHA Phase 5"}
+
+Example 4:
+Caller: "mera number 0300-1234567 hai"
+AI: "Perfect, 0300-1234567. We'll call you on this number."
+→ Extract: {"phone_number": "0300-1234567"} (HIGH confidence - AI confirmed!)
+
+Example 5:
+Caller: "nahi wait, teen zinger burger"
+AI: "Okay, changing to three zinger burgers."
+→ Extract: {"order_items": [{"item": "Zinger Burger", "quantity": 3}]} (Latest correction)
+
+Example 6:
+Caller: "I want one large pizza"
+AI: "Great! One large pizza. What toppings?"
+Caller: "pepperoni aur mushroom"
+AI: "Perfect, large pizza with pepperoni and mushroom."
+→ Extract: {"order_items": [{"item": "Large Pizza", "quantity": 1, "notes": "pepperoni and mushroom"}]}
+
+RETURN ONLY VALID JSON. No explanations, no markdown, just the JSON object."""
 
             user_prompt = f"Extract order information from this conversation:\n\n{conversation_text}\n\nReturn JSON only."
             
@@ -191,6 +323,7 @@ Return ONLY valid JSON.
                         return
 
                     try:
+                        # Clean markdown code blocks if present
                         content = content.strip()
                         if content.startswith("```"):
                             content = content.split("```")[1]
@@ -199,9 +332,11 @@ Return ONLY valid JSON.
                         
                         extracted = json.loads(content.strip())
 
+                        # Track what changed
                         updates = {}
 
                         def update_if_changed(key):
+                            """Update field if it changed."""
                             if extracted.get(key) and extracted[key] != self._current_order.get(key):
                                 self._current_order[key] = extracted[key]
                                 updates[key] = extracted[key]
@@ -212,7 +347,6 @@ Return ONLY valid JSON.
                         update_if_changed("special_instructions")
                         update_if_changed("payment_method")
                         update_if_changed("delivery_time")
-                        update_if_changed("total_price")
 
                         # Phone validation before accepting
                         if extracted.get("phone_number") and self._is_valid_phone(extracted["phone_number"]):
@@ -229,17 +363,21 @@ Return ONLY valid JSON.
                                 updates["order_items"] = extracted["order_items"]
 
                         # Validate price format before updating
-                        if extracted.get("total_price") and self._is_valid_price(extracted["total_price"]):
+                        if extracted.get("total_price") and self._is_valid_price(str(extracted["total_price"])):
                             if extracted["total_price"] != self._current_order.get("total_price"):
                                 self._current_order["total_price"] = extracted["total_price"]
                                 updates["total_price"] = extracted["total_price"]
 
+                        # Send updates to dashboard
                         if updates and self.update_callback:
                             await self.update_callback(updates)
-                            Log.info(f"[OrderExtraction] Updated data: {json.dumps(updates, indent=2)}")
+                            Log.info(f"[OrderExtraction] ✅ Updated: {json.dumps(updates, indent=2)}")
 
                     except json.JSONDecodeError as e:
                         Log.error(f"[OrderExtraction] JSON parse error: {e}")
+                        Log.error(f"[OrderExtraction] Content was: {content[:200]}")
 
         except Exception as e:
             Log.error(f"[OrderExtraction] Unexpected error: {e}")
+            import traceback
+            Log.error(f"[OrderExtraction] Traceback: {traceback.format_exc()}")
