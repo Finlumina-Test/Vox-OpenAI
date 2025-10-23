@@ -40,11 +40,15 @@ class OpenAIEventHandler:
         return event.get('item_id')
 
 
+from typing import Dict, Any
+from config import Config
+
+
 class OpenAISessionManager:
     """
     Configures and initializes OpenAI Realtime API sessions.
-    Ensures transcription stays in Roman Urdu/Hindi or English,
-    without translation to any other language.
+    Ensures transcription stays in English (Roman) script
+    for Urdu/Punjabi/English mixed speech — without translation.
     """
 
     @staticmethod
@@ -55,7 +59,7 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio"],
+                "output_modalities": ["audio", "text"],  # Include text for AI understanding
 
                 "audio": {
                     "input": {
@@ -63,22 +67,25 @@ class OpenAISessionManager:
                         "turn_detection": {"type": "server_vad"},
                         "transcription": {
                             "model": "gpt-4o-mini-transcribe",
-                            "language": "en"  # 👈 Explicitly force Urdu/Hindi transcription mode
+                            "language": "ur"  # Force Urdu/Punjabi speech mode
                         }
                     },
                     "output": {"format": {"type": "audio/pcmu"}}
                 },
 
-                # 👇 Added enhanced instruction block
                 "instructions": (
                     Config.SYSTEM_MESSAGE
                     + "\n\n"
-                    "You will receive speech in Urdu/Punjabi mixed with English. "
-                    "Always transcribe it as phonetically accurate Roman Urdu/Punjabi or English words. "
-                    "Do NOT translate or replace with any other language. "
-                    "Preserve natural phrasing — for example, 'mai burger order krna chahta hun' "
-                    "should stay exactly like that, not translated. "
-                    "If unsure of a word, write what you hear phonetically in Roman script."
+                    "### TRANSCRIPTION RULES ###\n"
+                    "You will receive speech in Urdu or Punjabi mixed with English.\n"
+                    "Always transcribe it **in English (Roman) script**, preserving the natural sounds.\n"
+                    "Do NOT translate or write in Urdu or Punjabi script.\n"
+                    "For example:\n"
+                    "  - If the caller says 'آج میں نے برگر کھانا ہے', write: 'aaj maine burger khana hai'.\n"
+                    "  - If the caller says 'دو زنگر برگر دے دینا', write: 'do zinger burger de dena'.\n"
+                    "  - If the caller says 'I want one zinger burger', write exactly that.\n"
+                    "If unsure of a word, write what you hear phonetically in Roman letters.\n"
+                    "Keep the style casual and conversational — just as it’s spoken."
                 ),
 
                 "tools": [
@@ -94,9 +101,7 @@ class OpenAISessionManager:
                             "properties": {
                                 "reason": {
                                     "type": "string",
-                                    "description": (
-                                        "Brief reason for ending, e.g., user said bye."
-                                    )
+                                    "description": "Brief reason for ending, e.g., user said bye."
                                 }
                             },
                             "required": []
@@ -106,6 +111,7 @@ class OpenAISessionManager:
             }
         }
         return session
+
 
     @staticmethod
     def create_initial_conversation_item() -> Dict[str, Any]:
