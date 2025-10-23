@@ -1,20 +1,15 @@
-import io
-import wave
 import base64
 import asyncio
-import aiohttp
 import numpy as np
 import time
-from scipy.signal import resample
-from typing import Dict, Optional, List, Callable
+from typing import Dict, Optional, Callable
 from collections import deque
-from config import Config
 from services.log_utils import Log
 
 
 class TranscriptionService:
     """
-    Real-time transcription service with strict sequential audio delivery.
+    Real-time audio streaming service with strict sequential delivery.
     
     Key Features:
     - Sequential audio playback (no overlap possible)
@@ -22,8 +17,9 @@ class TranscriptionService:
     - NO gaps for AI->Caller (natural conversation flow)
     - Voice Activity Detection (VAD) to prevent backlog
     - Async lock ensures one chunk completes before next starts
+    
+    NOTE: Transcription now handled by OpenAI natively!
     """
-    OPENAI_API_URL = "https://api.openai.com/v1/audio/transcriptions"
     
     # Audio format specs
     SAMPLE_RATE = 8000  # µ-law 8kHz from Twilio and OpenAI
@@ -41,16 +37,7 @@ class TranscriptionService:
     VAD_CONSECUTIVE_SILENCE = 5
     VAD_LOOKBACK_CHUNKS = 10
     
-    # Transcription settings
-    MIN_AUDIO_DURATION = 0.8
-    SILENCE_TIMEOUT = 0.5
-    MAX_BUFFER_DURATION = 3.0
-    
     def __init__(self):
-        # Transcription buffers
-        self._caller_buffer: bytearray = bytearray()
-        self._ai_buffer: bytearray = bytearray()
-        
         # Unified audio queue
         self._unified_audio_queue: asyncio.Queue = asyncio.Queue()
         
@@ -70,29 +57,8 @@ class TranscriptionService:
         self._caller_silence_chunks_count: int = 0
         self._caller_chunk_history: deque = deque(maxlen=self.VAD_LOOKBACK_CHUNKS)
         
-        # Transcription timing
-        self._caller_last_chunk_time: float = 0
-        self._ai_last_chunk_time: float = 0
-        self._caller_first_chunk_time: float = 0
-        self._ai_first_chunk_time: float = 0
-        
-        # Processing flags
-        self._caller_processing: bool = False
-        self._ai_processing: bool = False
-        
-        # Transcription monitoring
-        self._caller_monitor_task: Optional[asyncio.Task] = None
-        self._ai_monitor_task: Optional[asyncio.Task] = None
-        
         # Callbacks
         self.audio_callback: Optional[Callable] = None
-        self.transcription_callback: Optional[Callable] = None
-        
-        # Deduplication tracking
-        self._caller_last_transcript: str = ""
-        self._ai_last_transcript: str = ""
-        self._caller_transcript_history: deque = deque(maxlen=5)
-        self._ai_transcript_history: deque = deque(maxlen=5)
         
         # Shutdown flag
         self._shutdown: bool = False
@@ -103,10 +69,6 @@ class TranscriptionService:
         
         if not self._stream_task or self._stream_task.done():
             self._stream_task = asyncio.create_task(self._stream_unified_audio())
-    
-    def set_word_callback(self, callback: Callable):
-        """Set callback for transcription results."""
-        self.transcription_callback = callback
     
     def _calculate_chunk_duration(self, audio_bytes: bytes) -> float:
         """Calculate audio chunk duration in seconds (8kHz µ-law)."""
@@ -211,12 +173,14 @@ class TranscriptionService:
                     self._last_chunk_time_per_speaker[speaker] = current_time
                     self._last_streamed_speaker = speaker
                     
+                    # Send to dashboard
                     if self.audio_callback:
                         try:
                             await self.audio_callback(audio_data)
                         except Exception as e:
                             Log.error(f"[Stream] callback error: {e}")
                     
+                    # Wait for chunk duration to maintain timing
                     await asyncio.sleep(chunk_duration)
                 
                 self._unified_audio_queue.task_done()
@@ -225,9 +189,9 @@ class TranscriptionService:
                 Log.error(f"[Stream] error: {e}")
                 await asyncio.sleep(0.01)
     
-    async def transcribe_realtime(self, audio_input, source: str = "Unknown") -> str:
+    async def stream_audio_chunk(self, audio_input, source: str = "Unknown") -> None:
         """
-        Process incoming audio with Voice Activity Detection.
+        Process incoming audio chunk with Voice Activity Detection.
         
         🎯 KEY: Only stream caller audio when actually speaking!
         """
@@ -239,7 +203,7 @@ class TranscriptionService:
                 audio_bytes = bytes(audio_input)
                 original_base64 = base64.b64encode(audio_bytes).decode('ascii')
             else:
-                return ""
+                return
             
             should_stream = True
             
@@ -248,8 +212,6 @@ class TranscriptionService:
                 has_speech = self._detect_speech(audio_bytes)
                 should_stream = self._update_vad_state(has_speech, audio_bytes)
                 
-                await self._add_to_caller_buffer(audio_bytes)
-                
                 # Flush history when starting to speak
                 if should_stream and self._caller_speech_chunks_count == self.VAD_CONSECUTIVE_SPEECH:
                     for hist_chunk in list(self._caller_chunk_history)[:-1]:
@@ -257,243 +219,26 @@ class TranscriptionService:
                         hist_packet = {
                             "speaker": source,
                             "audio": hist_b64,
-                            "timestamp": int(time.time()),
+                            "timestamp": int(time.time() * 1000),
                             "size": len(hist_chunk)
                         }
                         await self._unified_audio_queue.put(hist_packet)
             
-            # Queue for streaming
+            # Queue for streaming (AI always streams, Caller only when speaking)
             if should_stream:
                 audio_packet = {
                     "speaker": source,
                     "audio": original_base64,
-                    "timestamp": int(time.time()),
+                    "timestamp": int(time.time() * 1000),
                     "size": len(audio_bytes)
                 }
                 await self._unified_audio_queue.put(audio_packet)
             
-            # Buffer for transcription (AI always buffers)
-            if source == "AI":
-                await self._add_to_ai_buffer(audio_bytes)
-            
-            return ""
-            
         except Exception as e:
-            Log.error(f"[{source}] Error: {e}")
-            return ""
-    
-    async def _add_to_caller_buffer(self, audio_bytes: bytes):
-        """Add to caller transcription buffer."""
-        current_time = time.time()
-        
-        if len(self._caller_buffer) == 0:
-            self._caller_first_chunk_time = current_time
-        
-        self._caller_buffer.extend(audio_bytes)
-        self._caller_last_chunk_time = current_time
-        
-        if not self._caller_monitor_task or self._caller_monitor_task.done():
-            self._caller_monitor_task = asyncio.create_task(
-                self._monitor_caller_buffer()
-            )
-    
-    async def _add_to_ai_buffer(self, audio_bytes: bytes):
-        """Add to AI transcription buffer."""
-        current_time = time.time()
-        
-        if len(self._ai_buffer) == 0:
-            self._ai_first_chunk_time = current_time
-        
-        self._ai_buffer.extend(audio_bytes)
-        self._ai_last_chunk_time = current_time
-        
-        if not self._ai_monitor_task or self._ai_monitor_task.done():
-            self._ai_monitor_task = asyncio.create_task(
-                self._monitor_ai_buffer()
-            )
-    
-    async def _monitor_caller_buffer(self):
-        """Monitor caller buffer for transcription."""
-        while not self._shutdown:
-            try:
-                await asyncio.sleep(0.1)
-                
-                buffer_duration = len(self._caller_buffer) / 8000.0
-                if buffer_duration < self.MIN_AUDIO_DURATION:
-                    continue
-                
-                time_since_last = time.time() - self._caller_last_chunk_time
-                
-                should_transcribe = (
-                    time_since_last >= self.SILENCE_TIMEOUT or
-                    buffer_duration >= self.MAX_BUFFER_DURATION
-                )
-                
-                if should_transcribe and not self._caller_processing:
-                    await self._transcribe_buffer("Caller")
-                    
-            except Exception as e:
-                Log.error(f"[Caller monitor] error: {e}")
-                break
-    
-    async def _monitor_ai_buffer(self):
-        """Monitor AI buffer for transcription."""
-        while not self._shutdown:
-            try:
-                await asyncio.sleep(0.1)
-                
-                buffer_duration = len(self._ai_buffer) / 8000.0
-                if buffer_duration < self.MIN_AUDIO_DURATION:
-                    continue
-                
-                time_since_last = time.time() - self._ai_last_chunk_time
-                
-                should_transcribe = (
-                    time_since_last >= self.SILENCE_TIMEOUT or
-                    buffer_duration >= self.MAX_BUFFER_DURATION
-                )
-                
-                if should_transcribe and not self._ai_processing:
-                    await self._transcribe_buffer("AI")
-                    
-            except Exception as e:
-                Log.error(f"[AI monitor] error: {e}")
-                break
-    
-    async def _transcribe_buffer(self, source: str):
-        """Transcribe accumulated buffer."""
-        if source == "Caller":
-            if self._caller_processing or len(self._caller_buffer) == 0:
-                return
-            self._caller_processing = True
-            
-            try:
-                audio_data = bytes(self._caller_buffer)
-                self._caller_buffer.clear()
-                
-                transcript = await self._transcribe_audio(audio_data, source)
-                
-                if transcript and not self._is_duplicate(transcript, source):
-                    self._caller_last_transcript = transcript
-                    self._caller_transcript_history.append(transcript.lower())
-                    
-                    if self.transcription_callback:
-                        await self.transcription_callback({
-                            "speaker": source,
-                            "text": transcript,
-                            "timestamp": int(time.time())
-                        })
-                
-            finally:
-                self._caller_processing = False
-                
-        elif source == "AI":
-            if self._ai_processing or len(self._ai_buffer) == 0:
-                return
-            self._ai_processing = True
-            
-            try:
-                audio_data = bytes(self._ai_buffer)
-                self._ai_buffer.clear()
-                
-                transcript = await self._transcribe_audio(audio_data, source)
-                
-                if transcript and not self._is_duplicate(transcript, source):
-                    self._ai_last_transcript = transcript
-                    self._ai_transcript_history.append(transcript.lower())
-                    
-                    if self.transcription_callback:
-                        await self.transcription_callback({
-                            "speaker": source,
-                            "text": transcript,
-                            "timestamp": int(time.time())
-                        })
-                
-            finally:
-                self._ai_processing = False
-    
-    def _is_duplicate(self, transcript: str, source: str) -> bool:
-        """Check if transcript is a duplicate of recent transcriptions."""
-        transcript_lower = transcript.lower().strip()
-        
-        if source == "Caller":
-            if transcript_lower == self._caller_last_transcript.lower():
-                return True
-            for prev in self._caller_transcript_history:
-                if self._similarity(transcript_lower, prev) > 0.85:
-                    return True
-        else:
-            if transcript_lower == self._ai_last_transcript.lower():
-                return True
-            for prev in self._ai_transcript_history:
-                if self._similarity(transcript_lower, prev) > 0.85:
-                    return True
-        
-        return False
-    
-    def _similarity(self, s1: str, s2: str) -> float:
-        """Calculate simple similarity ratio between two strings."""
-        if not s1 or not s2:
-            return 0.0
-        
-        words1 = set(s1.split())
-        words2 = set(s2.split())
-        
-        if not words1 or not words2:
-            return 0.0
-        
-        intersection = words1.intersection(words2)
-        union = words1.union(words2)
-        
-        return len(intersection) / len(union) if union else 0.0
-    
-    async def _transcribe_audio(self, mulaw_bytes: bytes, source: str) -> str:
-        """
-        Convert µ-law 8kHz to PCM16 16kHz and transcribe.
-        Forces English script output for ANY language (Urdu, Punjabi, English).
-        """
-        try:
-            pcm16 = self._mulaw_to_pcm16(mulaw_bytes)
-            pcm16_16k = self._resample_pcm16(pcm16, 8000, 16000)
-            
-            wav_io = io.BytesIO()
-            with wave.open(wav_io, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(pcm16_16k.tobytes())
-            wav_io.seek(0)
-            
-            headers = {"Authorization": f"Bearer {Config.OPENAI_API_KEY}"}
-            form = aiohttp.FormData()
-            form.add_field("file", wav_io, filename="audio.wav", content_type="audio/wav")
-            form.add_field("model", "whisper-1")
-            form.add_field("response_format", "verbose_json")
-            form.add_field("prompt", "Transcribe in English script: pizza, biryani, delivery, order, customer")
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.OPENAI_API_URL, headers=headers, data=form) as resp:
-                    if resp.status != 200:
-                        text = await resp.text()
-                        Log.error(f"[{source}] Transcription failed ({resp.status}): {text}")
-                        return ""
-                    
-                    data = await resp.json()
-                    transcript = (data.get("text") or "").strip()
-                    detected_lang = data.get("language", "unknown")
-                    
-                    if transcript:
-                        Log.info(f"[{source}] 📝 [{detected_lang}] {transcript}")
-                        return transcript
-                    
-                    return ""
-                    
-        except Exception as e:
-            Log.error(f"[{source}] Transcription error: {e}")
-            return ""
+            Log.error(f"[{source}] Audio streaming error: {e}")
     
     def _mulaw_to_pcm16(self, mulaw_bytes: bytes) -> np.ndarray:
-        """Convert µ-law 8-bit to PCM16."""
+        """Convert µ-law 8-bit to PCM16 (for VAD only)."""
         mu = np.frombuffer(mulaw_bytes, dtype=np.uint8)
         mu = ~mu
         
@@ -506,13 +251,6 @@ class TranscriptionService:
         
         pcm16 = np.where(sign == 0, magnitude, -magnitude)
         return pcm16.astype(np.int16)
-    
-    def _resample_pcm16(self, pcm_data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-        """Resample PCM16 audio."""
-        if src_rate == dst_rate:
-            return pcm_data
-        num_samples = int(len(pcm_data) * dst_rate / src_rate)
-        return resample(pcm_data, num_samples).astype(np.int16)
     
     async def shutdown(self):
         """Gracefully shutdown."""
