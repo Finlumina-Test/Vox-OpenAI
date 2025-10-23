@@ -57,7 +57,8 @@ class OpenAISessionManager:
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
-                        "turn_detection": {"type": "server_vad"}
+                        "turn_detection": {"type": "server_vad"},
+                        "transcription": {"model": "whisper-1"} 
                     },
                     "output": {
                         "format": {"type": "audio/pcmu"}
