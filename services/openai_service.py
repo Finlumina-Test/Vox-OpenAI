@@ -59,7 +59,7 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio", "text"],  # Include text for AI understanding
+                "output_modalities": ["audio"],  # Include text for AI understanding
 
                 "audio": {
                     "input": {
