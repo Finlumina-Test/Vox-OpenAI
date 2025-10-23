@@ -40,15 +40,14 @@ class OpenAIEventHandler:
         return event.get('item_id')
 
 
-from typing import Dict, Any
-from config import Config
-
-
 class OpenAISessionManager:
     """
     Configures and initializes OpenAI Realtime API sessions.
-    Ensures transcription stays in English (Roman) script
-    for Urdu/Punjabi/English mixed speech — without translation.
+    
+    🔥 TRANSCRIPTION STRATEGY:
+    - Caller transcripts: From response.done (HIGH QUALITY, includes context)
+    - AI transcripts: From response.done (same place)
+    - Both come from the same event = perfect sync!
     """
 
     @staticmethod
@@ -59,30 +58,50 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio"],
+                "output_modalities": ["audio"],  # Text comes with audio automatically
 
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": {"type": "server_vad"},
-                        # ✅ REMOVED: transcription config (we get better transcripts from response.done!)
+                        "transcription": {
+                            "model": "gpt-4o-mini-transcribe"
+                            # 🔥 NO language parameter - this forces phonetic Roman transcription!
+                            # Setting "language": "en" causes Urdu to be written in Urdu script
+                            # Omitting it = OpenAI writes phonetically in Roman letters
+                        }
                     },
                     "output": {"format": {"type": "audio/pcmu"}}
                 },
 
                 "instructions": (
-                    Config.SYSTEM_MESSAGE
-                    + "\n\n"
-                    "### TRANSCRIPTION RULES ###\n"
-                    "You will receive speech in Urdu or Punjabi mixed with English.\n"
-                    "Always transcribe it **in English (Roman) script**, preserving the natural sounds.\n"
-                    "Do NOT translate or write in Urdu or Punjabi script.\n"
-                    "For example:\n"
-                    "  - If the caller says 'آج میں نے برگر کھانا ہے', write: 'aaj maine burger khana hai'.\n"
-                    "  - If the caller says 'دو زنگر برگر دے دینا', write: 'do zinger burger de dena'.\n"
-                    "  - If the caller says 'I want one zinger burger', write exactly that.\n"
-                    "If unsure of a word, write what you hear phonetically in Roman letters.\n"
-                    "Keep the style casual and conversational — just as it's spoken."
+                    f"{Config.SYSTEM_MESSAGE}\n\n"
+                    "### LANGUAGE HANDLING ###\n\n"
+                    
+                    "🎯 CALLER LANGUAGE:\n"
+                    "- Caller speaks Urdu, Punjabi, or mixed English\n"
+                    "- You will see transcripts in Roman/Latin script (English letters)\n"
+                    "- Example: 'mera naam Ali hai' (NOT اردو script)\n"
+                    "- Example: 'do zinger burger de dena'\n"
+                    "- Example: 'I want one pizza'\n\n"
+                    
+                    "🗣️ YOUR RESPONSES:\n"
+                    "- Respond naturally in the SAME language/style as caller\n"
+                    "- If caller speaks Roman Urdu/Punjabi, respond in Roman Urdu/Punjabi\n"
+                    "- If caller speaks English, respond in English\n"
+                    "- Be conversational, friendly, and natural\n\n"
+                    
+                    "CONVERSATION EXAMPLES:\n"
+                    "Caller: 'mujhe burger chahiye'\n"
+                    "You: 'Bilkul! Konsa burger chahiye aapko?'\n\n"
+                    
+                    "Caller: 'zinger burger'\n"
+                    "You: 'Perfect! Kitne zinger burger chahiye?'\n\n"
+                    
+                    "Caller: 'I want two'\n"
+                    "You: 'Great! Two zinger burgers. Anything else?'\n\n"
+                    
+                    "Remember: Match the caller's language naturally!"
                 ),
 
                 "tools": [
@@ -108,7 +127,6 @@ class OpenAISessionManager:
             }
         }
         return session
-
 
     @staticmethod
     def create_initial_conversation_item() -> Dict[str, Any]:
@@ -177,9 +195,8 @@ class TranscriptFilter:
     Filters out low-quality transcripts from OpenAI's native transcription.
     """
     
-    # Common noise patterns that OpenAI might transcribe
     NOISE_PATTERNS = [
-        "thank you",  # Often phantom
+        "thank you",
         "thanks",
         "bye",
         "okay",
@@ -194,28 +211,19 @@ class TranscriptFilter:
         "ah",
     ]
     
-    # Minimum length for valid transcript
     MIN_TRANSCRIPT_LENGTH = 3
-    
-    # Maximum length for noise (usually short)
     MAX_NOISE_LENGTH = 15
     
     @staticmethod
     def is_valid_transcript(text: str, speaker: str) -> bool:
         """
         Validate if transcript is real speech or just noise.
-        
-        Rules:
-        1. Must be at least 3 characters
-        2. If very short (< 15 chars) and matches noise patterns, reject
-        3. AI transcripts are always valid (we trust our own output)
         """
         if not text or not isinstance(text, str):
             return False
         
         cleaned = text.strip().lower()
         
-        # Empty or too short
         if len(cleaned) < TranscriptFilter.MIN_TRANSCRIPT_LENGTH:
             return False
         
@@ -225,21 +233,23 @@ class TranscriptFilter:
         
         # For caller: Check if it's a noise pattern
         if len(cleaned) <= TranscriptFilter.MAX_NOISE_LENGTH:
-            # Check if it matches any noise pattern
             for pattern in TranscriptFilter.NOISE_PATTERNS:
                 if cleaned == pattern or cleaned.startswith(pattern + " ") or cleaned.endswith(" " + pattern):
                     Log.debug(f"[Filter] Rejected noise: '{text}'")
                     return False
         
-        # Passed all checks
         return True
 
 
 class OpenAIService:
     """
     Unified service for OpenAI Realtime API.
-    Uses OpenAI's native transcription for BOTH caller and AI.
-    ✅ HIGH QUALITY transcripts from response.done for both speakers!
+    
+    🔥 TRANSCRIPTION SOURCES:
+    1. Caller transcripts: response.done -> output[type=message,role=user] -> content[type=input_audio].transcript
+    2. AI transcripts: response.done -> output[type=message,role=assistant] -> content[type=output_audio].transcript
+    
+    Both come from response.done = HIGH QUALITY + PERFECT SYNC!
     """
 
     def __init__(self):
@@ -257,7 +267,7 @@ class OpenAIService:
         self.caller_transcript_callback: Optional[callable] = None
         self.ai_transcript_callback: Optional[callable] = None
         
-        # ✅ Track last transcript timestamp per speaker to ensure ordering
+        # Track last transcript timestamp per speaker
         self._last_transcript_time: Dict[str, float] = {"Caller": 0, "AI": 0}
 
     # --- SESSION & GREETING ---
@@ -432,12 +442,16 @@ class OpenAIService:
             self._goodbye_watchdog.cancel()
         self._goodbye_watchdog = None
 
-    # --- ✅ UNIFIED TRANSCRIPT EXTRACTION (CALLER + AI from response.done) ---
+    # --- 🔥 UNIFIED TRANSCRIPT EXTRACTION FROM response.done ---
     async def extract_all_transcripts(self, event: Dict[str, Any]) -> None:
         """
         Extract BOTH Caller and AI transcripts from response.done event.
-        ✅ HIGH QUALITY transcripts for both speakers!
-        This replaces the old separate methods.
+        
+        🔥 WHY response.done?
+        - Contains HIGH QUALITY transcripts with full context
+        - Includes BOTH user (caller) and assistant (AI) messages
+        - Perfect synchronization
+        - Roman script for Urdu/Punjabi!
         """
         try:
             etype = event.get("type", "")
@@ -455,16 +469,17 @@ class OpenAIService:
                     continue
                 
                 item_type = item.get("type")
+                item_role = item.get("role")
                 
-                # ✅ CALLER transcript (from user message with input_audio)
-                if item_type == "message" and item.get("role") == "user":
+                # 🔥 CALLER TRANSCRIPT (user message with input_audio)
+                if item_type == "message" and item_role == "user":
                     content = item.get("content") or []
                     
                     for c in content:
                         if not isinstance(c, dict):
                             continue
                         
-                        # This is where HIGH-QUALITY caller transcripts live!
+                        # This is where OpenAI puts caller transcripts!
                         if c.get("type") == "input_audio":
                             transcript = c.get("transcript")
                             
@@ -497,8 +512,8 @@ class OpenAIService:
                                     "timestamp": int(current_time * 1000)
                                 })
                 
-                # ✅ AI transcript (from assistant message with output_audio)
-                elif item_type == "message" and item.get("role") == "assistant":
+                # 🔥 AI TRANSCRIPT (assistant message with output_audio)
+                elif item_type == "message" and item_role == "assistant":
                     content = item.get("content") or []
                     
                     for c in content:
