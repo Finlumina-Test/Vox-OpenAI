@@ -177,7 +177,7 @@ Return ONLY valid JSON."""
                 "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
                 "Content-Type": "application/json"
             }
-            
+
             payload = {
                 "model": "gpt-4o-mini",
                 "messages": [
@@ -187,46 +187,98 @@ Return ONLY valid JSON."""
                 "temperature": 0.1,
                 "max_tokens": 500
             }
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    self.OPENAI_API_URL, 
-                    headers=headers, 
+                    self.OPENAI_API_URL,
+                    headers=headers,
                     json=payload
                 ) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
                         Log.error(f"[OrderExtraction] API failed: {resp.status} - {error_text}")
                         return
-                    
+
                     try:
                         data = await resp.json()
                     except Exception as e:
                         Log.error(f"[OrderExtraction] JSON decode failed: {e}")
                         return
-                    
+
                     if not data or not isinstance(data, dict):
                         Log.error(f"[OrderExtraction] Invalid response data type")
                         return
-                    
+
                     choices = data.get("choices")
                     if not choices or not isinstance(choices, list) or len(choices) == 0:
                         Log.error(f"[OrderExtraction] No choices in response")
                         return
-                    
+
                     first_choice = choices[0]
                     if not isinstance(first_choice, dict):
                         Log.error(f"[OrderExtraction] Invalid choice format")
                         return
-                    
+
                     message = first_choice.get("message")
                     if not message or not isinstance(message, dict):
                         Log.error(f"[OrderExtraction] No message in choice")
                         return
-                    
+
                     content = message.get("content", "")
                     if not content or not isinstance(content, str):
                         Log.error(f"[OrderExtraction] Empty or invalid content")
                         return
-                    
+
                     try:
+                        content = content.strip()
+                        if content.startswith("```"):
+                            content = content.split("```")[1]
+                            if content.startswith("json"):
+                                content = content[4:]
+
+                        extracted = json.loads(content.strip())
+
+                        # Prepare dictionary for updates
+                        updates = {}
+
+                        # Compare each field and collect only changed/valid data
+                        def update_if_changed(key):
+                            if extracted.get(key) and extracted[key] != self._current_order.get(key):
+                                self._current_order[key] = extracted[key]
+                                updates[key] = extracted[key]
+
+                        # Basic field updates
+                        update_if_changed("customer_name")
+                        update_if_changed("delivery_address")
+                        update_if_changed("special_instructions")
+                        update_if_changed("payment_method")
+                        update_if_changed("delivery_time")
+                        update_if_changed("total_price")
+
+                        # Phone validation before accepting
+                        if extracted.get("phone_number") and self._is_valid_phone(extracted["phone_number"]):
+                            if extracted["phone_number"] != self._current_order.get("phone_number"):
+                                self._current_order["phone_number"] = extracted["phone_number"]
+                                updates["phone_number"] = extracted["phone_number"]
+
+                        # Validate and update order_items
+                        if extracted.get("order_items") and isinstance(extracted["order_items"], list):
+                            new_norm = self._normalize_items(extracted["order_items"])
+                            old_norm = self._normalize_items(self._current_order.get("order_items", []))
+                            if new_norm != old_norm:
+                                self._current_order["order_items"] = extracted["order_items"]
+                                updates["order_items"] = extracted["order_items"]
+
+                        # Validate price format before updating total
+                        if extracted.get("total_price") and self._is_valid_price(extracted["total_price"]):
+                            if extracted["total_price"] != self._current_order.get("total_price"):
+                                self._current_order["total_price"] = extracted["total_price"]
+                                updates["total_price"] = extracted["total_price"]
+
+                        # Send updates only if something changed
+                        if updates and self.update_callback:
+                            await self.update_callback(updates)
+                            Log.info(f"[OrderExtraction] Updated data: {json.dumps(updates, indent=2)}")
+
+                    except json.JSONDecodeError as e:
+                        Log.error(f"[OrderExtraction] JSON parse error: {e}")
