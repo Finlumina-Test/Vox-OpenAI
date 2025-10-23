@@ -53,7 +53,7 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio"],
+                "output_modalities": ["audio"], 
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
@@ -64,6 +64,10 @@ class OpenAISessionManager:
                     }
                 },
                 "instructions": Config.SYSTEM_MESSAGE,
+                # ✅ Enable input audio transcription
+                "input_audio_transcription": {
+                    "model": "whisper-1"
+                },
                 "tools": [
                     {
                         "type": "function",
@@ -72,10 +76,7 @@ class OpenAISessionManager:
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "reason": {
-                                    "type": "string",
-                                    "description": "Brief reason for ending, e.g., user said bye."
-                                }
+                                "reason": {"type": "string", "description": "Brief reason for ending, e.g., user said bye."}
                             },
                             "required": []
                         }
@@ -84,7 +85,7 @@ class OpenAISessionManager:
             }
         }
         return session
-
+    
     @staticmethod
     def create_initial_conversation_item() -> Dict[str, Any]:
         """Create an initial conversation item for AI-first interactions."""
@@ -96,11 +97,7 @@ class OpenAISessionManager:
                 "content": [
                     {
                         "type": "input_text",
-                        "text": (
-                            "Greet the user with 'Hello there! I am an AI voice assistant "
-                            "powered by Twilio and the OpenAI Realtime API. You can ask me "
-                            "for facts, jokes, or anything you can imagine. How can I help you?'"
-                        )
+                        "text": "Greet the user with 'Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?'"
                     }
                 ]
             }
