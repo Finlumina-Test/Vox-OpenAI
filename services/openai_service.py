@@ -59,16 +59,13 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio"],  # Include text for AI understanding
+                "output_modalities": ["audio"],
 
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": {"type": "server_vad"},
-                        "transcription": {
-                            "model": "gpt-4o-mini-transcribe",
-                            "language": "en"  # Force Urdu/Punjabi speech mode
-                        }
+                        # ✅ REMOVED: transcription config (we get better transcripts from response.done!)
                     },
                     "output": {"format": {"type": "audio/pcmu"}}
                 },
@@ -85,7 +82,7 @@ class OpenAISessionManager:
                     "  - If the caller says 'دو زنگر برگر دے دینا', write: 'do zinger burger de dena'.\n"
                     "  - If the caller says 'I want one zinger burger', write exactly that.\n"
                     "If unsure of a word, write what you hear phonetically in Roman letters.\n"
-                    "Keep the style casual and conversational — just as it’s spoken."
+                    "Keep the style casual and conversational — just as it's spoken."
                 ),
 
                 "tools": [
@@ -242,7 +239,7 @@ class OpenAIService:
     """
     Unified service for OpenAI Realtime API.
     Uses OpenAI's native transcription for BOTH caller and AI.
-    No external Whisper calls needed!
+    ✅ HIGH QUALITY transcripts from response.done for both speakers!
     """
 
     def __init__(self):
@@ -435,55 +432,12 @@ class OpenAIService:
             self._goodbye_watchdog.cancel()
         self._goodbye_watchdog = None
 
-    # --- TRANSCRIPT EXTRACTION (OpenAI Native for BOTH) ---
-    async def extract_caller_transcript(self, event: Dict[str, Any]) -> None:
+    # --- ✅ UNIFIED TRANSCRIPT EXTRACTION (CALLER + AI from response.done) ---
+    async def extract_all_transcripts(self, event: Dict[str, Any]) -> None:
         """
-        Extract CALLER transcript from OpenAI's native transcription.
-        Event: conversation.item.input_audio_transcription.completed
-        
-        ✅ FIX: Filter out noise and ensure proper timing
-        """
-        try:
-            etype = event.get("type", "")
-            
-            if etype == "conversation.item.input_audio_transcription.completed":
-                transcript = event.get("transcript")
-                
-                if not transcript or not isinstance(transcript, str):
-                    return
-                
-                cleaned = transcript.strip()
-                
-                # ✅ FIX: Filter out noise using our validator
-                if not self.transcript_filter.is_valid_transcript(cleaned, "Caller"):
-                    Log.debug(f"[Caller] ❌ Filtered out: '{cleaned}'")
-                    return
-                
-                # ✅ FIX: Ensure sequential timing
-                current_time = time.time()
-                if current_time < self._last_transcript_time.get("Caller", 0):
-                    Log.debug(f"[Caller] ⏭️ Skipped out-of-order transcript")
-                    return
-                
-                self._last_transcript_time["Caller"] = current_time
-                
-                Log.info(f"[Caller] 📝 {cleaned}")
-                
-                if self.caller_transcript_callback:
-                    await self.caller_transcript_callback({
-                        "speaker": "Caller",
-                        "text": cleaned,
-                        "timestamp": int(current_time * 1000)
-                    })
-                    
-        except Exception as e:
-            Log.debug(f"[openai] Caller transcript extract error: {e}")
-
-    async def extract_ai_transcript(self, event: Dict[str, Any]) -> None:
-        """
-        Extract AI transcript from OpenAI's native response.done event.
-        
-        ✅ FIX: Ensure proper timing
+        Extract BOTH Caller and AI transcripts from response.done event.
+        ✅ HIGH QUALITY transcripts for both speakers!
+        This replaces the old separate methods.
         """
         try:
             etype = event.get("type", "")
@@ -494,17 +448,63 @@ class OpenAIService:
             resp = event.get("response") or {}
             output = resp.get("output") or []
             
+            current_time = time.time()
+            
             for item in output:
                 if not isinstance(item, dict):
                     continue
-                    
-                if item.get("type") == "message" and item.get("role") == "assistant":
+                
+                item_type = item.get("type")
+                
+                # ✅ CALLER transcript (from user message with input_audio)
+                if item_type == "message" and item.get("role") == "user":
                     content = item.get("content") or []
                     
                     for c in content:
                         if not isinstance(c, dict):
                             continue
+                        
+                        # This is where HIGH-QUALITY caller transcripts live!
+                        if c.get("type") == "input_audio":
+                            transcript = c.get("transcript")
                             
+                            if not transcript or not isinstance(transcript, str):
+                                continue
+                            
+                            cleaned = transcript.strip()
+                            
+                            if not cleaned:
+                                continue
+                            
+                            # Filter noise
+                            if not self.transcript_filter.is_valid_transcript(cleaned, "Caller"):
+                                Log.debug(f"[Caller] ❌ Filtered: '{cleaned}'")
+                                continue
+                            
+                            # Ensure sequential timing
+                            if current_time < self._last_transcript_time.get("Caller", 0):
+                                Log.debug(f"[Caller] ⏭️ Out-of-order")
+                                continue
+                            
+                            self._last_transcript_time["Caller"] = current_time
+                            
+                            Log.info(f"[Caller] 📝 {cleaned}")
+                            
+                            if self.caller_transcript_callback:
+                                await self.caller_transcript_callback({
+                                    "speaker": "Caller",
+                                    "text": cleaned,
+                                    "timestamp": int(current_time * 1000)
+                                })
+                
+                # ✅ AI transcript (from assistant message with output_audio)
+                elif item_type == "message" and item.get("role") == "assistant":
+                    content = item.get("content") or []
+                    
+                    for c in content:
+                        if not isinstance(c, dict):
+                            continue
+                        
                         if c.get("type") == "output_audio":
                             transcript = c.get("transcript")
                             
@@ -516,11 +516,10 @@ class OpenAIService:
                             if not cleaned:
                                 continue
                             
-                            # ✅ FIX: Ensure sequential timing
-                            current_time = time.time()
+                            # Ensure sequential timing
                             if current_time < self._last_transcript_time.get("AI", 0):
-                                Log.debug(f"[AI] ⏭️ Skipped out-of-order transcript")
-                                return
+                                Log.debug(f"[AI] ⏭️ Out-of-order")
+                                continue
                             
                             self._last_transcript_time["AI"] = current_time
                             
@@ -533,10 +532,11 @@ class OpenAIService:
                                     "timestamp": int(current_time * 1000)
                                 })
                             
+                            # Only process first AI transcript per response
                             return
                                 
         except Exception as e:
-            Log.debug(f"[openai] AI transcript extract error: {e}")
+            Log.debug(f"[openai] Transcript extract error: {e}")
 
     # --- AUDIO EVENTS ---
     def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
