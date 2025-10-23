@@ -43,8 +43,10 @@ class OpenAIEventHandler:
 class OpenAISessionManager:
     """
     Configures and initializes OpenAI Realtime API sessions.
+    Ensures transcription stays in Roman Urdu/Hindi or English,
+    without translation to any other language.
     """
-    
+
     @staticmethod
     def create_session_update() -> Dict[str, Any]:
         """Create a session update message for OpenAI Realtime API."""
@@ -54,28 +56,47 @@ class OpenAISessionManager:
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
                 "output_modalities": ["audio"],
+
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": {"type": "server_vad"},
-                        "transcription": {"model": "gpt-4o-mini-transcribe"} 
+                        "transcription": {
+                            "model": "gpt-4o-mini-transcribe",
+                            "language": "ur"  # 👈 Explicitly force Urdu/Hindi transcription mode
+                        }
                     },
-                    "output": {
-                        "format": {"type": "audio/pcmu"}
-                    }
+                    "output": {"format": {"type": "audio/pcmu"}}
                 },
-                "instructions": Config.SYSTEM_MESSAGE,
+
+                # 👇 Added enhanced instruction block
+                "instructions": (
+                    Config.SYSTEM_MESSAGE
+                    + "\n\n"
+                    "You will receive speech in Urdu/Punjabi mixed with English. "
+                    "Always transcribe it as phonetically accurate Roman Urdu/Punjabi or English words. "
+                    "Do NOT translate or replace with any other language. "
+                    "Preserve natural phrasing — for example, 'mai burger order krna chahta hun' "
+                    "should stay exactly like that, not translated. "
+                    "If unsure of a word, write what you hear phonetically in Roman script."
+                ),
+
                 "tools": [
                     {
                         "type": "function",
                         "name": "end_call",
-                        "description": "Politely end the phone call when the caller says goodbye or requests to end the conversation.",
+                        "description": (
+                            "Politely end the phone call when the caller says goodbye "
+                            "or requests to end the conversation."
+                        ),
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "reason": {
                                     "type": "string",
-                                    "description": "Brief reason for ending, e.g., user said bye."
+                                    "description": (
+                                        "Brief reason for ending, e.g., user said bye."
+                                    )
                                 }
                             },
                             "required": []
