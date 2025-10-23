@@ -75,7 +75,6 @@ class OrderExtractionService:
         if not items:
             return "[]"
         
-        # Sort by item name for consistent comparison
         sorted_items = sorted(items, key=lambda x: str(x.get("item", "")))
         return json.dumps(sorted_items, sort_keys=True)
     
@@ -84,10 +83,7 @@ class OrderExtractionService:
         if not phone or not isinstance(phone, str):
             return False
         
-        # Remove common separators
         cleaned = re.sub(r'[\s\-\(\)]', '', phone)
-        
-        # Must have at least 10 digits
         digits = re.findall(r'\d', cleaned)
         return len(digits) >= 10
     
@@ -96,19 +92,11 @@ class OrderExtractionService:
         if not price or not isinstance(price, str):
             return False
         
-        # Must contain digits
         return bool(re.search(r'\d', price))
     
     async def _extract_order_info(self):
         """
         Extract structured order information using GPT.
-        
-        ✅ KEY FIX: Returns COMPLETE order state each time
-        This allows proper handling of:
-        - Item additions
-        - Item removals
-        - Item corrections
-        - Quantity changes
         """
         try:
             self._last_extraction_time = asyncio.get_event_loop().time()
@@ -132,46 +120,19 @@ CRITICAL RULES:
 6. Ignore background noise, filler words, and unclear statements
 
 Fields to extract:
-- customer_name: Full name (only if clearly stated)
-- phone_number: Phone number in any format (only if clearly stated)
-- delivery_address: Complete address (only if clearly stated)
-- order_items: Array of {"item": "name", "quantity": number, "notes": "optional"}
-  * Return COMPLETE list of current items
-  * If corrected, return corrected version only
-  * If removed, exclude from list
-- special_instructions: Any special requests (only if clearly stated)
-- payment_method: "cash", "card", or "online" (only if clearly stated)
-- delivery_time: Preferred time or "ASAP" (only if clearly stated)
-- total_price: Total amount with currency (only if clearly stated)
+- customer_name
+- phone_number
+- delivery_address
+- order_items (list of {"item": "name", "quantity": number, "notes": "optional"})
+- special_instructions
+- payment_method
+- delivery_time
+- total_price
 
-Examples:
+Return ONLY valid JSON.
+"""
 
-Example 1 (Initial Order):
-Caller: I want 2 chicken biryani
-AI: Noted, 2 chicken biryani. Anything else?
-→ {"order_items": [{"item": "Chicken Biryani", "quantity": 2}]}
-
-Example 2 (Correction):
-Caller: I want 2 chicken biryani
-AI: Noted, 2 chicken biryani
-Caller: Actually, make it 3
-→ {"order_items": [{"item": "Chicken Biryani", "quantity": 3}]}
-
-Example 3 (Removal):
-Caller: I want chicken biryani and cola
-AI: Noted
-Caller: Actually, no cola
-→ {"order_items": [{"item": "Chicken Biryani", "quantity": 1}]}
-
-Example 4 (Addition):
-Caller: I want chicken biryani
-AI: Noted
-Caller: Also add raita
-→ {"order_items": [{"item": "Chicken Biryani", "quantity": 1}, {"item": "Raita", "quantity": 1}]}
-
-Return ONLY valid JSON."""
-            
-            user_prompt = f"""Extract order information from this conversation:\n\n{conversation_text}\n\nReturn JSON only."""
+            user_prompt = f"Extract order information from this conversation:\n\n{conversation_text}\n\nReturn JSON only."
             
             headers = {
                 "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
@@ -206,27 +167,27 @@ Return ONLY valid JSON."""
                         return
 
                     if not data or not isinstance(data, dict):
-                        Log.error(f"[OrderExtraction] Invalid response data type")
+                        Log.error("[OrderExtraction] Invalid response data type")
                         return
 
                     choices = data.get("choices")
-                    if not choices or not isinstance(choices, list) or len(choices) == 0:
-                        Log.error(f"[OrderExtraction] No choices in response")
+                    if not choices or not isinstance(choices, list):
+                        Log.error("[OrderExtraction] No choices in response")
                         return
 
                     first_choice = choices[0]
                     if not isinstance(first_choice, dict):
-                        Log.error(f"[OrderExtraction] Invalid choice format")
+                        Log.error("[OrderExtraction] Invalid choice format")
                         return
 
                     message = first_choice.get("message")
                     if not message or not isinstance(message, dict):
-                        Log.error(f"[OrderExtraction] No message in choice")
+                        Log.error("[OrderExtraction] No message in choice")
                         return
 
                     content = message.get("content", "")
                     if not content or not isinstance(content, str):
-                        Log.error(f"[OrderExtraction] Empty or invalid content")
+                        Log.error("[OrderExtraction] Empty or invalid content")
                         return
 
                     try:
@@ -235,13 +196,11 @@ Return ONLY valid JSON."""
                             content = content.split("```")[1]
                             if content.startswith("json"):
                                 content = content[4:]
-
+                        
                         extracted = json.loads(content.strip())
 
-                        # Prepare dictionary for updates
                         updates = {}
 
-                        # Compare each field and collect only changed/valid data
                         def update_if_changed(key):
                             if extracted.get(key) and extracted[key] != self._current_order.get(key):
                                 self._current_order[key] = extracted[key]
@@ -269,16 +228,18 @@ Return ONLY valid JSON."""
                                 self._current_order["order_items"] = extracted["order_items"]
                                 updates["order_items"] = extracted["order_items"]
 
-                        # Validate price format before updating total
+                        # Validate price format before updating
                         if extracted.get("total_price") and self._is_valid_price(extracted["total_price"]):
                             if extracted["total_price"] != self._current_order.get("total_price"):
                                 self._current_order["total_price"] = extracted["total_price"]
                                 updates["total_price"] = extracted["total_price"]
 
-                        # Send updates only if something changed
                         if updates and self.update_callback:
                             await self.update_callback(updates)
                             Log.info(f"[OrderExtraction] Updated data: {json.dumps(updates, indent=2)}")
 
                     except json.JSONDecodeError as e:
                         Log.error(f"[OrderExtraction] JSON parse error: {e}")
+
+        except Exception as e:
+            Log.error(f"[OrderExtraction] Unexpected error: {e}")
