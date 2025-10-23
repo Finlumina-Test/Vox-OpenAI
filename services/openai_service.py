@@ -148,6 +148,69 @@ class OpenAIConversationManager:
         return current_timestamp - response_start_timestamp
 
 
+class TranscriptFilter:
+    """
+    Filters out low-quality transcripts from OpenAI's native transcription.
+    """
+    
+    # Common noise patterns that OpenAI might transcribe
+    NOISE_PATTERNS = [
+        "thank you",  # Often phantom
+        "thanks",
+        "bye",
+        "okay",
+        "ok",
+        "yeah",
+        "yes",
+        "no",
+        "um",
+        "uh",
+        "hmm",
+        "mhm",
+        "ah",
+    ]
+    
+    # Minimum length for valid transcript
+    MIN_TRANSCRIPT_LENGTH = 3
+    
+    # Maximum length for noise (usually short)
+    MAX_NOISE_LENGTH = 15
+    
+    @staticmethod
+    def is_valid_transcript(text: str, speaker: str) -> bool:
+        """
+        Validate if transcript is real speech or just noise.
+        
+        Rules:
+        1. Must be at least 3 characters
+        2. If very short (< 15 chars) and matches noise patterns, reject
+        3. AI transcripts are always valid (we trust our own output)
+        """
+        if not text or not isinstance(text, str):
+            return False
+        
+        cleaned = text.strip().lower()
+        
+        # Empty or too short
+        if len(cleaned) < TranscriptFilter.MIN_TRANSCRIPT_LENGTH:
+            return False
+        
+        # AI transcripts are always valid
+        if speaker == "AI":
+            return True
+        
+        # For caller: Check if it's a noise pattern
+        if len(cleaned) <= TranscriptFilter.MAX_NOISE_LENGTH:
+            # Check if it matches any noise pattern
+            for pattern in TranscriptFilter.NOISE_PATTERNS:
+                if cleaned == pattern or cleaned.startswith(pattern + " ") or cleaned.endswith(" " + pattern):
+                    Log.debug(f"[Filter] Rejected noise: '{text}'")
+                    return False
+        
+        # Passed all checks
+        return True
+
+
 class OpenAIService:
     """
     Unified service for OpenAI Realtime API.
@@ -159,6 +222,7 @@ class OpenAIService:
         self.session_manager = OpenAISessionManager()
         self.conversation_manager = OpenAIConversationManager()
         self.event_handler = OpenAIEventHandler()
+        self.transcript_filter = TranscriptFilter()
         self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
         self._pending_goodbye: bool = False
         self._goodbye_audio_heard: bool = False
@@ -168,6 +232,9 @@ class OpenAIService:
         # Callbacks for transcripts
         self.caller_transcript_callback: Optional[callable] = None
         self.ai_transcript_callback: Optional[callable] = None
+        
+        # ✅ Track last transcript timestamp per speaker to ensure ordering
+        self._last_transcript_time: Dict[str, float] = {"Caller": 0, "AI": 0}
 
     # --- SESSION & GREETING ---
     async def initialize_session(self, connection_manager) -> None:
@@ -346,24 +413,41 @@ class OpenAIService:
         """
         Extract CALLER transcript from OpenAI's native transcription.
         Event: conversation.item.input_audio_transcription.completed
+        
+        ✅ FIX: Filter out noise and ensure proper timing
         """
         try:
             etype = event.get("type", "")
             
-            # ✅ NEW: Handle caller transcription from OpenAI
             if etype == "conversation.item.input_audio_transcription.completed":
                 transcript = event.get("transcript")
                 
-                if transcript and isinstance(transcript, str) and transcript.strip():
-                    Log.info(f"[Caller] 📝 {transcript}")
-                    
-                    if self.caller_transcript_callback:
-                        await self.caller_transcript_callback({
-                            "speaker": "Caller",
-                            "text": transcript.strip(),
-                            "timestamp": int(time.time() * 1000)
-                        })
+                if not transcript or not isinstance(transcript, str):
                     return
+                
+                cleaned = transcript.strip()
+                
+                # ✅ FIX: Filter out noise using our validator
+                if not self.transcript_filter.is_valid_transcript(cleaned, "Caller"):
+                    Log.debug(f"[Caller] ❌ Filtered out: '{cleaned}'")
+                    return
+                
+                # ✅ FIX: Ensure sequential timing
+                current_time = time.time()
+                if current_time < self._last_transcript_time.get("Caller", 0):
+                    Log.debug(f"[Caller] ⏭️ Skipped out-of-order transcript")
+                    return
+                
+                self._last_transcript_time["Caller"] = current_time
+                
+                Log.info(f"[Caller] 📝 {cleaned}")
+                
+                if self.caller_transcript_callback:
+                    await self.caller_transcript_callback({
+                        "speaker": "Caller",
+                        "text": cleaned,
+                        "timestamp": int(current_time * 1000)
+                    })
                     
         except Exception as e:
             Log.debug(f"[openai] Caller transcript extract error: {e}")
@@ -371,6 +455,8 @@ class OpenAIService:
     async def extract_ai_transcript(self, event: Dict[str, Any]) -> None:
         """
         Extract AI transcript from OpenAI's native response.done event.
+        
+        ✅ FIX: Ensure proper timing
         """
         try:
             etype = event.get("type", "")
@@ -395,17 +481,32 @@ class OpenAIService:
                         if c.get("type") == "output_audio":
                             transcript = c.get("transcript")
                             
-                            if transcript and isinstance(transcript, str) and transcript.strip():
-                                Log.info(f"[AI] 📝 {transcript}")
-                                
-                                if self.ai_transcript_callback:
-                                    await self.ai_transcript_callback({
-                                        "speaker": "AI",
-                                        "text": transcript.strip(),
-                                        "timestamp": int(time.time() * 1000)
-                                    })
-                                
+                            if not transcript or not isinstance(transcript, str):
+                                continue
+                            
+                            cleaned = transcript.strip()
+                            
+                            if not cleaned:
+                                continue
+                            
+                            # ✅ FIX: Ensure sequential timing
+                            current_time = time.time()
+                            if current_time < self._last_transcript_time.get("AI", 0):
+                                Log.debug(f"[AI] ⏭️ Skipped out-of-order transcript")
                                 return
+                            
+                            self._last_transcript_time["AI"] = current_time
+                            
+                            Log.info(f"[AI] 📝 {cleaned}")
+                            
+                            if self.ai_transcript_callback:
+                                await self.ai_transcript_callback({
+                                    "speaker": "AI",
+                                    "text": cleaned,
+                                    "timestamp": int(current_time * 1000)
+                                })
+                            
+                            return
                                 
         except Exception as e:
             Log.debug(f"[openai] AI transcript extract error: {e}")
