@@ -291,7 +291,8 @@ async def handle_media_stream(websocket: WebSocket):
         async def handle_other_openai_event(response: dict):
             """Handle other OpenAI events (transcription, etc)."""
             openai_service.process_event_for_logging(response)
-            await openai_service.extract_all_transcripts(response) 
+            await openai_service.extract_caller_transcript(response)
+            await openai_service.extract_ai_transcript(response) 
        
         async def openai_receiver():
             """Receive and process OpenAI events."""
