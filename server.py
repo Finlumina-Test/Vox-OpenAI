@@ -105,6 +105,7 @@ async def index_page():
 async def handle_incoming_call(request: Request):
     return TwilioService.create_incoming_call_response(request)
 
+
 # ---------------------------
 # Dashboard websocket
 # ---------------------------
@@ -203,14 +204,14 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
                         connection_manager
                     )
                     
-                    # ✅ Broadcast as "Human" speaker
-                    broadcast_to_dashboards_nonblocking({
-                        "messageType": "audio",
-                        "speaker": "Human",
-                        "audio": audio_base64,
-                        "timestamp": int(time.time() * 1000),
-                        "callSid": call_sid
-                    }, call_sid)
+                    # ✅ DO NOT BROADCAST - Dashboard shouldn't hear itself
+                    # broadcast_to_dashboards_nonblocking({
+                    #     "messageType": "audio",
+                    #     "speaker": "Human",
+                    #     "audio": audio_base64,
+                    #     "timestamp": int(time.time() * 1000),
+                    #     "callSid": call_sid
+                    # }, call_sid)
                     
     except WebSocketDisconnect:
         Log.info(f"[HumanAudio] Disconnected for call {call_sid}")
@@ -240,17 +241,6 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
             }, call_sid)
 
 
-# ---------------------------
-# Health endpoint
-# ---------------------------
-@app.get("/", response_class=JSONResponse)
-async def index_page():
-    return {"message": "Twilio Media Stream Server is running!"}
-
-
-# ---------------------------
-# Twilio incoming-call TwiML
-# ---------------------------
 @app.api_route("/takeover", methods=["POST"])
 async def handle_takeover(request: Request):
     """Handle human takeover requests from dashboard."""
