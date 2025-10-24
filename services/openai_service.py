@@ -269,6 +269,10 @@ class TranscriptFilter:
         if len(cleaned) < TranscriptFilter.MIN_TRANSCRIPT_LENGTH:
             return False
         
+        # ✅ Allow all Human transcripts through
+        if speaker == "Human":
+            return True
+        
         if speaker == "AI":
             return True
         
@@ -302,11 +306,12 @@ class OpenAIService:
         # Callbacks
         self.caller_transcript_callback: Optional[callable] = None
         self.ai_transcript_callback: Optional[callable] = None
+        self.human_transcript_callback: Optional[callable] = None  # ✅ NEW
         
         # Track last transcript timestamp
         self._last_transcript_time: Dict[str, float] = {"Caller": 0, "AI": 0, "Human": 0}
         
-        # ✅ NEW: Human takeover state
+        # Human takeover state
         self.human_takeover_active: bool = False
         self.human_audio_callback: Optional[callable] = None
 
@@ -348,9 +353,66 @@ class OpenAIService:
                     "type": "input_audio_buffer.append",
                     "audio": audio_base64
                 })
-                Log.debug("[HumanAudio] Sent to OpenAI for context")
+                
+                # ✅ Manually commit the audio for transcription
+                await connection_manager.send_to_openai({
+                    "type": "input_audio_buffer.commit"
+                })
+                
+                Log.debug("[HumanAudio] Sent to OpenAI for transcription")
         except Exception as e:
             Log.error(f"Failed to send human audio to OpenAI: {e}")
+
+    # ✅ NEW: Extract human agent transcript
+    async def extract_human_transcript(self, event: Dict[str, Any]) -> None:
+        """
+        Extract HUMAN agent transcript from OpenAI transcription.
+        Only triggered when human is in control.
+        """
+        try:
+            if not self.is_human_in_control():
+                return
+            
+            etype = event.get("type", "")
+            
+            if etype == "conversation.item.input_audio_transcription.completed":
+                transcript = event.get("transcript")
+                
+                if not transcript or not isinstance(transcript, str):
+                    return
+                
+                cleaned = transcript.strip()
+                
+                if not cleaned:
+                    return
+                
+                # ✅ Convert to Roman script if needed
+                roman_text = await self.roman_converter.convert_to_roman(cleaned)
+                
+                # Filter noise
+                if not self.transcript_filter.is_valid_transcript(roman_text, "Human"):
+                    Log.debug(f"[Human] ❌ Filtered: '{roman_text}'")
+                    return
+                
+                # Ensure sequential timing
+                current_time = time.time()
+                if current_time < self._last_transcript_time.get("Human", 0):
+                    Log.debug(f"[Human] ⏭️ Out-of-order")
+                    return
+                
+                self._last_transcript_time["Human"] = current_time
+                
+                Log.info(f"[Human Agent] 📝 {roman_text}")
+                
+                if self.human_transcript_callback:
+                    await self.human_transcript_callback({
+                        "speaker": "Human",
+                        "text": roman_text,
+                        "timestamp": int(current_time * 1000)
+                    })
+                    
+        except Exception as e:
+            Log.error(f"[Human] Transcript error: {e}")
 
     # --- EVENT LOGGING & TOOL CALLS ---
     def process_event_for_logging(self, event: Dict[str, Any]) -> None:
@@ -518,6 +580,11 @@ class OpenAIService:
         Extract CALLER transcript and convert to Roman script if needed.
         """
         try:
+            # ✅ During human takeover, treat transcripts as Human
+            if self.is_human_in_control():
+                await self.extract_human_transcript(event)
+                return
+            
             etype = event.get("type", "")
             
             if etype == "conversation.item.input_audio_transcription.completed":
