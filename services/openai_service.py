@@ -336,6 +336,8 @@ class OpenAIService:
     def disable_human_takeover(self):
         """Disable human takeover mode - AI resumes."""
         self._human_takeover_active = False
+        # ✅ Reset transcript timing to prevent issues
+        self._last_transcript_time = {"Caller": 0, "AI": 0, "Human": 0}
         Log.info("[Takeover] Human takeover DISABLED - AI will resume")
     
     def is_human_in_control(self) -> bool:
