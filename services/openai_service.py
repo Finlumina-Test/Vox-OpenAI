@@ -295,6 +295,7 @@ class OpenAIService:
         self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
         self._pending_goodbye: bool = False
         self._goodbye_audio_heard: bool = False
+        self._human_takeover_active = False
         self._goodbye_item_id: Optional[str] = None
         self._goodbye_watchdog: Optional[asyncio.Task] = None
         
@@ -322,38 +323,34 @@ class OpenAIService:
         await connection_manager.send_to_openai(response_trigger)
 
     # --- HUMAN TAKEOVER ---
-    def enable_human_takeover(self) -> None:
+    def enable_human_takeover(self):
         """Enable human takeover mode - AI stops responding."""
-        self.human_takeover_active = True
-        Log.info("🎤 Human takeover ENABLED")
+        self._human_takeover_active = True
+        Log.info("[Takeover] Human takeover ENABLED - AI will not respond")
     
-    def disable_human_takeover(self) -> None:
+    def disable_human_takeover(self):
         """Disable human takeover mode - AI resumes."""
-        self.human_takeover_active = False
-        Log.info("🤖 Human takeover DISABLED - AI resumed")
+        self._human_takeover_active = False
+        Log.info("[Takeover] Human takeover DISABLED - AI will resume")
     
     def is_human_in_control(self) -> bool:
-        """Check if human is currently controlling the call."""
-        return self.human_takeover_active
+        """Check if human agent has taken over the call."""
+        return getattr(self, '_human_takeover_active', False)
     
-    async def send_human_audio_to_openai(self, audio_base64: str, connection_manager) -> None:
+    async def send_human_audio_to_openai(self, audio_base64: str, connection_manager):
         """
-        Send human agent's audio to OpenAI (so it gets transcribed and processed).
+        Send human agent audio to OpenAI for transcription/context.
+        This keeps OpenAI aware of the conversation even during human takeover.
         """
         try:
-            if not self.human_takeover_active:
-                Log.debug("[Human] Takeover not active, ignoring audio")
-                return
-            
-            # Send audio to OpenAI's input buffer
-            audio_message = {
-                "type": "input_audio_buffer.append",
-                "audio": audio_base64
-            }
-            await connection_manager.send_to_openai(audio_message)
-            
+            if connection_manager.is_openai_connected():
+                await connection_manager.send_to_openai({
+                    "type": "input_audio_buffer.append",
+                    "audio": audio_base64
+                })
+                Log.debug("[HumanAudio] Sent to OpenAI for context")
         except Exception as e:
-            Log.error(f"[Human] Audio send error: {e}")
+            Log.error(f"Failed to send human audio to OpenAI: {e}")
 
     # --- EVENT LOGGING & TOOL CALLS ---
     def process_event_for_logging(self, event: Dict[str, Any]) -> None:
