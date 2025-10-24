@@ -129,7 +129,7 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio", "text"],
+                "output_modalities": ["audio"],
 
                 "audio": {
                     "input": {
