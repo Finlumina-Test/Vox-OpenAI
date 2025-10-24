@@ -61,7 +61,7 @@ class OpenAISessionManager:
                         "turn_detection": {"type": "server_vad"},
                         # ✅ KEEP transcription config for input_audio_transcription.completed events
                         "transcription": {
-                            "model": "whisper-1",
+                            "model": "gpt-4o-mini-transcribe",
                         }
                     },
                     "output": {"format": {"type": "audio/pcmu"}}
