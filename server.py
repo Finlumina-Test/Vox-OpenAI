@@ -1,4 +1,4 @@
-# server.py - Fixed Human Takeover Implementation
+# server.py - Fixed Human Takeover with Audio Routing
 import os
 import json
 import time
@@ -138,7 +138,7 @@ async def dashboard_stream(websocket: WebSocket):
 async def human_audio_stream(websocket: WebSocket, call_sid: str):
     """
     WebSocket endpoint for human agent audio.
-    Streams directly to Twilio for real-time caller experience.
+    Streams directly to Twilio AND receives caller audio.
     """
     await websocket.accept()
     
@@ -156,6 +156,9 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
         Log.error(f"[HumanAudio] Services not available for call {call_sid}")
         await websocket.close(code=4005, reason="Services not available")
         return
+    
+    # ✅ Store human audio websocket for routing caller audio
+    active_calls[call_sid]["human_audio_ws"] = websocket
     
     try:
         while True:
@@ -179,13 +182,13 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
                         await connection_manager.send_to_twilio(twilio_message)
                         Log.debug(f"[HumanAudio] Sent audio to Twilio")
                     
-                    # Also send to OpenAI for transcription/context
+                    # ✅ Send to OpenAI with Human context
                     await openai_service.send_human_audio_to_openai(
                         audio_base64,
                         connection_manager
                     )
                     
-                    # Broadcast to dashboard for monitoring
+                    # ✅ Broadcast as "Human" speaker
                     broadcast_to_dashboards_nonblocking({
                         "messageType": "audio",
                         "speaker": "Human",
@@ -199,6 +202,10 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
     except Exception as e:
         Log.error(f"[HumanAudio] Error: {e}")
     finally:
+        # ✅ Remove reference
+        if call_sid in active_calls and "human_audio_ws" in active_calls[call_sid]:
+            del active_calls[call_sid]["human_audio_ws"]
+        
         # ✅ Notify OpenAI to resume when human disconnects
         if openai_service and openai_service.is_human_in_control():
             openai_service.disable_human_takeover()
@@ -268,6 +275,15 @@ async def handle_takeover(request: Request):
                 Log.info(f"[Takeover] Cancelled AI response for call {call_sid}")
             except Exception as e:
                 Log.error(f"Failed to cancel AI response: {e}")
+            
+            # ✅ Clear input audio buffer to prevent AI from responding to old audio
+            try:
+                await connection_manager.send_to_openai({
+                    "type": "input_audio_buffer.clear"
+                })
+                Log.info(f"[Takeover] Cleared input buffer for call {call_sid}")
+            except Exception as e:
+                Log.error(f"Failed to clear buffer: {e}")
             
             Log.info(f"[Takeover] ✅ ENABLED for call {call_sid}")
             
@@ -345,6 +361,11 @@ async def handle_media_stream(websocket: WebSocket):
         if not speaker or not text:
             return
         
+        # ✅ Skip AI transcripts during human takeover
+        if speaker == "AI" and openai_service.is_human_in_control():
+            Log.debug(f"[Transcript] Skipping AI transcript during takeover: {text[:50]}")
+            return
+        
         payload = {
             "messageType": "transcription",
             "speaker": speaker,
@@ -384,8 +405,31 @@ async def handle_media_stream(websocket: WebSocket):
                 media = data.get("media") or {}
                 payload_b64 = media.get("payload")
                 if payload_b64:
-                    # ✅ Don't send caller audio to OpenAI during human takeover
-                    if not openai_service.is_human_in_control():
+                    # ✅ During takeover: route caller audio to human agent
+                    if openai_service.is_human_in_control():
+                        Log.debug("[media] Human takeover active - routing caller audio to human")
+                        
+                        # Send to human audio websocket
+                        if current_call_sid and current_call_sid in active_calls:
+                            human_ws = active_calls[current_call_sid].get("human_audio_ws")
+                            if human_ws:
+                                try:
+                                    await human_ws.send_text(json.dumps({
+                                        "type": "caller_audio",
+                                        "audio": payload_b64,
+                                        "timestamp": int(time.time() * 1000)
+                                    }))
+                                    Log.debug("[media] Sent caller audio to human agent")
+                                except Exception as e:
+                                    Log.error(f"[media] Failed to send to human: {e}")
+                        
+                        # Still stream to dashboard for monitoring
+                        try:
+                            await transcription_service.stream_audio_chunk(payload_b64, source="Caller")
+                        except Exception as e:
+                            Log.error(f"[media] failed to stream caller audio: {e}")
+                    else:
+                        # Normal mode: send to OpenAI
                         if connection_manager.is_openai_connected():
                             try:
                                 audio_message = audio_service.process_incoming_audio(data)
@@ -393,14 +437,12 @@ async def handle_media_stream(websocket: WebSocket):
                                     await connection_manager.send_to_openai(audio_message)
                             except Exception as e:
                                 Log.error(f"[media] failed to send to OpenAI: {e}")
-                    else:
-                        Log.debug("[media] Skipping caller audio - human takeover active")
-                    
-                    # Stream caller audio to dashboard
-                    try:
-                        await transcription_service.stream_audio_chunk(payload_b64, source="Caller")
-                    except Exception as e:
-                        Log.error(f"[media] failed to stream caller audio: {e}")
+                        
+                        # Stream caller audio to dashboard
+                        try:
+                            await transcription_service.stream_audio_chunk(payload_b64, source="Caller")
+                        except Exception as e:
+                            Log.error(f"[media] failed to stream caller audio: {e}")
 
         async def handle_audio_delta(response: dict):
             """Handle audio response from OpenAI."""
@@ -451,7 +493,12 @@ async def handle_media_stream(websocket: WebSocket):
             """Handle other OpenAI events."""
             openai_service.process_event_for_logging(response)
             await openai_service.extract_caller_transcript(response)
-            await openai_service.extract_ai_transcript(response)
+            
+            # ✅ Only extract AI transcripts if NOT in takeover mode
+            if not openai_service.is_human_in_control():
+                await openai_service.extract_ai_transcript(response)
+            else:
+                Log.debug("[OpenAI] Skipping AI transcript extraction - human takeover active")
        
         async def openai_receiver():
             """Receive and process OpenAI events."""
@@ -486,7 +533,8 @@ async def handle_media_stream(websocket: WebSocket):
                 "connection_manager": connection_manager,
                 "audio_service": audio_service,
                 "transcription_service": transcription_service,
-                "order_extractor": order_extractor
+                "order_extractor": order_extractor,
+                "human_audio_ws": None  # Will be set when human connects
             }
             Log.info(f"[ActiveCalls] Registered call {current_call_sid}")
 
