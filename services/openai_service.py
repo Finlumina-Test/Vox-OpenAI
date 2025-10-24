@@ -40,6 +40,82 @@ class OpenAIEventHandler:
         return event.get('item_id')
 
 
+class RomanScriptConverter:
+    """
+    Converts Hindi/Urdu script transcripts to Roman (Latin) script.
+    Uses GPT to transliterate while preserving pronunciation.
+    """
+    
+    @staticmethod
+    async def convert_to_roman(text: str) -> str:
+        """
+        Convert Urdu/Hindi script text to Roman script.
+        
+        If text is already in Roman script, returns as-is.
+        If text contains Urdu/Hindi script, converts to Roman.
+        """
+        try:
+            # Check if text contains Urdu/Hindi characters
+            has_urdu_hindi = any('\u0600' <= char <= '\u06FF' or '\u0900' <= char <= '\u097F' for char in text)
+            
+            if not has_urdu_hindi:
+                # Already in Roman script
+                return text
+            
+            Log.info(f"[Roman] Converting: {text}")
+            
+            # Use GPT to transliterate
+            import aiohttp
+            
+            system_prompt = """You are a transliteration expert. Convert Urdu/Hindi script text to Roman (Latin) script while preserving the exact pronunciation.
+
+Rules:
+- Write EXACTLY how it sounds in Roman letters
+- Do NOT translate meanings
+- Keep it phonetically accurate
+- Use casual/conversational spelling
+
+Examples:
+- آج میں نے برگر کھانا ہے → aaj maine burger khana hai
+- دو زنگر برگر دے دینا → do zinger burger de dena
+- ٹھیک ہے → theek hai"""
+
+            headers = {
+                "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+
+            payload = {
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Transliterate to Roman script: {text}"}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 100
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=3)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        roman_text = data['choices'][0]['message']['content'].strip()
+                        Log.info(f"[Roman] ✅ Converted to: {roman_text}")
+                        return roman_text
+                    else:
+                        Log.error(f"[Roman] API failed: {resp.status}")
+                        return text
+                        
+        except Exception as e:
+            Log.error(f"[Roman] Conversion error: {e}")
+            return text
+
+
 class OpenAISessionManager:
     """
     Configures and initializes OpenAI Realtime API sessions.
@@ -53,15 +129,14 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio"],  # ✅ Include text for transcripts
+                "output_modalities": ["audio", "text"],
 
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": {"type": "server_vad"},
-                        # ✅ KEEP transcription config for input_audio_transcription.completed events
                         "transcription": {
-                            "model": "gpt-4o-mini-transcribe",
+                            "model": "whisper-1",
                         }
                     },
                     "output": {"format": {"type": "audio/pcmu"}}
@@ -69,17 +144,7 @@ class OpenAISessionManager:
 
                 "instructions": (
                     Config.SYSTEM_MESSAGE
-                    + "\n\n"
-                    "### TRANSCRIPTION RULES ###\n"
-                    "You will receive speech in Urdu or Punjabi mixed with English.\n"
-                    "Always transcribe it **in English (Roman) script**, preserving the natural sounds.\n"
-                    "Do NOT translate or write in Urdu or Punjabi script.\n"
-                    "For example:\n"
-                    "  - If the caller says 'آج میں نے برگر کھانا ہے', write: 'aaj maine burger khana hai'.\n"
-                    "  - If the caller says 'دو زنگر برگر دے دینا', write: 'do zinger burger de dena'.\n"
-                    "  - If the caller says 'I want one zinger burger', write exactly that.\n"
-                    "If unsure of a word, write what you hear phonetically in Roman letters.\n"
-                    "Keep the style casual and conversational — just as it's spoken."
+                    + "\n\nRespond naturally to customer queries about orders, menu items, and delivery."
                 ),
 
                 "tools": [
@@ -218,8 +283,7 @@ class TranscriptFilter:
 
 class OpenAIService:
     """
-    Unified service for OpenAI Realtime API.
-    Uses OpenAI's native transcription for BOTH caller and AI.
+    Unified service for OpenAI Realtime API with human takeover support.
     """
 
     def __init__(self):
@@ -227,18 +291,23 @@ class OpenAIService:
         self.conversation_manager = OpenAIConversationManager()
         self.event_handler = OpenAIEventHandler()
         self.transcript_filter = TranscriptFilter()
+        self.roman_converter = RomanScriptConverter()
         self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
         self._pending_goodbye: bool = False
         self._goodbye_audio_heard: bool = False
         self._goodbye_item_id: Optional[str] = None
         self._goodbye_watchdog: Optional[asyncio.Task] = None
         
-        # Callbacks for transcripts
+        # Callbacks
         self.caller_transcript_callback: Optional[callable] = None
         self.ai_transcript_callback: Optional[callable] = None
         
-        # Track last transcript timestamp per speaker
-        self._last_transcript_time: Dict[str, float] = {"Caller": 0, "AI": 0}
+        # Track last transcript timestamp
+        self._last_transcript_time: Dict[str, float] = {"Caller": 0, "AI": 0, "Human": 0}
+        
+        # ✅ NEW: Human takeover state
+        self.human_takeover_active: bool = False
+        self.human_audio_callback: Optional[callable] = None
 
     # --- SESSION & GREETING ---
     async def initialize_session(self, connection_manager) -> None:
@@ -251,6 +320,40 @@ class OpenAIService:
         response_trigger = self.session_manager.create_response_trigger()
         await connection_manager.send_to_openai(initial_item)
         await connection_manager.send_to_openai(response_trigger)
+
+    # --- HUMAN TAKEOVER ---
+    def enable_human_takeover(self) -> None:
+        """Enable human takeover mode - AI stops responding."""
+        self.human_takeover_active = True
+        Log.info("🎤 Human takeover ENABLED")
+    
+    def disable_human_takeover(self) -> None:
+        """Disable human takeover mode - AI resumes."""
+        self.human_takeover_active = False
+        Log.info("🤖 Human takeover DISABLED - AI resumed")
+    
+    def is_human_in_control(self) -> bool:
+        """Check if human is currently controlling the call."""
+        return self.human_takeover_active
+    
+    async def send_human_audio_to_openai(self, audio_base64: str, connection_manager) -> None:
+        """
+        Send human agent's audio to OpenAI (so it gets transcribed and processed).
+        """
+        try:
+            if not self.human_takeover_active:
+                Log.debug("[Human] Takeover not active, ignoring audio")
+                return
+            
+            # Send audio to OpenAI's input buffer
+            audio_message = {
+                "type": "input_audio_buffer.append",
+                "audio": audio_base64
+            }
+            await connection_manager.send_to_openai(audio_message)
+            
+        except Exception as e:
+            Log.error(f"[Human] Audio send error: {e}")
 
     # --- EVENT LOGGING & TOOL CALLS ---
     def process_event_for_logging(self, event: Dict[str, Any]) -> None:
@@ -412,32 +515,31 @@ class OpenAIService:
             self._goodbye_watchdog.cancel()
         self._goodbye_watchdog = None
 
-    # --- TRANSCRIPT EXTRACTION (Using input_audio_transcription.completed) ---
+    # --- TRANSCRIPT EXTRACTION WITH ROMAN CONVERSION ---
     async def extract_caller_transcript(self, event: Dict[str, Any]) -> None:
         """
-        Extract CALLER transcript from conversation.item.input_audio_transcription.completed
-        ✅ This event fires reliably for caller speech
+        Extract CALLER transcript and convert to Roman script if needed.
         """
         try:
             etype = event.get("type", "")
             
-            # ✅ Use the CORRECT event type
             if etype == "conversation.item.input_audio_transcription.completed":
                 transcript = event.get("transcript")
                 
                 if not transcript or not isinstance(transcript, str):
-                    Log.debug("[Caller] No transcript in event")
                     return
                 
                 cleaned = transcript.strip()
                 
                 if not cleaned:
-                    Log.debug("[Caller] Empty transcript")
                     return
                 
+                # ✅ Convert to Roman script if needed
+                roman_text = await self.roman_converter.convert_to_roman(cleaned)
+                
                 # Filter noise
-                if not self.transcript_filter.is_valid_transcript(cleaned, "Caller"):
-                    Log.debug(f"[Caller] ❌ Filtered: '{cleaned}'")
+                if not self.transcript_filter.is_valid_transcript(roman_text, "Caller"):
+                    Log.debug(f"[Caller] ❌ Filtered: '{roman_text}'")
                     return
                 
                 # Ensure sequential timing
@@ -448,12 +550,12 @@ class OpenAIService:
                 
                 self._last_transcript_time["Caller"] = current_time
                 
-                Log.info(f"[Caller] 📝 {cleaned}")
+                Log.info(f"[Caller] 📝 {roman_text}")
                 
                 if self.caller_transcript_callback:
                     await self.caller_transcript_callback({
                         "speaker": "Caller",
-                        "text": cleaned,
+                        "text": roman_text,
                         "timestamp": int(current_time * 1000)
                     })
                     
@@ -461,10 +563,7 @@ class OpenAIService:
             Log.error(f"[Caller] Transcript error: {e}")
 
     async def extract_ai_transcript(self, event: Dict[str, Any]) -> None:
-        """
-        Extract AI transcript from response.done event
-        ✅ This works perfectly for AI responses
-        """
+        """Extract AI transcript from response.done event."""
         try:
             etype = event.get("type", "")
             
@@ -496,7 +595,6 @@ class OpenAIService:
                             if not cleaned:
                                 continue
                             
-                            # Ensure sequential timing
                             current_time = time.time()
                             if current_time < self._last_transcript_time.get("AI", 0):
                                 Log.debug(f"[AI] ⏭️ Out-of-order")
