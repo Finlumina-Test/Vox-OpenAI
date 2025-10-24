@@ -43,11 +43,6 @@ class OpenAIEventHandler:
 class OpenAISessionManager:
     """
     Configures and initializes OpenAI Realtime API sessions.
-    
-    🔥 TRANSCRIPTION FIX:
-    - NO language parameter = Forces phonetic Roman transcription
-    - Caller speaks Urdu/Punjabi → Transcribed as "aaj mein burger khana hai"
-    - NOT as "آج میں برگر کھانا ہے"
     """
 
     @staticmethod
@@ -58,48 +53,33 @@ class OpenAISessionManager:
             "session": {
                 "type": "realtime",
                 "model": "gpt-realtime-mini-2025-10-06",
-                "output_modalities": ["audio"],  # Text comes automatically with audio
+                "output_modalities": ["audio"],  # ✅ Include text for transcripts
 
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": {"type": "server_vad"},
+                        # ✅ KEEP transcription config for input_audio_transcription.completed events
                         "transcription": {
-                            "model": "gpt-4o-mini-transcribe"
-                            # 🔥 CRITICAL: NO "language" parameter!
-                            # Setting language="en" causes Urdu to be written in Urdu script
-                            # Omitting it = OpenAI writes phonetically in Roman/Latin letters
+                            "model": "whisper-1",
                         }
                     },
                     "output": {"format": {"type": "audio/pcmu"}}
                 },
 
                 "instructions": (
-                    f"{Config.SYSTEM_MESSAGE}\n\n"
-                    "### LANGUAGE HANDLING ###\n\n"
-                    
-                    "🎯 INPUT LANGUAGE:\n"
-                    "- Caller speaks Urdu, Punjabi, or mixed English\n"
-                    "- Transcripts are in Roman/Latin script (English letters)\n"
-                    "- Example: 'mera naam Ali hai' NOT 'میرا نام علی ہے'\n"
-                    "- Example: 'do zinger burger chahiye'\n"
-                    "- Example: 'I want one pizza'\n\n"
-                    
-                    "🗣️ YOUR RESPONSES:\n"
-                    "- Respond in the SAME language as caller\n"
-                    "- If caller speaks Roman Urdu/Punjabi, respond in Roman Urdu/Punjabi\n"
-                    "- If caller speaks English, respond in English\n"
-                    "- Be conversational, friendly, natural\n\n"
-                    
-                    "EXAMPLES:\n"
-                    "Caller: 'mujhe burger chahiye'\n"
-                    "You: 'Bilkul! Konsa burger chahiye?'\n\n"
-                    
-                    "Caller: 'zinger burger'\n"
-                    "You: 'Perfect! Kitne zinger burger?'\n\n"
-                    
-                    "Caller: 'I want two'\n"
-                    "You: 'Great! Two zinger burgers. Anything else?'\n"
+                    Config.SYSTEM_MESSAGE
+                    + "\n\n"
+                    "### TRANSCRIPTION RULES ###\n"
+                    "You will receive speech in Urdu or Punjabi mixed with English.\n"
+                    "Always transcribe it **in English (Roman) script**, preserving the natural sounds.\n"
+                    "Do NOT translate or write in Urdu or Punjabi script.\n"
+                    "For example:\n"
+                    "  - If the caller says 'آج میں نے برگر کھانا ہے', write: 'aaj maine burger khana hai'.\n"
+                    "  - If the caller says 'دو زنگر برگر دے دینا', write: 'do zinger burger de dena'.\n"
+                    "  - If the caller says 'I want one zinger burger', write exactly that.\n"
+                    "If unsure of a word, write what you hear phonetically in Roman letters.\n"
+                    "Keep the style casual and conversational — just as it's spoken."
                 ),
 
                 "tools": [
@@ -125,6 +105,7 @@ class OpenAISessionManager:
             }
         }
         return session
+
 
     @staticmethod
     def create_initial_conversation_item() -> Dict[str, Any]:
@@ -214,9 +195,7 @@ class TranscriptFilter:
     
     @staticmethod
     def is_valid_transcript(text: str, speaker: str) -> bool:
-        """
-        Validate if transcript is real speech or just noise.
-        """
+        """Validate if transcript is real speech or just noise."""
         if not text or not isinstance(text, str):
             return False
         
@@ -225,11 +204,9 @@ class TranscriptFilter:
         if len(cleaned) < TranscriptFilter.MIN_TRANSCRIPT_LENGTH:
             return False
         
-        # AI transcripts are always valid
         if speaker == "AI":
             return True
         
-        # For caller: Check if it's a noise pattern
         if len(cleaned) <= TranscriptFilter.MAX_NOISE_LENGTH:
             for pattern in TranscriptFilter.NOISE_PATTERNS:
                 if cleaned == pattern or cleaned.startswith(pattern + " ") or cleaned.endswith(" " + pattern):
@@ -242,10 +219,7 @@ class TranscriptFilter:
 class OpenAIService:
     """
     Unified service for OpenAI Realtime API.
-    
-    🔥 TRANSCRIPTION SOURCES (response.done event):
-    1. Caller: output[type=message,role=user] -> content[type=input_audio].transcript
-    2. AI: output[type=message,role=assistant] -> content[type=output_audio].transcript
+    Uses OpenAI's native transcription for BOTH caller and AI.
     """
 
     def __init__(self):
@@ -438,22 +412,61 @@ class OpenAIService:
             self._goodbye_watchdog.cancel()
         self._goodbye_watchdog = None
 
-    # --- 🔥 UNIFIED TRANSCRIPT EXTRACTION FROM response.done ---
-    async def extract_all_transcripts(self, event: Dict[str, Any]) -> None:
+    # --- TRANSCRIPT EXTRACTION (Using input_audio_transcription.completed) ---
+    async def extract_caller_transcript(self, event: Dict[str, Any]) -> None:
         """
-        Extract BOTH Caller and AI transcripts from response.done event.
-        
-        🔥 DEBUG MODE ENABLED - Will log everything!
+        Extract CALLER transcript from conversation.item.input_audio_transcription.completed
+        ✅ This event fires reliably for caller speech
         """
         try:
             etype = event.get("type", "")
             
-            # 🔥 DEBUG: Log ALL response.done events
-            if etype == "response.done":
-                Log.info(f"[DEBUG] 🎯 Got response.done event")
-                resp = event.get("response") or {}
-                output = resp.get("output") or []
-                Log.info(f"[DEBUG] Output items count: {len(output)}")
+            # ✅ Use the CORRECT event type
+            if etype == "conversation.item.input_audio_transcription.completed":
+                transcript = event.get("transcript")
+                
+                if not transcript or not isinstance(transcript, str):
+                    Log.debug("[Caller] No transcript in event")
+                    return
+                
+                cleaned = transcript.strip()
+                
+                if not cleaned:
+                    Log.debug("[Caller] Empty transcript")
+                    return
+                
+                # Filter noise
+                if not self.transcript_filter.is_valid_transcript(cleaned, "Caller"):
+                    Log.debug(f"[Caller] ❌ Filtered: '{cleaned}'")
+                    return
+                
+                # Ensure sequential timing
+                current_time = time.time()
+                if current_time < self._last_transcript_time.get("Caller", 0):
+                    Log.debug(f"[Caller] ⏭️ Out-of-order")
+                    return
+                
+                self._last_transcript_time["Caller"] = current_time
+                
+                Log.info(f"[Caller] 📝 {cleaned}")
+                
+                if self.caller_transcript_callback:
+                    await self.caller_transcript_callback({
+                        "speaker": "Caller",
+                        "text": cleaned,
+                        "timestamp": int(current_time * 1000)
+                    })
+                    
+        except Exception as e:
+            Log.error(f"[Caller] Transcript error: {e}")
+
+    async def extract_ai_transcript(self, event: Dict[str, Any]) -> None:
+        """
+        Extract AI transcript from response.done event
+        ✅ This works perfectly for AI responses
+        """
+        try:
+            etype = event.get("type", "")
             
             if etype != "response.done":
                 return
@@ -461,98 +474,33 @@ class OpenAIService:
             resp = event.get("response") or {}
             output = resp.get("output") or []
             
-            current_time = time.time()
-            
-            for idx, item in enumerate(output):
+            for item in output:
                 if not isinstance(item, dict):
                     continue
-                
-                item_type = item.get("type")
-                item_role = item.get("role")
-                
-                # 🔥 DEBUG: Log each item
-                Log.info(f"[DEBUG] Item {idx}: type={item_type}, role={item_role}")
-                
-                # 🔥 CALLER TRANSCRIPT (user message with input_audio)
-                if item_type == "message" and item_role == "user":
-                    content = item.get("content") or []
-                    Log.info(f"[DEBUG] 👤 Found USER message, content items: {len(content)}")
                     
-                    for c_idx, c in enumerate(content):
+                if item.get("type") == "message" and item.get("role") == "assistant":
+                    content = item.get("content") or []
+                    
+                    for c in content:
                         if not isinstance(c, dict):
                             continue
-                        
-                        c_type = c.get("type")
-                        Log.info(f"[DEBUG] Content {c_idx}: type={c_type}")
-                        
-                        # This is where OpenAI puts caller transcripts!
-                        if c_type == "input_audio":
+                            
+                        if c.get("type") == "output_audio":
                             transcript = c.get("transcript")
-                            Log.info(f"[DEBUG] 🎤 Found input_audio, transcript present: {transcript is not None}")
                             
                             if not transcript or not isinstance(transcript, str):
-                                Log.info(f"[DEBUG] ❌ Transcript invalid or missing")
                                 continue
                             
                             cleaned = transcript.strip()
-                            Log.info(f"[DEBUG] Raw transcript: '{cleaned}'")
-                            
-                            if not cleaned:
-                                continue
-                            
-                            # Filter noise
-                            if not self.transcript_filter.is_valid_transcript(cleaned, "Caller"):
-                                Log.debug(f"[Caller] ❌ Filtered: '{cleaned}'")
-                                continue
-                            
-                            # Ensure sequential timing
-                            if current_time < self._last_transcript_time.get("Caller", 0):
-                                Log.debug(f"[Caller] ⏭️ Out-of-order")
-                                continue
-                            
-                            self._last_transcript_time["Caller"] = current_time
-                            
-                            Log.info(f"[Caller] 📝 {cleaned}")
-                            
-                            if self.caller_transcript_callback:
-                                await self.caller_transcript_callback({
-                                    "speaker": "Caller",
-                                    "text": cleaned,
-                                    "timestamp": int(current_time * 1000)
-                                })
-                            else:
-                                Log.info(f"[DEBUG] ⚠️ No caller_transcript_callback set!")
-                
-                # 🔥 AI TRANSCRIPT (assistant message with output_audio)
-                elif item_type == "message" and item_role == "assistant":
-                    content = item.get("content") or []
-                    Log.info(f"[DEBUG] 🤖 Found ASSISTANT message, content items: {len(content)}")
-                    
-                    for c_idx, c in enumerate(content):
-                        if not isinstance(c, dict):
-                            continue
-                        
-                        c_type = c.get("type")
-                        Log.info(f"[DEBUG] Content {c_idx}: type={c_type}")
-                        
-                        if c_type == "output_audio":
-                            transcript = c.get("transcript")
-                            Log.info(f"[DEBUG] 🔊 Found output_audio, transcript present: {transcript is not None}")
-                            
-                            if not transcript or not isinstance(transcript, str):
-                                Log.info(f"[DEBUG] ❌ Transcript invalid or missing")
-                                continue
-                            
-                            cleaned = transcript.strip()
-                            Log.info(f"[DEBUG] Raw AI transcript: '{cleaned}'")
                             
                             if not cleaned:
                                 continue
                             
                             # Ensure sequential timing
+                            current_time = time.time()
                             if current_time < self._last_transcript_time.get("AI", 0):
                                 Log.debug(f"[AI] ⏭️ Out-of-order")
-                                continue
+                                return
                             
                             self._last_transcript_time["AI"] = current_time
                             
@@ -564,16 +512,11 @@ class OpenAIService:
                                     "text": cleaned,
                                     "timestamp": int(current_time * 1000)
                                 })
-                            else:
-                                Log.info(f"[DEBUG] ⚠️ No ai_transcript_callback set!")
                             
-                            # Only process first AI transcript per response
                             return
                                 
         except Exception as e:
-            Log.error(f"[openai] Transcript extract error: {e}")
-            import traceback
-            Log.error(f"[DEBUG] Traceback: {traceback.format_exc()}")
+            Log.error(f"[AI] Transcript error: {e}")
 
     # --- AUDIO EVENTS ---
     def extract_audio_response_data(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
