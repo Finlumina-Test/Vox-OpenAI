@@ -145,6 +145,7 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
     Log.info(f"[HumanAudio] Connected for call {call_sid}")
     
     if call_sid not in active_calls:
+        Log.error(f"[HumanAudio] Call {call_sid} not found in active_calls")
         await websocket.close(code=4004, reason="Call not found")
         return
     
@@ -152,6 +153,7 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
     connection_manager = active_calls[call_sid].get("connection_manager")
     
     if not openai_service or not connection_manager:
+        Log.error(f"[HumanAudio] Services not available for call {call_sid}")
         await websocket.close(code=4005, reason="Services not available")
         return
     
@@ -164,7 +166,7 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
                 audio_base64 = data.get("audio")
                 
                 if audio_base64 and openai_service.is_human_in_control():
-                    # ✅ FIXED: Send directly to Twilio for real-time audio
+                    # ✅ Send directly to Twilio for real-time audio
                     stream_sid = getattr(connection_manager.state, 'stream_sid', None)
                     if stream_sid:
                         twilio_message = {
@@ -175,6 +177,7 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
                             }
                         }
                         await connection_manager.send_to_twilio(twilio_message)
+                        Log.debug(f"[HumanAudio] Sent audio to Twilio")
                     
                     # Also send to OpenAI for transcription/context
                     await openai_service.send_human_audio_to_openai(
@@ -196,7 +199,7 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
     except Exception as e:
         Log.error(f"[HumanAudio] Error: {e}")
     finally:
-        # ✅ FIXED: Notify OpenAI to resume when human disconnects
+        # ✅ Notify OpenAI to resume when human disconnects
         if openai_service and openai_service.is_human_in_control():
             openai_service.disable_human_takeover()
             
@@ -239,10 +242,13 @@ async def handle_takeover(request: Request):
         call_sid = data.get("callSid")
         action = data.get("action")
         
+        Log.info(f"[Takeover] Request: {action} for call {call_sid}")
+        
         if not call_sid or action not in ["enable", "disable"]:
             return JSONResponse({"error": "Invalid request"}, status_code=400)
         
         if call_sid not in active_calls:
+            Log.error(f"[Takeover] Call {call_sid} not found")
             return JSONResponse({"error": "Call not found"}, status_code=404)
         
         openai_service = active_calls[call_sid].get("openai_service")
@@ -254,15 +260,16 @@ async def handle_takeover(request: Request):
         if action == "enable":
             openai_service.enable_human_takeover()
             
-            # ✅ FIXED: Cancel any ongoing AI responses
+            # ✅ Cancel any ongoing AI responses
             try:
                 await connection_manager.send_to_openai({
                     "type": "response.cancel"
                 })
+                Log.info(f"[Takeover] Cancelled AI response for call {call_sid}")
             except Exception as e:
                 Log.error(f"Failed to cancel AI response: {e}")
             
-            Log.info(f"[Takeover] Enabled for call {call_sid}")
+            Log.info(f"[Takeover] ✅ ENABLED for call {call_sid}")
             
             broadcast_to_dashboards_nonblocking({
                 "messageType": "takeoverStatus",
@@ -274,15 +281,16 @@ async def handle_takeover(request: Request):
         else:
             openai_service.disable_human_takeover()
             
-            # ✅ FIXED: Clear audio buffer and resume AI
+            # ✅ Clear audio buffer and resume AI
             try:
                 await connection_manager.send_to_openai({
                     "type": "input_audio_buffer.clear"
                 })
+                Log.info(f"[Takeover] Cleared audio buffer for call {call_sid}")
             except Exception as e:
                 Log.error(f"Failed to clear buffer: {e}")
             
-            Log.info(f"[Takeover] Disabled for call {call_sid}")
+            Log.info(f"[Takeover] ✅ DISABLED for call {call_sid}")
             
             broadcast_to_dashboards_nonblocking({
                 "messageType": "takeoverStatus",
@@ -370,14 +378,13 @@ async def handle_media_stream(websocket: WebSocket):
             await connection_manager.close_openai_connection()
             return
 
-        # ✅ FIXED: Proper indentation for all handlers
         async def handle_media_event(data: dict):
             """Handle incoming media from Twilio."""
             if data.get("event") == "media":
                 media = data.get("media") or {}
                 payload_b64 = media.get("payload")
                 if payload_b64:
-                    # ✅ FIXED: Don't send caller audio to OpenAI during human takeover
+                    # ✅ Don't send caller audio to OpenAI during human takeover
                     if not openai_service.is_human_in_control():
                         if connection_manager.is_openai_connected():
                             try:
@@ -386,6 +393,8 @@ async def handle_media_stream(websocket: WebSocket):
                                     await connection_manager.send_to_openai(audio_message)
                             except Exception as e:
                                 Log.error(f"[media] failed to send to OpenAI: {e}")
+                    else:
+                        Log.debug("[media] Skipping caller audio - human takeover active")
                     
                     # Stream caller audio to dashboard
                     try:
@@ -396,7 +405,7 @@ async def handle_media_stream(websocket: WebSocket):
         async def handle_audio_delta(response: dict):
             """Handle audio response from OpenAI."""
             try:
-                # ✅ FIXED: Skip AI audio if human has taken over
+                # ✅ Skip AI audio if human has taken over
                 if openai_service.is_human_in_control():
                     Log.debug("[Audio] Skipping AI audio - human takeover active")
                     return
@@ -432,7 +441,7 @@ async def handle_media_stream(websocket: WebSocket):
         async def handle_speech_started():
             """Handle user speech interruption."""
             try:
-                # ✅ FIXED: Don't interrupt if human is in control
+                # ✅ Don't interrupt if human is in control
                 if not openai_service.is_human_in_control():
                     await connection_manager.send_mark_to_twilio()
             except Exception:
@@ -479,6 +488,7 @@ async def handle_media_stream(websocket: WebSocket):
                 "transcription_service": transcription_service,
                 "order_extractor": order_extractor
             }
+            Log.info(f"[ActiveCalls] Registered call {current_call_sid}")
 
             async def send_order_update(order_data: Dict[str, Any]):
                 payload = {
