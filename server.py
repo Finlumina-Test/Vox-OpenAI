@@ -236,11 +236,6 @@ async def index_page():
 # ---------------------------
 # Twilio incoming-call TwiML
 # ---------------------------
-@app.api_route("/incoming-call", methods=["GET", "POST"])
-async def handle_incoming_call(request: Request):
-    return TwilioService.create_incoming_call_response(request)
-
-
 @app.api_route("/takeover", methods=["POST"])
 async def handle_takeover(request: Request):
     """Handle human takeover requests from dashboard."""
@@ -295,16 +290,38 @@ async def handle_takeover(request: Request):
             
             return JSONResponse({"success": True, "message": "Takeover enabled"})
         else:
+            # ✅ ENHANCED DISABLE SEQUENCE
             openai_service.disable_human_takeover()
             
-            # ✅ Clear audio buffer and resume AI
+            # ✅ Step 1: Cancel any pending responses
+            try:
+                await connection_manager.send_to_openai({
+                    "type": "response.cancel"
+                })
+                Log.info(f"[Takeover] Cancelled pending responses")
+            except Exception as e:
+                Log.error(f"Failed to cancel responses: {e}")
+            
+            # ✅ Step 2: Clear audio buffer completely
             try:
                 await connection_manager.send_to_openai({
                     "type": "input_audio_buffer.clear"
                 })
-                Log.info(f"[Takeover] Cleared audio buffer for call {call_sid}")
+                Log.info(f"[Takeover] Cleared audio buffer")
             except Exception as e:
                 Log.error(f"Failed to clear buffer: {e}")
+            
+            # ✅ Step 3: Wait for buffer to settle
+            await asyncio.sleep(0.3)
+            
+            # ✅ Step 4: Commit fresh buffer to force reset
+            try:
+                await connection_manager.send_to_openai({
+                    "type": "input_audio_buffer.commit"
+                })
+                Log.info(f"[Takeover] Committed fresh buffer")
+            except Exception as e:
+                Log.error(f"Failed to commit buffer: {e}")
             
             Log.info(f"[Takeover] ✅ DISABLED for call {call_sid}")
             
