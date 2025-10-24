@@ -91,6 +91,21 @@ app.add_middleware(
 
 
 # ---------------------------
+# Health endpoint
+# ---------------------------
+@app.get("/", response_class=JSONResponse)
+async def index_page():
+    return {"message": "Twilio Media Stream Server is running!"}
+
+
+# ---------------------------
+# Twilio incoming-call TwiML
+# ---------------------------
+@app.api_route("/incoming-call", methods=["GET", "POST"])
+async def handle_incoming_call(request: Request):
+    return TwilioService.create_incoming_call_response(request)
+
+# ---------------------------
 # Dashboard websocket
 # ---------------------------
 @app.websocket("/dashboard-stream")
