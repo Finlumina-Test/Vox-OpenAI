@@ -32,8 +32,9 @@ class DashboardClient:
         self.websocket = websocket
         self.call_sid = call_sid  # None = subscribe to ALL calls
 
-
+active_calls: Dict[str, Dict[str, Any]] = {
 dashboard_clients: Set[DashboardClient] = set()
+
 
 
 # ---------------------------
@@ -133,6 +134,78 @@ async def dashboard_stream(websocket: WebSocket):
         dashboard_clients.discard(client)
         Log.info(f"Dashboard disconnected. Total clients: {len(dashboard_clients)}")
 
+@app.websocket("/human-audio/{call_sid}")
+async def human_audio_stream(websocket: WebSocket, call_sid: str):
+    """
+    WebSocket endpoint for human agent to send audio to the call.
+    Dashboard connects here when taking over.
+    """
+    await websocket.accept()
+    
+    Log.info(f"[HumanAudio] Connected for call {call_sid}")
+    
+    if call_sid not in active_calls:
+        await websocket.close(code=4004, reason="Call not found")
+        return
+    
+    openai_service = active_calls[call_sid].get("openai_service")
+    connection_manager = active_calls[call_sid].get("connection_manager")
+    
+    if not openai_service or not connection_manager:
+        await websocket.close(code=4005, reason="Services not available")
+        return
+    
+    try:
+        while True:
+            # Receive audio from dashboard (base64 µ-law)
+            message = await websocket.receive_text()
+            data = json.loads(message)
+            
+            if data.get("type") == "audio":
+                audio_base64 = data.get("audio")
+                
+                if audio_base64 and openai_service.is_human_in_control():
+                    # Send human audio to OpenAI
+                    await openai_service.send_human_audio_to_openai(
+                        audio_base64,
+                        connection_manager
+                    )
+                    
+                    # Also send to Twilio so caller hears it
+                    stream_sid = getattr(connection_manager.state, 'stream_sid', None)
+                    if stream_sid:
+                        twilio_message = {
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {
+                                "payload": audio_base64
+                            }
+                        }
+                        await connection_manager.send_to_twilio(twilio_message)
+                    
+                    # Broadcast to dashboard for monitoring
+                    broadcast_to_dashboards_nonblocking({
+                        "messageType": "audio",
+                        "speaker": "Human",
+                        "audio": audio_base64,
+                        "timestamp": int(time.time() * 1000),
+                        "callSid": call_sid
+                    }, call_sid)
+                    
+    except WebSocketDisconnect:
+        Log.info(f"[HumanAudio] Disconnected for call {call_sid}")
+    except Exception as e:
+        Log.error(f"[HumanAudio] Error: {e}")
+    finally:
+        # Auto-disable takeover when human disconnects
+        if openai_service and openai_service.is_human_in_control():
+            openai_service.disable_human_takeover()
+            broadcast_to_dashboards_nonblocking({
+                "messageType": "takeoverStatus",
+                "active": False,
+                "callSid": call_sid
+            }, call_sid)
+
 
 # ---------------------------
 # Health endpoint
@@ -148,6 +221,54 @@ async def index_page():
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     return TwilioService.create_incoming_call_response(request)
+
+@app.api_route("/takeover", methods=["POST"])
+async def handle_takeover(request: Request):
+    """Handle human takeover requests from dashboard."""
+    try:
+        data = await request.json()
+        call_sid = data.get("callSid")
+        action = data.get("action")  # "enable" or "disable"
+        
+        if not call_sid or action not in ["enable", "disable"]:
+            return JSONResponse({"error": "Invalid request"}, status_code=400)
+        
+        if call_sid not in active_calls:
+            return JSONResponse({"error": "Call not found"}, status_code=404)
+        
+        openai_service = active_calls[call_sid].get("openai_service")
+        
+        if not openai_service:
+            return JSONResponse({"error": "Service not available"}, status_code=500)
+        
+        if action == "enable":
+            openai_service.enable_human_takeover()
+            Log.info(f"[Takeover] Enabled for call {call_sid}")
+            
+            # Notify dashboard
+            broadcast_to_dashboards_nonblocking({
+                "messageType": "takeoverStatus",
+                "active": True,
+                "callSid": call_sid
+            }, call_sid)
+            
+            return JSONResponse({"success": True, "message": "Takeover enabled"})
+        else:
+            openai_service.disable_human_takeover()
+            Log.info(f"[Takeover] Disabled for call {call_sid}")
+            
+            # Notify dashboard
+            broadcast_to_dashboards_nonblocking({
+                "messageType": "takeoverStatus",
+                "active": False,
+                "callSid": call_sid
+            }, call_sid)
+            
+            return JSONResponse({"success": True, "message": "Takeover disabled"})
+            
+    except Exception as e:
+        Log.error(f"[Takeover] Error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ---------------------------
@@ -250,36 +371,41 @@ async def handle_media_stream(websocket: WebSocket):
                     except Exception as e:
                         Log.error(f"[media] failed to stream caller audio: {e}")
 
-        async def handle_audio_delta(response: dict):
-            """Handle audio response from OpenAI."""
+       async def handle_audio_delta(response: dict):
+    """Handle audio response from OpenAI."""
+    try:
+        # ✅ ADD: Skip AI audio if human has taken over
+        if openai_service.is_human_in_control():
+            Log.debug("[Audio] Skipping AI audio - human takeover active")
+            return
+        
+        audio_data = openai_service.extract_audio_response_data(response) or {}
+        delta = audio_data.get("delta")
+        
+        if delta:
+            # Send to Twilio
+            if getattr(connection_manager.state, "stream_sid", None):
+                try:
+                    audio_message = audio_service.process_outgoing_audio(
+                        response, connection_manager.state.stream_sid
+                    )
+                    if audio_message:
+                        await connection_manager.send_to_twilio(audio_message)
+                        mark_msg = audio_service.create_mark_message(
+                            connection_manager.state.stream_sid
+                        )
+                        await connection_manager.send_to_twilio(mark_msg)
+                except Exception as e:
+                    Log.error(f"[audio->twilio] failed: {e}")
+            
+            # Stream AI audio to dashboard
             try:
-                audio_data = openai_service.extract_audio_response_data(response) or {}
-                delta = audio_data.get("delta")
-                
-                if delta:
-                    # Send to Twilio
-                    if getattr(connection_manager.state, "stream_sid", None):
-                        try:
-                            audio_message = audio_service.process_outgoing_audio(
-                                response, connection_manager.state.stream_sid
-                            )
-                            if audio_message:
-                                await connection_manager.send_to_twilio(audio_message)
-                                mark_msg = audio_service.create_mark_message(
-                                    connection_manager.state.stream_sid
-                                )
-                                await connection_manager.send_to_twilio(mark_msg)
-                        except Exception as e:
-                            Log.error(f"[audio->twilio] failed: {e}")
-                    
-                    # Stream AI audio to dashboard
-                    try:
-                        await transcription_service.stream_audio_chunk(delta, source="AI")
-                    except Exception as e:
-                        Log.error(f"[audio->dashboard] failed: {e}")
-                        
+                await transcription_service.stream_audio_chunk(delta, source="AI")
             except Exception as e:
-                Log.error(f"[audio-delta] failed: {e}")
+                Log.error(f"[audio->dashboard] failed: {e}")
+                
+    except Exception as e:
+        Log.error(f"[audio-delta] failed: {e}")
 
         async def handle_speech_started():
             """Handle user speech interruption."""
@@ -316,10 +442,30 @@ async def handle_media_stream(websocket: WebSocket):
                     Log.error(f"Session renewal failed: {e}")
 
         async def on_start_cb(stream_sid: str):
-            """Handle Twilio stream start."""
-            nonlocal current_call_sid
-            current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
-            Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
+    """Handle Twilio stream start."""
+    nonlocal current_call_sid
+    current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
+    Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
+    
+    # ✅ ADD: Register this call
+    active_calls[current_call_sid] = {
+        "openai_service": openai_service,
+        "connection_manager": connection_manager,
+        "audio_service": audio_service,
+        "transcription_service": transcription_service,
+        "order_extractor": order_extractor
+    }
+
+    async def send_order_update(order_data: Dict[str, Any]):
+        payload = {
+            "messageType": "orderUpdate",
+            "orderData": order_data,
+            "timestamp": int(time.time() * 1000),
+            "callSid": current_call_sid,
+        }
+        broadcast_to_dashboards_nonblocking(payload, current_call_sid)
+    
+    order_extractor.set_update_callback(send_order_update)
 
             async def send_order_update(order_data: Dict[str, Any]):
                 payload = {
@@ -348,38 +494,43 @@ async def handle_media_stream(websocket: WebSocket):
 
     except Exception as e:
         Log.error(f"Error in media stream handler: {e}")
-    finally:
-        # Final order summary
-        try:
-            final_summary = order_extractor.get_order_summary()
-            Log.info(f"\n{final_summary}")
-            final_order = order_extractor.get_current_order()
-            if any(final_order.values()):
-                broadcast_to_dashboards_nonblocking({
-                    "messageType": "orderComplete",
-                    "orderData": final_order,
-                    "summary": final_summary,
-                    "timestamp": int(time.time() * 1000),
-                    "callSid": current_call_sid,
-                }, current_call_sid)
-        except Exception:
-            pass
+finally:
+    # Final order summary
+    try:
+        final_summary = order_extractor.get_order_summary()
+        Log.info(f"\n{final_summary}")
+        final_order = order_extractor.get_current_order()
+        if any(final_order.values()):
+            broadcast_to_dashboards_nonblocking({
+                "messageType": "orderComplete",
+                "orderData": final_order,
+                "summary": final_summary,
+                "timestamp": int(time.time() * 1000),
+                "callSid": current_call_sid,
+            }, current_call_sid)
+    except Exception:
+        pass
 
         # Cleanup
-        try:
-            await transcription_service.shutdown()
-        except Exception:
-            pass
+   if current_call_sid and current_call_sid in active_calls:
+        del active_calls[current_call_sid]
+        Log.info(f"[Cleanup] Removed call {current_call_sid} from active_calls")
 
-        try:
-            await order_extractor.shutdown()
-        except Exception:
-            pass
+    # Cleanup services
+    try:
+        await transcription_service.shutdown()
+    except Exception:
+        pass
 
-        try:
-            await connection_manager.close_openai_connection()
-        except Exception:
-            pass
+    try:
+        await order_extractor.shutdown()
+    except Exception:
+        pass
+
+    try:
+        await connection_manager.close_openai_connection()
+    except Exception:
+        pass
 
 
 # ---------------------------
