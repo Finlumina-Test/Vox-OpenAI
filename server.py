@@ -343,6 +343,71 @@ async def handle_takeover(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.api_route("/end-call", methods=["POST"])
+async def handle_end_call(request: Request):
+    """Handle end call request from dashboard."""
+    try:
+        data = await request.json()
+        call_sid = data.get("callSid")
+        
+        Log.info(f"[EndCall] Request to end call {call_sid}")
+        
+        if not call_sid:
+            return JSONResponse({"error": "Invalid request"}, status_code=400)
+        
+        if call_sid not in active_calls:
+            Log.error(f"[EndCall] Call {call_sid} not found")
+            return JSONResponse({"error": "Call not found"}, status_code=404)
+        
+        openai_service = active_calls[call_sid].get("openai_service")
+        connection_manager = active_calls[call_sid].get("connection_manager")
+        
+        if not openai_service or not connection_manager:
+            return JSONResponse({"error": "Service not available"}, status_code=500)
+        
+        # If human is in control, disable takeover first
+        if openai_service.is_human_in_control():
+            openai_service.disable_human_takeover()
+            Log.info(f"[EndCall] Disabled takeover for call {call_sid}")
+        
+        # Use Twilio REST API to end the call
+        if Config.has_twilio_credentials():
+            try:
+                from twilio.rest import Client
+                client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
+                
+                Log.info(f"[EndCall] Ending call via Twilio REST API")
+                client.calls(call_sid).update(status='completed')
+                
+                Log.info(f"[EndCall] ✅ Call {call_sid} ended successfully")
+                
+                # Broadcast to dashboards
+                broadcast_to_dashboards_nonblocking({
+                    "messageType": "callEnded",
+                    "callSid": call_sid,
+                    "timestamp": int(time.time() * 1000)
+                }, call_sid)
+                
+                return JSONResponse({
+                    "success": True, 
+                    "message": "Call ended successfully"
+                })
+                
+            except Exception as e:
+                Log.error(f"[EndCall] Twilio REST error: {e}")
+                return JSONResponse({
+                    "error": f"Failed to end call: {str(e)}"
+                }, status_code=500)
+        else:
+            return JSONResponse({
+                "error": "Twilio credentials not configured"
+            }, status_code=500)
+            
+    except Exception as e:
+        Log.error(f"[EndCall] Error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # ---------------------------
 # Media stream: Twilio <-> OpenAI <-> Dashboard
 # ---------------------------
