@@ -11,8 +11,8 @@ class SilenceDetector:
     """
     
     # Very low threshold - only catches absolute silence
-    SILENCE_THRESHOLD = 100  # Very low for µ-law audio
-    GRACE_CHUNKS = 2  # Keep first 2 silent chunks
+    SILENCE_THRESHOLD = 50  # Even lower
+    GRACE_CHUNKS = 10  # Keep way more chunks
     
     def __init__(self):
         self._consecutive_silence_count = 0
