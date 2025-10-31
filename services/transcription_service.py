@@ -1,9 +1,7 @@
 import base64
 import asyncio
-import numpy as np
 import time
 from typing import Dict, Optional, Callable
-from collections import deque
 from services.log_utils import Log
 
 
@@ -15,10 +13,10 @@ class TranscriptionService:
     - Sequential audio playback (no overlap possible)
     - 1.0s gap ONLY for Caller->AI transitions
     - NO gaps for AI->Caller (natural conversation flow)
-    - Voice Activity Detection (VAD) to prevent backlog
     - Async lock ensures one chunk completes before next starts
     
     NOTE: Transcription now handled by OpenAI natively!
+    NOTE: Silence detection handled by silence_detection.py module!
     """
     
     # Audio format specs
@@ -29,13 +27,6 @@ class TranscriptionService:
     # Speaker turn detection
     SPEAKER_SILENCE_THRESHOLD = 0.3  # If no chunks for 0.3s, speaker is done
     SPEAKER_TRANSITION_DELAY = 1.0   # 1 SECOND gap for Caller->AI
-    
-    # Voice Activity Detection
-    VAD_ENERGY_THRESHOLD = 1000
-    VAD_ZCR_THRESHOLD = 0.1
-    VAD_CONSECUTIVE_SPEECH = 3
-    VAD_CONSECUTIVE_SILENCE = 5
-    VAD_LOOKBACK_CHUNKS = 10
     
     def __init__(self):
         # Unified audio queue
@@ -50,12 +41,6 @@ class TranscriptionService:
         
         # 🔒 CRITICAL: Sequential playback lock
         self._playback_lock: asyncio.Lock = asyncio.Lock()
-        
-        # VAD state for caller
-        self._caller_is_speaking: bool = False
-        self._caller_speech_chunks_count: int = 0
-        self._caller_silence_chunks_count: int = 0
-        self._caller_chunk_history: deque = deque(maxlen=self.VAD_LOOKBACK_CHUNKS)
         
         # Callbacks
         self.audio_callback: Optional[Callable] = None
@@ -75,45 +60,6 @@ class TranscriptionService:
         num_samples = len(audio_bytes)
         duration_seconds = num_samples / self.SAMPLE_RATE
         return duration_seconds
-    
-    def _detect_speech(self, mulaw_bytes: bytes) -> bool:
-        """Voice Activity Detection using energy and zero-crossing rate."""
-        try:
-            pcm16 = self._mulaw_to_pcm16(mulaw_bytes)
-            
-            energy = np.sum(pcm16.astype(np.float64) ** 2)
-            zcr = np.sum(np.abs(np.diff(np.sign(pcm16)))) / (2 * len(pcm16))
-            
-            has_speech = (energy > self.VAD_ENERGY_THRESHOLD and 
-                         zcr > self.VAD_ZCR_THRESHOLD)
-            
-            return has_speech
-            
-        except Exception as e:
-            Log.debug(f"[VAD] Error: {e}")
-            return False
-    
-    def _update_vad_state(self, has_speech: bool, audio_bytes: bytes) -> bool:
-        """Update VAD state machine and determine if chunk should be streamed."""
-        self._caller_chunk_history.append(audio_bytes)
-        
-        if has_speech:
-            self._caller_speech_chunks_count += 1
-            self._caller_silence_chunks_count = 0
-            
-            if not self._caller_is_speaking and self._caller_speech_chunks_count >= self.VAD_CONSECUTIVE_SPEECH:
-                self._caller_is_speaking = True
-                Log.info("[VAD] 🎤 Caller started speaking")
-                return True
-        else:
-            self._caller_silence_chunks_count += 1
-            self._caller_speech_chunks_count = 0
-            
-            if self._caller_is_speaking and self._caller_silence_chunks_count >= self.VAD_CONSECUTIVE_SILENCE:
-                self._caller_is_speaking = False
-                Log.info("[VAD] 🔇 Caller stopped speaking")
-        
-        return self._caller_is_speaking
     
     async def _stream_unified_audio(self):
         """
@@ -191,9 +137,9 @@ class TranscriptionService:
     
     async def stream_audio_chunk(self, audio_input, source: str = "Unknown") -> None:
         """
-        Process incoming audio chunk with Voice Activity Detection.
+        Process incoming audio chunk and queue for streaming.
         
-        🎯 KEY: Only stream caller audio when actually speaking!
+        NOTE: Silence detection now handled by silence_detection.py before calling this!
         """
         try:
             if isinstance(audio_input, str):
@@ -205,52 +151,30 @@ class TranscriptionService:
             else:
                 return
             
-            should_stream = True
-            
-            # Apply VAD to caller audio only
-            if source == "Caller":
-                has_speech = self._detect_speech(audio_bytes)
-                should_stream = self._update_vad_state(has_speech, audio_bytes)
-                
-                # Flush history when starting to speak
-                if should_stream and self._caller_speech_chunks_count == self.VAD_CONSECUTIVE_SPEECH:
-                    for hist_chunk in list(self._caller_chunk_history)[:-1]:
-                        hist_b64 = base64.b64encode(hist_chunk).decode('ascii')
-                        hist_packet = {
-                            "speaker": source,
-                            "audio": hist_b64,
-                            "timestamp": int(time.time() * 1000),
-                            "size": len(hist_chunk)
-                        }
-                        await self._unified_audio_queue.put(hist_packet)
-            
-            # Queue for streaming (AI always streams, Caller only when speaking)
-            if should_stream:
-                audio_packet = {
-                    "speaker": source,
-                    "audio": original_base64,
-                    "timestamp": int(time.time() * 1000),
-                    "size": len(audio_bytes)
-                }
-                await self._unified_audio_queue.put(audio_packet)
+            # Queue for streaming
+            audio_packet = {
+                "speaker": source,
+                "audio": original_base64,
+                "timestamp": int(time.time() * 1000),
+                "size": len(audio_bytes)
+            }
+            await self._unified_audio_queue.put(audio_packet)
             
         except Exception as e:
             Log.error(f"[{source}] Audio streaming error: {e}")
     
-    def _mulaw_to_pcm16(self, mulaw_bytes: bytes) -> np.ndarray:
-        """Convert µ-law 8-bit to PCM16 (for VAD only)."""
-        mu = np.frombuffer(mulaw_bytes, dtype=np.uint8)
-        mu = ~mu
-        
-        sign = (mu & 0x80).astype(np.int32)
-        exponent = ((mu >> 4) & 0x07).astype(np.int32)
-        mantissa = (mu & 0x0F).astype(np.int32)
-        
-        magnitude = ((mantissa << 3) + 0x84) << exponent
-        magnitude = np.clip(magnitude, 0, 0x7FFF)
-        
-        pcm16 = np.where(sign == 0, magnitude, -magnitude)
-        return pcm16.astype(np.int16)
+    def clear_buffers(self):
+        """Clear audio queue (used during human takeover)."""
+        try:
+            while not self._unified_audio_queue.empty():
+                try:
+                    self._unified_audio_queue.get_nowait()
+                    self._unified_audio_queue.task_done()
+                except:
+                    break
+            Log.info("[Stream] Buffers cleared")
+        except Exception as e:
+            Log.error(f"[Stream] Buffer clear error: {e}")
     
     async def shutdown(self):
         """Gracefully shutdown."""
