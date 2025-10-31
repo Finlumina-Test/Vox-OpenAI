@@ -6,189 +6,80 @@ from services.log_utils import Log
 
 class SilenceDetector:
     """
-    Detects and filters silence in audio streams.
-    Prevents transmission of silent audio chunks to reduce bandwidth and delays.
+    Simple silence detector - filters ONLY absolute silence, not background noise.
+    Very permissive to avoid cutting off speech.
     """
     
-    # Silence detection thresholds
-    SILENCE_THRESHOLD = 500  # RMS threshold for μ-law audio (adjust as needed)
-    MIN_SPEECH_DURATION_MS = 100  # Minimum speech duration to consider it real
+    # Very low threshold - only catches absolute silence
+    SILENCE_THRESHOLD = 100  # Very low for µ-law audio
+    GRACE_CHUNKS = 2  # Keep first 2 silent chunks
     
     def __init__(self):
         self._consecutive_silence_count = 0
-        self._consecutive_speech_count = 0
         self._last_was_speech = False
     
     @staticmethod
     def calculate_audio_energy(audio_base64: str) -> float:
-        """
-        Calculate the energy (RMS) of an audio chunk.
-        
-        Args:
-            audio_base64: Base64 encoded μ-law audio
-            
-        Returns:
-            RMS energy value
-        """
+        """Calculate RMS energy of µ-law audio chunk."""
         try:
-            # Decode base64 to bytes
             audio_bytes = base64.b64decode(audio_base64)
-            
-            # Convert to numpy array
             audio_array = np.frombuffer(audio_bytes, dtype=np.uint8)
             
-            # Calculate RMS (Root Mean Square) energy
-            # For μ-law, values around 127-128 are silence
-            # Deviation from 127-128 indicates sound
+            # For µ-law, silence is around 127-128
+            # Any deviation indicates sound
             centered = audio_array.astype(np.float32) - 127.5
             rms = np.sqrt(np.mean(centered ** 2))
             
             return rms
             
         except Exception as e:
-            Log.debug(f"[Silence] Energy calculation error: {e}")
-            # If error, assume it's speech to be safe
-            return 1000.0
+            Log.debug(f"[Silence] Energy error: {e}")
+            return 1000.0  # Assume speech on error
     
-    def is_silence(self, audio_base64: str, speaker: str) -> bool:
-        """
-        Determine if an audio chunk is silence.
-        
-        Args:
-            audio_base64: Base64 encoded audio
-            speaker: "Caller" or "AI"
-            
-        Returns:
-            True if silence, False if speech
-        """
+    def is_silence(self, audio_base64: str) -> bool:
+        """Check if audio is absolute silence."""
         try:
             energy = self.calculate_audio_energy(audio_base64)
-            
             is_silent = energy < self.SILENCE_THRESHOLD
             
             if is_silent:
                 self._consecutive_silence_count += 1
-                self._consecutive_speech_count = 0
             else:
-                self._consecutive_speech_count += 1
                 self._consecutive_silence_count = 0
             
-            # Update state
             previous_was_speech = self._last_was_speech
             self._last_was_speech = not is_silent
             
-            # Log only on transitions (speech -> silence or silence -> speech)
+            # Log only on transitions
             if previous_was_speech and is_silent:
-                Log.debug(f"[Silence] {speaker} stopped speaking (energy: {energy:.1f})")
+                Log.debug(f"[Silence] Stopped (energy: {energy:.1f})")
             elif not previous_was_speech and not is_silent:
-                Log.debug(f"[Silence] {speaker} started speaking (energy: {energy:.1f})")
+                Log.debug(f"[Silence] Started (energy: {energy:.1f})")
             
             return is_silent
             
-        except Exception as e:
-            Log.error(f"[Silence] Detection error: {e}")
-            # On error, assume speech to avoid dropping audio
-            return False
+        except Exception:
+            return False  # Assume speech on error
     
     def should_transmit(self, audio_base64: str, speaker: str) -> bool:
         """
-        Determine if audio chunk should be transmitted to dashboard.
-        
-        Args:
-            audio_base64: Base64 encoded audio
-            speaker: "Caller" or "AI"
-            
-        Returns:
-            True if should transmit, False if should drop
+        Determine if audio should be transmitted.
+        Very permissive - only filters prolonged absolute silence.
         """
-        is_silent = self.is_silence(audio_base64, speaker)
+        is_silent = self.is_silence(audio_base64)
         
         # Always transmit speech
         if not is_silent:
             return True
         
-        # Drop prolonged silence (more than 3 consecutive silent chunks)
-        # Keep first 2-3 silent chunks to avoid cutting off audio abruptly
-        if self._consecutive_silence_count <= 3:
+        # Keep first few silent chunks to avoid abrupt cutoff
+        if self._consecutive_silence_count <= self.GRACE_CHUNKS:
             return True
         
+        # Filter only prolonged absolute silence
         return False
     
     def reset(self):
-        """Reset silence detection state."""
+        """Reset detector state."""
         self._consecutive_silence_count = 0
-        self._consecutive_speech_count = 0
         self._last_was_speech = False
-        Log.debug("[Silence] Detector reset")
-
-
-class AdaptiveSilenceDetector(SilenceDetector):
-    """
-    Advanced silence detector with adaptive thresholds.
-    Automatically adjusts silence threshold based on background noise.
-    """
-    
-    def __init__(self):
-        super().__init__()
-        self._noise_floor = 500.0  # Initial noise floor estimate
-        self._energy_history = []
-        self._max_history = 50  # Keep last 50 samples for noise estimation
-    
-    def update_noise_floor(self, energy: float):
-        """Update noise floor estimate based on recent audio."""
-        self._energy_history.append(energy)
-        
-        # Keep only recent history
-        if len(self._energy_history) > self._max_history:
-            self._energy_history.pop(0)
-        
-        # Calculate noise floor as 25th percentile of energy
-        if len(self._energy_history) >= 10:
-            sorted_energy = sorted(self._energy_history)
-            percentile_25 = sorted_energy[len(sorted_energy) // 4]
-            
-            # Smooth the noise floor update
-            self._noise_floor = 0.9 * self._noise_floor + 0.1 * percentile_25
-    
-    def is_silence(self, audio_base64: str, speaker: str) -> bool:
-        """Detect silence with adaptive threshold."""
-        try:
-            energy = self.calculate_audio_energy(audio_base64)
-            
-            # Update noise floor
-            self.update_noise_floor(energy)
-            
-            # Adaptive threshold: 2x noise floor + safety margin
-            adaptive_threshold = max(self._noise_floor * 2.0, 300.0)
-            
-            is_silent = energy < adaptive_threshold
-            
-            if is_silent:
-                self._consecutive_silence_count += 1
-                self._consecutive_speech_count = 0
-            else:
-                self._consecutive_speech_count += 1
-                self._consecutive_silence_count = 0
-            
-            # Update state
-            previous_was_speech = self._last_was_speech
-            self._last_was_speech = not is_silent
-            
-            # Log transitions
-            if previous_was_speech and is_silent:
-                Log.debug(f"[Silence] {speaker} stopped (energy: {energy:.1f}, threshold: {adaptive_threshold:.1f})")
-            elif not previous_was_speech and not is_silent:
-                Log.debug(f"[Silence] {speaker} started (energy: {energy:.1f}, threshold: {adaptive_threshold:.1f})")
-            
-            return is_silent
-            
-        except Exception as e:
-            Log.error(f"[Silence] Detection error: {e}")
-            return False
-    
-    def reset(self):
-        """Reset detector and clear history."""
-        super().reset()
-        self._energy_history.clear()
-        self._noise_floor = 500.0
-        Log.debug("[Silence] Adaptive detector reset")
