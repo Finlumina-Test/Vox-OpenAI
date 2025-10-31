@@ -15,7 +15,7 @@ class Config:
     OPENAI_API_KEY: str = os.getenv('OPENAI_API_KEY')
     TEMPERATURE: float = float(os.getenv('TEMPERATURE', 0.8))
     VOICE: str = 'alloy'  # Options: alloy, ash, ballad, coral, echo, sage, shimmer, verse
-    OPENAI_REALTIME_MODEL: str = os.getenv('OPENAI_REALTIME_MODEL', 'gpt-realtime')
+    OPENAI_REALTIME_MODEL: str = os.getenv('OPENAI_REALTIME_MODEL', 'gpt-realtime-mini-2025-10-06')
     COMPANY_NAME: str = os.getenv('COMPANY_NAME', 'Finlumina-Vox')
     
     # Server Configuration
