@@ -521,16 +521,8 @@ async def handle_media_stream(websocket: WebSocket):
                         
                         # Stream to dashboard for monitoring ONLY if not silence
                         if should_send_to_dashboard:
-                            payload = {
-                                "messageType": "audio",
-                                "speaker": "Caller",
-                                "audio": payload_b64,
-                                "timestamp": int(time.time() * 1000),
-                                "callSid": current_call_sid,
-                            }
-                            await _do_broadcast(payload, current_call_sid)
-                        else:
-                            Log.debug("[media] Filtered caller silence during takeover")
+                            # ✅ Route through transcription service for sequential playback
+                            await transcription_service.stream_audio_chunk(payload_b64, source="Caller")
                     else:
                         # Normal mode: send to OpenAI (always)
                         if connection_manager.is_openai_connected():
@@ -543,14 +535,8 @@ async def handle_media_stream(websocket: WebSocket):
                         
                         # Stream caller audio to dashboard ONLY if not silence
                         if should_send_to_dashboard:
-                            payload = {
-                                "messageType": "audio",
-                                "speaker": "Caller",
-                                "audio": payload_b64,
-                                "timestamp": int(time.time() * 1000),
-                                "callSid": current_call_sid,
-                            }
-                            await _do_broadcast(payload, current_call_sid)
+                            # ✅ Route through transcription service for sequential playback
+                            await transcription_service.stream_audio_chunk(payload_b64, source="Caller")
                         else:
                             Log.debug("[media] Filtered caller silence")
 
@@ -586,16 +572,8 @@ async def handle_media_stream(websocket: WebSocket):
                     
                     # ✅ Stream AI audio to dashboard ONLY if not silence
                     if should_send_to_dashboard:
-                        payload = {
-                            "messageType": "audio",
-                            "speaker": "AI",
-                            "audio": delta,
-                            "timestamp": int(time.time() * 1000),
-                            "callSid": current_call_sid,
-                        }
-                        await _do_broadcast(payload, current_call_sid)
-                    else:
-                        Log.debug("[audio] Filtered AI silence")
+                        # ✅ Route through transcription service for sequential playback
+                        await transcription_service.stream_audio_chunk(delta, source="AI")
                         
             except Exception as e:
                 Log.error(f"[audio-delta] failed: {e}")
