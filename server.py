@@ -21,7 +21,7 @@ from services import (
 )
 from services.transcription_service import TranscriptionService
 from services.log_utils import Log
-from services.silence_detection import AdaptiveSilenceDetector
+from services.silence_detection import SilenceDetector
 
 
 # ---------------------------
@@ -424,8 +424,8 @@ async def handle_media_stream(websocket: WebSocket):
     transcription_service = TranscriptionService()
     
     # ✅ Initialize silence detectors for each speaker
-    caller_silence_detector = AdaptiveSilenceDetector()
-    ai_silence_detector = AdaptiveSilenceDetector()
+    caller_silence_detector = SilenceDetector()
+    ai_silence_detector = SilenceDetector()
     
     current_call_sid: Optional[str] = None
 
