@@ -603,15 +603,18 @@ async def handle_media_stream(websocket: WebSocket):
                 delta = audio_data.get("delta")
                 
                 if delta:
-                    # 🔥 AI is responding, so user interruption is over
+                    # 🔥 Check if user interrupted before processing
                     if user_is_speaking:
-                        user_is_speaking = False
-                        Log.info("✅ [Interruption] AI resuming - user done speaking")
+                        Log.debug("[Audio] 🛑 Dropping AI audio - user is speaking")
+                        return  # Don't send to Twilio OR dashboard
+                    
+                    # 🔥 AI is responding, so user interruption is over
+                    user_is_speaking = False
                     
                     # ✅ Check if AI audio is silence
                     should_send_to_dashboard = ai_silence_detector.should_transmit(delta, "AI")
                     
-                    # Send to Twilio (always, for call continuity)
+                    # 🔥 Send to Twilio ONLY if user isn't speaking
                     if getattr(connection_manager.state, "stream_sid", None):
                         try:
                             audio_message = audio_service.process_outgoing_audio(
@@ -647,7 +650,20 @@ async def handle_media_stream(websocket: WebSocket):
                     # 🔥 Set flag to stop AI audio streaming
                     user_is_speaking = True
                     
-                    # ✅ Step 1: Cancel AI's ongoing response
+                    # ✅ Step 1: Send CLEAR to Twilio to stop playing buffered audio
+                    try:
+                        stream_sid = getattr(connection_manager.state, 'stream_sid', None)
+                        if stream_sid:
+                            clear_message = {
+                                "event": "clear",
+                                "streamSid": stream_sid
+                            }
+                            await connection_manager.send_to_twilio(clear_message)
+                            Log.info("🔇 [Interruption] Sent CLEAR to Twilio")
+                    except Exception as e:
+                        Log.error(f"Failed to clear Twilio buffer: {e}")
+                    
+                    # ✅ Step 2: Cancel AI's ongoing response
                     try:
                         await connection_manager.send_to_openai({
                             "type": "response.cancel"
@@ -656,7 +672,7 @@ async def handle_media_stream(websocket: WebSocket):
                     except Exception as e:
                         Log.error(f"Failed to cancel response: {e}")
                     
-                    # ✅ Step 2: Clear AI audio queue immediately
+                    # ✅ Step 3: Clear AI audio queue immediately
                     cleared_count = 0
                     while not ai_audio_queue.empty():
                         try:
@@ -669,7 +685,7 @@ async def handle_media_stream(websocket: WebSocket):
                     if cleared_count > 0:
                         Log.info(f"🗑️ [Interruption] Cleared {cleared_count} AI audio chunks")
                     
-                    # ✅ Step 3: Send mark to Twilio
+                    # ✅ Step 4: Send mark to Twilio
                     await connection_manager.send_mark_to_twilio()
                     
             except Exception as e:
