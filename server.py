@@ -424,6 +424,7 @@ async def handle_media_stream(websocket: WebSocket):
     ai_audio_queue = asyncio.Queue()
     ai_stream_task = None
     shutdown_flag = False
+    user_is_speaking = False  # 🔥 Track if user interrupted AI
 
     async def ai_audio_streamer():
         """
@@ -438,6 +439,11 @@ async def handle_media_stream(websocket: WebSocket):
                 
                 if audio_data is None:  # Shutdown signal
                     break
+                
+                # 🔥 Skip AI audio if user is speaking (interruption)
+                if user_is_speaking:
+                    ai_audio_queue.task_done()
+                    continue
                 
                 # Calculate chunk duration (8kHz µ-law)
                 audio_b64 = audio_data.get("audio", "")
@@ -585,6 +591,8 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def handle_audio_delta(response: dict):
             """Handle audio response from OpenAI."""
+            nonlocal user_is_speaking
+            
             try:
                 # ✅ Skip AI audio if human has taken over
                 if openai_service.is_human_in_control():
@@ -595,6 +603,11 @@ async def handle_media_stream(websocket: WebSocket):
                 delta = audio_data.get("delta")
                 
                 if delta:
+                    # 🔥 AI is responding, so user interruption is over
+                    if user_is_speaking:
+                        user_is_speaking = False
+                        Log.info("✅ [Interruption] AI resuming - user done speaking")
+                    
                     # ✅ Check if AI audio is silence
                     should_send_to_dashboard = ai_silence_detector.should_transmit(delta, "AI")
                     
@@ -624,12 +637,43 @@ async def handle_media_stream(websocket: WebSocket):
                 Log.error(f"[audio-delta] failed: {e}")
 
         async def handle_speech_started():
-            """Handle user speech interruption."""
+            """Handle user speech interruption - IMMEDIATE cutoff."""
+            nonlocal user_is_speaking
+            
             try:
                 if not openai_service.is_human_in_control():
+                    Log.info("🛑 [Interruption] USER SPEAKING - Stopping AI immediately")
+                    
+                    # 🔥 Set flag to stop AI audio streaming
+                    user_is_speaking = True
+                    
+                    # ✅ Step 1: Cancel AI's ongoing response
+                    try:
+                        await connection_manager.send_to_openai({
+                            "type": "response.cancel"
+                        })
+                        Log.info("✅ [Interruption] Cancelled AI response")
+                    except Exception as e:
+                        Log.error(f"Failed to cancel response: {e}")
+                    
+                    # ✅ Step 2: Clear AI audio queue immediately
+                    cleared_count = 0
+                    while not ai_audio_queue.empty():
+                        try:
+                            ai_audio_queue.get_nowait()
+                            ai_audio_queue.task_done()
+                            cleared_count += 1
+                        except:
+                            break
+                    
+                    if cleared_count > 0:
+                        Log.info(f"🗑️ [Interruption] Cleared {cleared_count} AI audio chunks")
+                    
+                    # ✅ Step 3: Send mark to Twilio
                     await connection_manager.send_mark_to_twilio()
-            except Exception:
-                pass
+                    
+            except Exception as e:
+                Log.error(f"[Interruption] Error: {e}")
 
         async def handle_other_openai_event(response: dict):
             """Handle other OpenAI events."""
