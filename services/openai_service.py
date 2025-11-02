@@ -137,9 +137,9 @@ class OpenAISessionManager:
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.5,  # Lower = more sensitive to speech
-                            "prefix_padding_ms": 300,  # Audio before speech detection
-                            "silence_duration_ms": 500  # Shorter = faster interruption (was 700ms default)
+                            "threshold": 0.4,  # 🔥 More aggressive (lower = triggers easier)
+                            "prefix_padding_ms": 200,  # Less padding for faster detection
+                            "silence_duration_ms": 300  # 🔥 Very fast interruption
                         },
                         "transcription": {
                             "model": "whisper-1",
