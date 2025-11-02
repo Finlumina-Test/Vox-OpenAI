@@ -421,9 +421,9 @@ async def handle_media_stream(websocket: WebSocket):
     current_call_sid: Optional[str] = None
     
     # ✅ AI Audio Queue System (for natural timing)
-    ai_audio_queue: asyncio.Queue = asyncio.Queue()
-    ai_stream_task: Optional[asyncio.Task] = None
-    shutdown_flag: bool = False
+    ai_audio_queue = asyncio.Queue()
+    ai_stream_task = None
+    shutdown_flag = False
 
     async def ai_audio_streamer():
         """
@@ -715,7 +715,6 @@ async def handle_media_stream(websocket: WebSocket):
         Log.error(f"Error in media stream handler: {e}")
     finally:
         # ✅ Shutdown AI audio streamer
-        nonlocal shutdown_flag
         shutdown_flag = True
         try:
             await ai_audio_queue.put(None)  # Signal shutdown
