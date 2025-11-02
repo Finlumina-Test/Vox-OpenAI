@@ -19,7 +19,8 @@ class OpenAIEventHandler:
     @staticmethod
     def is_audio_delta_event(event: Dict[str, Any]) -> bool:
         """Check if event is an audio delta from OpenAI."""
-        return (event.get('type') == 'response.output_audio.delta' and 
+        return (event.get('type') == 'response.audio_delta' or
+                event.get('type') == 'response.output_audio.delta' and 
                 'delta' in event)
     
     @staticmethod
@@ -134,7 +135,12 @@ class OpenAISessionManager:
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
-                        "turn_detection": {"type": "server_vad"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,  # Lower = more sensitive to speech
+                            "prefix_padding_ms": 300,  # Audio before speech detection
+                            "silence_duration_ms": 500  # Shorter = faster interruption (was 700ms default)
+                        },
                         "transcription": {
                             "model": "whisper-1",
                         }
@@ -174,7 +180,7 @@ class OpenAISessionManager:
 
     @staticmethod
     def create_initial_conversation_item() -> Dict[str, Any]:
-        """Create an initial conversation item for AI-first interactions."""
+        """Create an initial conversation item for AI-first greeting."""
         return {
             "type": "conversation.item.create",
             "item": {
@@ -184,9 +190,9 @@ class OpenAISessionManager:
                     {
                         "type": "input_text",
                         "text": (
-                            "Greet the user with 'Hello there! I am an AI voice assistant "
-                            "powered by Twilio and the OpenAI Realtime API. You can ask me "
-                            "for facts, jokes, or anything you can imagine. How can I help you?'"
+                            "Greet the caller warmly with: 'Hello! Welcome to Finlumina Demo Vox. "
+                            "I'm your AI voice assistant powered by advanced realtime technology. "
+                            "How can I help you today?'"
                         )
                     }
                 ]
@@ -306,7 +312,7 @@ class OpenAIService:
         # Callbacks
         self.caller_transcript_callback: Optional[callable] = None
         self.ai_transcript_callback: Optional[callable] = None
-        self.human_transcript_callback: Optional[callable] = None  # ✅ NEW
+        self.human_transcript_callback: Optional[callable] = None
         
         # Track last transcript timestamp
         self._last_transcript_time: Dict[str, float] = {"Caller": 0, "AI": 0, "Human": 0}
@@ -320,8 +326,14 @@ class OpenAIService:
         session_update = self.session_manager.create_session_update()
         Log.json('Sending session update', session_update)
         await connection_manager.send_to_openai(session_update)
+        
+        # ✅ Auto-send greeting after session is ready
+        await asyncio.sleep(0.5)  # Small delay to ensure session is established
+        await self.send_initial_greeting(connection_manager)
 
     async def send_initial_greeting(self, connection_manager) -> None:
+        """Send the initial greeting automatically."""
+        Log.info("🎤 Sending initial greeting...")
         initial_item = self.session_manager.create_initial_conversation_item()
         response_trigger = self.session_manager.create_response_trigger()
         await connection_manager.send_to_openai(initial_item)
@@ -365,7 +377,7 @@ class OpenAIService:
         except Exception as e:
             Log.error(f"Failed to send human audio to OpenAI: {e}")
 
-    # ✅ NEW: Extract human agent transcript
+    # ✅ Extract human agent transcript
     async def extract_human_transcript(self, event: Dict[str, Any]) -> None:
         """
         Extract HUMAN agent transcript from OpenAI transcription.
