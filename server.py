@@ -1,4 +1,4 @@
-# server.py - Fixed Audio Delay During Takeover
+# server.py - Fixed Audio Streaming (Direct, No Delays)
 import os
 import json
 import time
@@ -252,21 +252,12 @@ async def handle_takeover(request: Request):
         
         openai_service = active_calls[call_sid].get("openai_service")
         connection_manager = active_calls[call_sid].get("connection_manager")
-        transcription_service = active_calls[call_sid].get("transcription_service")
         
         if not openai_service or not connection_manager:
             return JSONResponse({"error": "Service not available"}, status_code=500)
         
         if action == "enable":
             openai_service.enable_human_takeover()
-            
-            # ✅ CRITICAL: Clear audio buffer to prevent delayed audio
-            if transcription_service:
-                try:
-                    transcription_service.clear_buffers()
-                    Log.info(f"[Takeover] Cleared audio buffers")
-                except Exception as e:
-                    Log.error(f"Failed to clear buffers: {e}")
             
             # ✅ Cancel any ongoing AI responses
             try:
@@ -429,8 +420,9 @@ async def handle_media_stream(websocket: WebSocket):
     
     current_call_sid: Optional[str] = None
 
-    # Audio streaming callback - DIRECT TO DASHBOARD (NO BUFFERING)
+    # ✅ DIRECT audio streaming (NO buffering, NO delays)
     async def handle_audio_stream(audio_data: Dict[str, Any]):
+        """Send audio directly to dashboard - NO delays, NO buffering."""
         if current_call_sid:
             payload = {
                 "messageType": "audio",
@@ -439,10 +431,8 @@ async def handle_media_stream(websocket: WebSocket):
                 "timestamp": audio_data.get("timestamp", int(time.time() * 1000)),
                 "callSid": current_call_sid,
             }
-            # ✅ Send immediately without buffering
+            # ✅ Send IMMEDIATELY to dashboard
             await _do_broadcast(payload, current_call_sid)
-
-    transcription_service.set_audio_callback(handle_audio_stream)
 
     # OpenAI transcript callback
     async def handle_openai_transcript(transcription_data: Dict[str, Any]):
@@ -519,10 +509,13 @@ async def handle_media_stream(websocket: WebSocket):
                                 except Exception as e:
                                     Log.error(f"[media] Failed to send to human: {e}")
                         
-                        # Stream to dashboard for monitoring ONLY if not silence
+                        # Stream to dashboard for monitoring ONLY if not silence - DIRECT
                         if should_send_to_dashboard:
-                            # ✅ Route through transcription service for sequential playback
-                            await transcription_service.stream_audio_chunk(payload_b64, source="Caller")
+                            await handle_audio_stream({
+                                "speaker": "Caller",
+                                "audio": payload_b64,
+                                "timestamp": int(time.time() * 1000)
+                            })
                     else:
                         # Normal mode: send to OpenAI (always)
                         if connection_manager.is_openai_connected():
@@ -533,10 +526,13 @@ async def handle_media_stream(websocket: WebSocket):
                             except Exception as e:
                                 Log.error(f"[media] failed to send to OpenAI: {e}")
                         
-                        # Stream caller audio to dashboard ONLY if not silence
+                        # Stream caller audio to dashboard ONLY if not silence - DIRECT
                         if should_send_to_dashboard:
-                            # ✅ Route through transcription service for sequential playback
-                            await transcription_service.stream_audio_chunk(payload_b64, source="Caller")
+                            await handle_audio_stream({
+                                "speaker": "Caller",
+                                "audio": payload_b64,
+                                "timestamp": int(time.time() * 1000)
+                            })
                         else:
                             Log.debug("[media] Filtered caller silence")
 
@@ -570,10 +566,13 @@ async def handle_media_stream(websocket: WebSocket):
                         except Exception as e:
                             Log.error(f"[audio->twilio] failed: {e}")
                     
-                    # ✅ Stream AI audio to dashboard ONLY if not silence
+                    # ✅ Stream AI audio to dashboard ONLY if not silence - DIRECT
                     if should_send_to_dashboard:
-                        # ✅ Route through transcription service for sequential playback
-                        await transcription_service.stream_audio_chunk(delta, source="AI")
+                        await handle_audio_stream({
+                            "speaker": "AI",
+                            "audio": delta,
+                            "timestamp": int(time.time() * 1000)
+                        })
                         
             except Exception as e:
                 Log.error(f"[audio-delta] failed: {e}")
