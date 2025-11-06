@@ -431,6 +431,7 @@ async def handle_media_stream(websocket: WebSocket):
         Sequential AI audio streaming with natural timing.
         Each chunk plays with its proper duration before the next.
         """
+        nonlocal user_is_speaking
         Log.info("[AI Streamer] 🎵 Started")
         
         while not shutdown_flag:
@@ -454,7 +455,7 @@ async def handle_media_stream(websocket: WebSocket):
                     Log.debug(f"[AI Streamer] Duration calc error: {e}")
                     duration_seconds = 0.02  # Default 20ms
                 
-                # Send to dashboard
+                # Send to dashboard using nonblocking broadcast
                 if current_call_sid:
                     payload = {
                         "messageType": "audio",
@@ -463,7 +464,8 @@ async def handle_media_stream(websocket: WebSocket):
                         "timestamp": audio_data.get("timestamp", int(time.time() * 1000)),
                         "callSid": current_call_sid,
                     }
-                    await _do_broadcast(payload, current_call_sid)
+                    # 🔥 FIX: Use nonblocking broadcast
+                    broadcast_to_dashboards_nonblocking(payload, current_call_sid)
                 
                 # Wait for natural chunk duration
                 await asyncio.sleep(duration_seconds)
@@ -475,19 +477,6 @@ async def handle_media_stream(websocket: WebSocket):
                 await asyncio.sleep(0.01)
         
         Log.info("[AI Streamer] 🛑 Stopped")
-
-    # ✅ DIRECT audio streaming for CALLER (instant, no queuing)
-    async def handle_caller_audio(audio_data: Dict[str, Any]):
-        """Send caller audio directly to dashboard - NO delays."""
-        if current_call_sid:
-            payload = {
-                "messageType": "audio",
-                "speaker": "Caller",
-                "audio": audio_data["audio"],
-                "timestamp": audio_data.get("timestamp", int(time.time() * 1000)),
-                "callSid": current_call_sid,
-            }
-            await _do_broadcast(payload, current_call_sid)
     
     # ✅ QUEUED audio streaming for AI (natural timing)
     async def handle_ai_audio(audio_data: Dict[str, Any]):
@@ -568,10 +557,14 @@ async def handle_media_stream(websocket: WebSocket):
                         
                         # Stream to dashboard ONLY if not silence - DIRECT
                         if should_send_to_dashboard:
-                            await handle_caller_audio({
+                            # 🔥 FIX: Use nonblocking broadcast
+                            broadcast_to_dashboards_nonblocking({
+                                "messageType": "audio",
+                                "speaker": "Caller",
                                 "audio": payload_b64,
-                                "timestamp": int(time.time() * 1000)
-                            })
+                                "timestamp": int(time.time() * 1000),
+                                "callSid": current_call_sid
+                            }, current_call_sid)
                     else:
                         # Normal mode: send to OpenAI (always)
                         if connection_manager.is_openai_connected():
@@ -584,10 +577,14 @@ async def handle_media_stream(websocket: WebSocket):
                         
                         # Stream caller audio to dashboard ONLY if not silence - DIRECT
                         if should_send_to_dashboard:
-                            await handle_caller_audio({
+                            # 🔥 FIX: Use nonblocking broadcast
+                            broadcast_to_dashboards_nonblocking({
+                                "messageType": "audio",
+                                "speaker": "Caller",
                                 "audio": payload_b64,
-                                "timestamp": int(time.time() * 1000)
-                            })
+                                "timestamp": int(time.time() * 1000),
+                                "callSid": current_call_sid
+                            }, current_call_sid)
 
         async def handle_audio_delta(response: dict):
             """Handle audio response from OpenAI."""
