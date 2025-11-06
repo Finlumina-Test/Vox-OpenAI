@@ -424,14 +424,17 @@ async def handle_media_stream(websocket: WebSocket):
     ai_audio_queue = asyncio.Queue()
     ai_stream_task = None
     shutdown_flag = False
-    user_is_speaking = False  # 🔥 Track if user interrupted AI
+    
+    # 🔥 FIXED: Proper interruption tracking
+    ai_currently_speaking = False  # Track if AI is actively speaking
+    last_speech_started_time = 0  # When user last interrupted
 
     async def ai_audio_streamer():
         """
         Sequential AI audio streaming with natural timing.
         Each chunk plays with its proper duration before the next.
         """
-        nonlocal user_is_speaking
+        nonlocal ai_currently_speaking
         Log.info("[AI Streamer] 🎵 Started")
         
         while not shutdown_flag:
@@ -440,11 +443,6 @@ async def handle_media_stream(websocket: WebSocket):
                 
                 if audio_data is None:  # Shutdown signal
                     break
-                
-                # 🔥 Skip AI audio if user is speaking (interruption)
-                if user_is_speaking:
-                    ai_audio_queue.task_done()
-                    continue
                 
                 # Calculate chunk duration (8kHz µ-law)
                 audio_b64 = audio_data.get("audio", "")
@@ -455,6 +453,9 @@ async def handle_media_stream(websocket: WebSocket):
                     Log.debug(f"[AI Streamer] Duration calc error: {e}")
                     duration_seconds = 0.02  # Default 20ms
                 
+                # 🔥 Mark that AI is speaking
+                ai_currently_speaking = True
+                
                 # Send to dashboard using nonblocking broadcast
                 if current_call_sid:
                     payload = {
@@ -464,7 +465,6 @@ async def handle_media_stream(websocket: WebSocket):
                         "timestamp": audio_data.get("timestamp", int(time.time() * 1000)),
                         "callSid": current_call_sid,
                     }
-                    # 🔥 FIX: Use nonblocking broadcast
                     broadcast_to_dashboards_nonblocking(payload, current_call_sid)
                 
                 # Wait for natural chunk duration
@@ -555,9 +555,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 except Exception as e:
                                     Log.error(f"[media] Failed to send to human: {e}")
                         
-                        # Stream to dashboard ONLY if not silence - DIRECT
+                        # Stream to dashboard ONLY if not silence
                         if should_send_to_dashboard:
-                            # 🔥 FIX: Use nonblocking broadcast
                             broadcast_to_dashboards_nonblocking({
                                 "messageType": "audio",
                                 "speaker": "Caller",
@@ -575,9 +574,8 @@ async def handle_media_stream(websocket: WebSocket):
                             except Exception as e:
                                 Log.error(f"[media] failed to send to OpenAI: {e}")
                         
-                        # Stream caller audio to dashboard ONLY if not silence - DIRECT
+                        # Stream caller audio to dashboard ONLY if not silence
                         if should_send_to_dashboard:
-                            # 🔥 FIX: Use nonblocking broadcast
                             broadcast_to_dashboards_nonblocking({
                                 "messageType": "audio",
                                 "speaker": "Caller",
@@ -588,8 +586,6 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def handle_audio_delta(response: dict):
             """Handle audio response from OpenAI."""
-            nonlocal user_is_speaking
-            
             try:
                 # ✅ Skip AI audio if human has taken over
                 if openai_service.is_human_in_control():
@@ -600,18 +596,10 @@ async def handle_media_stream(websocket: WebSocket):
                 delta = audio_data.get("delta")
                 
                 if delta:
-                    # 🔥 Check if user interrupted before processing
-                    if user_is_speaking:
-                        Log.debug("[Audio] 🛑 Dropping AI audio - user is speaking")
-                        return  # Don't send to Twilio OR dashboard
-                    
-                    # 🔥 AI is responding, so user interruption is over
-                    user_is_speaking = False
-                    
                     # ✅ Check if AI audio is silence
                     should_send_to_dashboard = ai_silence_detector.should_transmit(delta, "AI")
                     
-                    # 🔥 Send to Twilio ONLY if user isn't speaking
+                    # Send to Twilio for phone call
                     if getattr(connection_manager.state, "stream_sid", None):
                         try:
                             audio_message = audio_service.process_outgoing_audio(
@@ -638,14 +626,14 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def handle_speech_started():
             """Handle user speech interruption - IMMEDIATE cutoff."""
-            nonlocal user_is_speaking
+            nonlocal ai_currently_speaking, last_speech_started_time
             
             try:
                 if not openai_service.is_human_in_control():
                     Log.info("🛑 [Interruption] USER SPEAKING - Stopping AI immediately")
                     
-                    # 🔥 Set flag to stop AI audio streaming
-                    user_is_speaking = True
+                    # 🔥 Record interruption time
+                    last_speech_started_time = time.time()
                     
                     # ✅ Step 1: Send CLEAR to Twilio to stop playing buffered audio
                     try:
@@ -681,6 +669,9 @@ async def handle_media_stream(websocket: WebSocket):
                     
                     if cleared_count > 0:
                         Log.info(f"🗑️ [Interruption] Cleared {cleared_count} AI audio chunks")
+                    
+                    # 🔥 Mark AI as stopped
+                    ai_currently_speaking = False
                     
                     # ✅ Step 4: Send mark to Twilio
                     await connection_manager.send_mark_to_twilio()
