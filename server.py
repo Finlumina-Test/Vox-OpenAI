@@ -275,14 +275,18 @@ async def handle_takeover(request: Request):
         if action == "enable":
             openai_service.enable_human_takeover()
             
-            # ✅ Cancel any ongoing AI responses
+            # ✅ Try to cancel ongoing AI responses (ignore if none active)
             try:
                 await connection_manager.send_to_openai({
                     "type": "response.cancel"
                 })
                 Log.info(f"[Takeover] Cancelled AI response for call {call_sid}")
             except Exception as e:
-                Log.error(f"Failed to cancel AI response: {e}")
+                # Ignore "no active response" errors - this is normal
+                if "response_cancel_not_active" in str(e):
+                    Log.debug(f"[Takeover] No active response to cancel (this is fine)")
+                else:
+                    Log.error(f"Failed to cancel AI response: {e}")
             
             # ✅ Clear input audio buffer to prevent AI from responding to old audio
             try:
@@ -306,14 +310,17 @@ async def handle_takeover(request: Request):
             # ✅ ENHANCED DISABLE SEQUENCE
             openai_service.disable_human_takeover()
             
-            # ✅ Step 1: Cancel any pending responses
+            # ✅ Step 1: Try to cancel any pending responses (ignore if none)
             try:
                 await connection_manager.send_to_openai({
                     "type": "response.cancel"
                 })
                 Log.info(f"[Takeover] Cancelled pending responses")
             except Exception as e:
-                Log.error(f"Failed to cancel responses: {e}")
+                if "response_cancel_not_active" in str(e):
+                    Log.debug(f"[Takeover] No pending responses (this is fine)")
+                else:
+                    Log.error(f"Failed to cancel responses: {e}")
             
             # ✅ Step 2: Clear audio buffer completely
             try:
@@ -739,8 +746,25 @@ async def handle_media_stream(websocket: WebSocket):
         async def on_start_cb(stream_sid: str):
             """Handle Twilio stream start."""
             nonlocal current_call_sid, ai_stream_task
-            current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
-            Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
+            
+            # 🔥 FIXED: Properly extract callSid from Twilio metadata
+            # Twilio sends callSid in connection_manager.state.call_sid
+            twilio_call_sid = getattr(connection_manager.state, 'call_sid', None)
+            
+            if twilio_call_sid:
+                current_call_sid = twilio_call_sid
+                Log.info(f"✅ Using Twilio Call SID: {current_call_sid}")
+            else:
+                # Fallback to stream_sid (but this shouldn't be used for API calls)
+                current_call_sid = stream_sid
+                Log.warning(f"⚠️ No Call SID from Twilio, using Stream SID: {stream_sid}")
+            
+            Log.event("Twilio Start", {
+                "streamSid": stream_sid, 
+                "callSid": current_call_sid,
+                "callSidLength": len(current_call_sid),
+                "callSidStartsWithCA": current_call_sid.startswith('CA') if current_call_sid else False
+            })
             
             # ✅ Reset silence detectors
             caller_silence_detector.reset()
