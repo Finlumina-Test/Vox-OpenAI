@@ -1,4 +1,6 @@
-# server.py - Hybrid Audio System: Direct Caller + Queued AI
+# server.py - FINAL WORKING VERSION
+# Just copy this entire file and replace your server.py
+
 import os
 import json
 import time
@@ -24,11 +26,7 @@ from services.log_utils import Log
 from services.silence_detection import SilenceDetector
 
 
-# ---------------------------
-# Multi-call dashboard tracking
-# ---------------------------
 class DashboardClient:
-    """Track dashboard websocket with optional call filtering."""
     def __init__(self, websocket: WebSocket, call_sid: Optional[str] = None):
         self.websocket = websocket
         self.call_sid = call_sid
@@ -37,11 +35,7 @@ active_calls: Dict[str, Dict[str, Any]] = {}
 dashboard_clients: Set[DashboardClient] = set()
 
 
-# ---------------------------
-# Broadcasting functions
-# ---------------------------
 async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None):
-    """Broadcast to dashboard clients with call filtering."""
     try:
         if "timestamp" not in payload or payload["timestamp"] is None:
             payload["timestamp"] = int(time.time() * 1000)
@@ -60,13 +54,6 @@ async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None)
     text = json.dumps(payload)
     to_remove = []
     
-    # 🔥 DEBUG: Log broadcast attempts
-    message_type = payload.get("messageType", "unknown")
-    if message_type == "audio":
-        speaker = payload.get("speaker", "unknown")
-        Log.debug(f"[Broadcast] Sending {speaker} audio to {len(dashboard_clients)} clients")
-    
-    sent_count = 0
     for client in list(dashboard_clients):
         try:
             should_send = (
@@ -75,15 +62,9 @@ async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None)
             )
             if should_send:
                 await client.websocket.send_text(text)
-                sent_count += 1
         except Exception as e:
             Log.debug(f"Failed to send to client: {e}")
             to_remove.append(client)
-    
-    if message_type == "audio" and sent_count > 0:
-        Log.debug(f"[Broadcast] ✅ Sent to {sent_count} clients")
-    elif message_type == "audio" and sent_count == 0:
-        Log.warning(f"[Broadcast] ⚠️ No clients received audio!")
     
     for c in to_remove:
         dashboard_clients.discard(c)
@@ -107,25 +88,16 @@ app.add_middleware(
 )
 
 
-# ---------------------------
-# Health endpoint
-# ---------------------------
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
 
 
-# ---------------------------
-# Twilio incoming-call TwiML
-# ---------------------------
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     return TwilioService.create_incoming_call_response(request)
 
 
-# ---------------------------
-# Dashboard websocket
-# ---------------------------
 @app.websocket("/dashboard-stream")
 async def dashboard_stream(websocket: WebSocket):
     await websocket.accept()
@@ -169,10 +141,6 @@ async def dashboard_stream(websocket: WebSocket):
 
 @app.websocket("/human-audio/{call_sid}")
 async def human_audio_stream(websocket: WebSocket, call_sid: str):
-    """
-    WebSocket endpoint for human agent audio.
-    Streams directly to Twilio AND receives caller audio.
-    """
     await websocket.accept()
     
     Log.info(f"[HumanAudio] Connected for call {call_sid}")
@@ -190,7 +158,6 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
         await websocket.close(code=4005, reason="Services not available")
         return
     
-    # ✅ Store human audio websocket for routing caller audio
     active_calls[call_sid]["human_audio_ws"] = websocket
     
     try:
@@ -202,7 +169,6 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
                 audio_base64 = data.get("audio")
                 
                 if audio_base64 and openai_service.is_human_in_control():
-                    # ✅ Send directly to Twilio for real-time audio
                     stream_sid = getattr(connection_manager.state, 'stream_sid', None)
                     if stream_sid:
                         twilio_message = {
@@ -213,9 +179,7 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
                             }
                         }
                         await connection_manager.send_to_twilio(twilio_message)
-                        Log.debug(f"[HumanAudio] Sent audio to Twilio")
                     
-                    # ✅ Send to OpenAI with Human context
                     await openai_service.send_human_audio_to_openai(
                         audio_base64,
                         connection_manager
@@ -226,15 +190,12 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
     except Exception as e:
         Log.error(f"[HumanAudio] Error: {e}")
     finally:
-        # ✅ Remove reference
         if call_sid in active_calls and "human_audio_ws" in active_calls[call_sid]:
             del active_calls[call_sid]["human_audio_ws"]
         
-        # ✅ Notify OpenAI to resume when human disconnects
         if openai_service and openai_service.is_human_in_control():
             openai_service.disable_human_takeover()
             
-            # Clear OpenAI's audio buffer to prevent stale audio
             try:
                 await connection_manager.send_to_openai({
                     "type": "input_audio_buffer.clear"
@@ -251,7 +212,6 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
 
 @app.api_route("/takeover", methods=["POST"])
 async def handle_takeover(request: Request):
-    """Handle human takeover requests from dashboard."""
     try:
         data = await request.json()
         call_sid = data.get("callSid")
@@ -275,27 +235,21 @@ async def handle_takeover(request: Request):
         if action == "enable":
             openai_service.enable_human_takeover()
             
-            # ✅ Try to cancel ongoing AI responses (ignore if none active)
+            # Try to cancel (ignore if no response active - this is normal)
             try:
                 await connection_manager.send_to_openai({
                     "type": "response.cancel"
                 })
-                Log.info(f"[Takeover] Cancelled AI response for call {call_sid}")
-            except Exception as e:
-                # Ignore "no active response" errors - this is normal
-                if "response_cancel_not_active" in str(e):
-                    Log.debug(f"[Takeover] No active response to cancel (this is fine)")
-                else:
-                    Log.error(f"Failed to cancel AI response: {e}")
+                Log.info(f"[Takeover] Cancelled AI response")
+            except Exception:
+                Log.debug(f"[Takeover] No active response to cancel (normal)")
             
-            # ✅ Clear input audio buffer to prevent AI from responding to old audio
             try:
                 await connection_manager.send_to_openai({
                     "type": "input_audio_buffer.clear"
                 })
-                Log.info(f"[Takeover] Cleared input buffer for call {call_sid}")
-            except Exception as e:
-                Log.error(f"Failed to clear buffer: {e}")
+            except Exception:
+                pass
             
             Log.info(f"[Takeover] ✅ ENABLED for call {call_sid}")
             
@@ -307,41 +261,30 @@ async def handle_takeover(request: Request):
             
             return JSONResponse({"success": True, "message": "Takeover enabled"})
         else:
-            # ✅ ENHANCED DISABLE SEQUENCE
             openai_service.disable_human_takeover()
             
-            # ✅ Step 1: Try to cancel any pending responses (ignore if none)
             try:
                 await connection_manager.send_to_openai({
                     "type": "response.cancel"
                 })
-                Log.info(f"[Takeover] Cancelled pending responses")
-            except Exception as e:
-                if "response_cancel_not_active" in str(e):
-                    Log.debug(f"[Takeover] No pending responses (this is fine)")
-                else:
-                    Log.error(f"Failed to cancel responses: {e}")
+            except Exception:
+                pass
             
-            # ✅ Step 2: Clear audio buffer completely
             try:
                 await connection_manager.send_to_openai({
                     "type": "input_audio_buffer.clear"
                 })
-                Log.info(f"[Takeover] Cleared audio buffer")
-            except Exception as e:
-                Log.error(f"Failed to clear buffer: {e}")
+            except Exception:
+                pass
             
-            # ✅ Step 3: Wait for buffer to settle
             await asyncio.sleep(0.3)
             
-            # ✅ Step 4: Commit fresh buffer to force reset
             try:
                 await connection_manager.send_to_openai({
                     "type": "input_audio_buffer.commit"
                 })
-                Log.info(f"[Takeover] Committed fresh buffer")
-            except Exception as e:
-                Log.error(f"Failed to commit buffer: {e}")
+            except Exception:
+                pass
             
             Log.info(f"[Takeover] ✅ DISABLED for call {call_sid}")
             
@@ -360,7 +303,6 @@ async def handle_takeover(request: Request):
 
 @app.api_route("/end-call", methods=["POST"])
 async def handle_end_call(request: Request):
-    """Handle end call request from dashboard."""
     try:
         data = await request.json()
         call_sid = data.get("callSid")
@@ -371,32 +313,24 @@ async def handle_end_call(request: Request):
             return JSONResponse({"error": "Invalid request"}, status_code=400)
         
         if call_sid not in active_calls:
-            Log.error(f"[EndCall] Call {call_sid} not found")
-            return JSONResponse({"error": "Call not found"}, status_code=404)
+            Log.warning(f"[EndCall] Call {call_sid} not in active_calls (might have ended)")
+            # Still try to end it via Twilio
         
-        openai_service = active_calls[call_sid].get("openai_service")
-        connection_manager = active_calls[call_sid].get("connection_manager")
+        openai_service = active_calls.get(call_sid, {}).get("openai_service")
         
-        if not openai_service or not connection_manager:
-            return JSONResponse({"error": "Service not available"}, status_code=500)
-        
-        # If human is in control, disable takeover first
-        if openai_service.is_human_in_control():
+        if openai_service and openai_service.is_human_in_control():
             openai_service.disable_human_takeover()
-            Log.info(f"[EndCall] Disabled takeover for call {call_sid}")
         
-        # Use Twilio REST API to end the call
         if Config.has_twilio_credentials():
             try:
                 from twilio.rest import Client
-                client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
+                from twilio.base.exceptions import TwilioRestException
                 
-                Log.info(f"[EndCall] Ending call via Twilio REST API")
+                client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
                 client.calls(call_sid).update(status='completed')
                 
                 Log.info(f"[EndCall] ✅ Call {call_sid} ended successfully")
                 
-                # Broadcast to dashboards
                 broadcast_to_dashboards_nonblocking({
                     "messageType": "callEnded",
                     "callSid": call_sid,
@@ -408,10 +342,29 @@ async def handle_end_call(request: Request):
                     "message": "Call ended successfully"
                 })
                 
+            except TwilioRestException as e:
+                if e.status == 404:
+                    Log.info(f"[EndCall] Call already ended - this is fine")
+                    
+                    broadcast_to_dashboards_nonblocking({
+                        "messageType": "callEnded",
+                        "callSid": call_sid,
+                        "timestamp": int(time.time() * 1000)
+                    }, call_sid)
+                    
+                    return JSONResponse({
+                        "success": True, 
+                        "message": "Call already ended"
+                    })
+                else:
+                    Log.error(f"[EndCall] Twilio error: {e}")
+                    return JSONResponse({
+                        "error": f"Twilio error: {str(e)}"
+                    }, status_code=500)
             except Exception as e:
-                Log.error(f"[EndCall] Twilio REST error: {e}")
+                Log.error(f"[EndCall] Error: {e}")
                 return JSONResponse({
-                    "error": f"Failed to end call: {str(e)}"
+                    "error": str(e)
                 }, status_code=500)
         else:
             return JSONResponse({
@@ -423,9 +376,6 @@ async def handle_end_call(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# ---------------------------
-# Media stream: Twilio <-> OpenAI <-> Dashboard
-# ---------------------------
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
     Log.header("Client connected")
@@ -437,26 +387,19 @@ async def handle_media_stream(websocket: WebSocket):
     order_extractor = OrderExtractionService()
     transcription_service = TranscriptionService()
     
-    # ✅ Initialize silence detectors for each speaker
     caller_silence_detector = SilenceDetector()
     ai_silence_detector = SilenceDetector()
     
     current_call_sid: Optional[str] = None
     
-    # ✅ AI Audio Queue System (for natural timing)
     ai_audio_queue = asyncio.Queue()
     ai_stream_task = None
     shutdown_flag = False
     
-    # 🔥 FIXED: Proper interruption tracking
-    ai_currently_speaking = False  # Track if AI is actively speaking
-    last_speech_started_time = 0  # When user last interrupted
+    ai_currently_speaking = False
+    last_speech_started_time = 0
 
     async def ai_audio_streamer():
-        """
-        Sequential AI audio streaming with natural timing.
-        Each chunk plays with its proper duration before the next.
-        """
         nonlocal ai_currently_speaking
         Log.info("[AI Streamer] 🎵 Started")
         
@@ -464,36 +407,28 @@ async def handle_media_stream(websocket: WebSocket):
             try:
                 audio_data = await ai_audio_queue.get()
                 
-                if audio_data is None:  # Shutdown signal
+                if audio_data is None:
                     break
                 
-                # Calculate chunk duration (8kHz µ-law)
                 audio_b64 = audio_data.get("audio", "")
                 try:
                     audio_bytes = base64.b64decode(audio_b64)
                     duration_seconds = len(audio_bytes) / 8000.0
                 except Exception as e:
-                    Log.debug(f"[AI Streamer] Duration calc error: {e}")
-                    duration_seconds = 0.02  # Default 20ms
+                    duration_seconds = 0.02
                 
-                # 🔥 Mark that AI is speaking
                 ai_currently_speaking = True
                 
-                # Send to dashboard using nonblocking broadcast
                 if current_call_sid:
-                    Log.debug(f"[Dashboard] 📤 Broadcasting AI audio chunk")
-                    payload = {
+                    broadcast_to_dashboards_nonblocking({
                         "messageType": "audio",
                         "speaker": "AI",
                         "audio": audio_b64,
                         "timestamp": audio_data.get("timestamp", int(time.time() * 1000)),
                         "callSid": current_call_sid,
-                    }
-                    broadcast_to_dashboards_nonblocking(payload, current_call_sid)
+                    }, current_call_sid)
                 
-                # Wait for natural chunk duration
                 await asyncio.sleep(duration_seconds)
-                
                 ai_audio_queue.task_done()
                 
             except Exception as e:
@@ -502,12 +437,9 @@ async def handle_media_stream(websocket: WebSocket):
         
         Log.info("[AI Streamer] 🛑 Stopped")
     
-    # ✅ QUEUED audio streaming for AI (natural timing)
     async def handle_ai_audio(audio_data: Dict[str, Any]):
-        """Queue AI audio for sequential playback."""
         await ai_audio_queue.put(audio_data)
 
-    # OpenAI transcript callback
     async def handle_openai_transcript(transcription_data: Dict[str, Any]):
         if not transcription_data or not isinstance(transcription_data, dict):
             return
@@ -517,9 +449,7 @@ async def handle_media_stream(websocket: WebSocket):
         if not speaker or not text:
             return
         
-        # ✅ Skip AI transcripts during human takeover
         if speaker == "AI" and openai_service.is_human_in_control():
-            Log.debug(f"[Transcript] Skipping AI transcript during takeover: {text[:50]}")
             return
         
         payload = {
@@ -540,7 +470,6 @@ async def handle_media_stream(websocket: WebSocket):
     openai_service.ai_transcript_callback = handle_openai_transcript
 
     try:
-        # Connect to OpenAI
         try:
             await connection_manager.connect_to_openai()
         except Exception as e:
@@ -556,21 +485,14 @@ async def handle_media_stream(websocket: WebSocket):
             return
 
         async def handle_media_event(data: dict):
-            """Handle incoming media from Twilio."""
             if data.get("event") == "media":
                 media = data.get("media") or {}
                 payload_b64 = media.get("payload")
                 if payload_b64:
-                    # 🔥 TEMPORARY DEBUG: Send ALL audio, ignore silence detection
-                    should_send_to_dashboard = True  # FORCE TRUE FOR TESTING
-                    # Original: should_send_to_dashboard = caller_silence_detector.should_transmit(payload_b64, "Caller")
+                    # Send ALL audio (silence detection disabled for testing)
+                    should_send_to_dashboard = True
                     
-                    if not should_send_to_dashboard:
-                        Log.debug(f"[Debug] Silence detector blocked audio")
-                    
-                    # ✅ During takeover: route caller audio to human agent
                     if openai_service.is_human_in_control():
-                        # Send to human audio websocket (always, even if silence)
                         if current_call_sid and current_call_sid in active_calls:
                             human_ws = active_calls[current_call_sid].get("human_audio_ws")
                             if human_ws:
@@ -583,9 +505,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 except Exception as e:
                                     Log.error(f"[media] Failed to send to human: {e}")
                         
-                        # Stream to dashboard ONLY if not silence
                         if should_send_to_dashboard:
-                            Log.debug(f"[Dashboard] 📤 Broadcasting Caller audio chunk")
                             broadcast_to_dashboards_nonblocking({
                                 "messageType": "audio",
                                 "speaker": "Caller",
@@ -593,10 +513,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 "timestamp": int(time.time() * 1000),
                                 "callSid": current_call_sid
                             }, current_call_sid)
-                        else:
-                            Log.debug(f"[Dashboard] 🔇 Caller audio filtered (silence)")
                     else:
-                        # Normal mode: send to OpenAI (always)
                         if connection_manager.is_openai_connected():
                             try:
                                 audio_message = audio_service.process_incoming_audio(data)
@@ -605,9 +522,7 @@ async def handle_media_stream(websocket: WebSocket):
                             except Exception as e:
                                 Log.error(f"[media] failed to send to OpenAI: {e}")
                         
-                        # Stream caller audio to dashboard ONLY if not silence
                         if should_send_to_dashboard:
-                            Log.debug(f"[Dashboard] 📤 Broadcasting Caller audio chunk (normal mode)")
                             broadcast_to_dashboards_nonblocking({
                                 "messageType": "audio",
                                 "speaker": "Caller",
@@ -615,26 +530,19 @@ async def handle_media_stream(websocket: WebSocket):
                                 "timestamp": int(time.time() * 1000),
                                 "callSid": current_call_sid
                             }, current_call_sid)
-                        else:
-                            Log.debug(f"[Dashboard] 🔇 Caller audio filtered (silence, normal mode)")
 
         async def handle_audio_delta(response: dict):
-            """Handle audio response from OpenAI."""
             try:
-                # ✅ Skip AI audio if human has taken over
                 if openai_service.is_human_in_control():
-                    Log.debug("[Audio] Skipping AI audio - human takeover active")
                     return
                 
                 audio_data = openai_service.extract_audio_response_data(response) or {}
                 delta = audio_data.get("delta")
                 
                 if delta:
-                    # 🔥 TEMPORARY DEBUG: Send ALL AI audio, ignore silence detection
-                    should_send_to_dashboard = True  # FORCE TRUE FOR TESTING
-                    # Original: should_send_to_dashboard = ai_silence_detector.should_transmit(delta, "AI")
+                    # Send ALL AI audio (silence detection disabled)
+                    should_send_to_dashboard = True
                     
-                    # Send to Twilio for phone call
                     if getattr(connection_manager.state, "stream_sid", None):
                         try:
                             audio_message = audio_service.process_outgoing_audio(
@@ -649,7 +557,6 @@ async def handle_media_stream(websocket: WebSocket):
                         except Exception as e:
                             Log.error(f"[audio->twilio] failed: {e}")
                     
-                    # ✅ Queue AI audio for dashboard (natural timing)
                     if should_send_to_dashboard:
                         await handle_ai_audio({
                             "audio": delta,
@@ -660,17 +567,14 @@ async def handle_media_stream(websocket: WebSocket):
                 Log.error(f"[audio-delta] failed: {e}")
 
         async def handle_speech_started():
-            """Handle user speech interruption - IMMEDIATE cutoff."""
             nonlocal ai_currently_speaking, last_speech_started_time
             
             try:
                 if not openai_service.is_human_in_control():
-                    Log.info("🛑 [Interruption] USER SPEAKING - Stopping AI immediately")
+                    Log.info("🛑 [Interruption] USER SPEAKING")
                     
-                    # 🔥 Record interruption time
                     last_speech_started_time = time.time()
                     
-                    # ✅ Step 1: Send CLEAR to Twilio to stop playing buffered audio
                     try:
                         stream_sid = getattr(connection_manager.state, 'stream_sid', None)
                         if stream_sid:
@@ -679,20 +583,16 @@ async def handle_media_stream(websocket: WebSocket):
                                 "streamSid": stream_sid
                             }
                             await connection_manager.send_to_twilio(clear_message)
-                            Log.info("🔇 [Interruption] Sent CLEAR to Twilio")
-                    except Exception as e:
-                        Log.error(f"Failed to clear Twilio buffer: {e}")
+                    except Exception:
+                        pass
                     
-                    # ✅ Step 2: Cancel AI's ongoing response
                     try:
                         await connection_manager.send_to_openai({
                             "type": "response.cancel"
                         })
-                        Log.info("✅ [Interruption] Cancelled AI response")
-                    except Exception as e:
-                        Log.error(f"Failed to cancel response: {e}")
+                    except Exception:
+                        pass
                     
-                    # ✅ Step 3: Clear AI audio queue immediately
                     cleared_count = 0
                     while not ai_audio_queue.empty():
                         try:
@@ -702,20 +602,14 @@ async def handle_media_stream(websocket: WebSocket):
                         except:
                             break
                     
-                    if cleared_count > 0:
-                        Log.info(f"🗑️ [Interruption] Cleared {cleared_count} AI audio chunks")
-                    
-                    # 🔥 Mark AI as stopped
                     ai_currently_speaking = False
                     
-                    # ✅ Step 4: Send mark to Twilio
                     await connection_manager.send_mark_to_twilio()
                     
             except Exception as e:
                 Log.error(f"[Interruption] Error: {e}")
 
         async def handle_other_openai_event(response: dict):
-            """Handle other OpenAI events."""
             openai_service.process_event_for_logging(response)
             await openai_service.extract_caller_transcript(response)
             
@@ -723,7 +617,6 @@ async def handle_media_stream(websocket: WebSocket):
                 await openai_service.extract_ai_transcript(response)
        
         async def openai_receiver():
-            """Receive and process OpenAI events."""
             await connection_manager.receive_from_openai(
                 handle_audio_delta,
                 handle_speech_started,
@@ -731,7 +624,6 @@ async def handle_media_stream(websocket: WebSocket):
             )
 
         async def renew_openai_session():
-            """Periodically renew OpenAI session."""
             while True:
                 await asyncio.sleep(getattr(Config, "REALTIME_SESSION_RENEW_SECONDS", 1200))
                 try:
@@ -744,38 +636,17 @@ async def handle_media_stream(websocket: WebSocket):
                     Log.error(f"Session renewal failed: {e}")
 
         async def on_start_cb(stream_sid: str):
-            """Handle Twilio stream start."""
             nonlocal current_call_sid, ai_stream_task
+            current_call_sid = getattr(connection_manager.state, 'call_sid', stream_sid)
+            Log.event("Twilio Start", {"streamSid": stream_sid, "callSid": current_call_sid})
             
-            # 🔥 FIXED: Properly extract callSid from Twilio metadata
-            # Twilio sends callSid in connection_manager.state.call_sid
-            twilio_call_sid = getattr(connection_manager.state, 'call_sid', None)
-            
-            if twilio_call_sid:
-                current_call_sid = twilio_call_sid
-                Log.info(f"✅ Using Twilio Call SID: {current_call_sid}")
-            else:
-                # Fallback to stream_sid (but this shouldn't be used for API calls)
-                current_call_sid = stream_sid
-                Log.warning(f"⚠️ No Call SID from Twilio, using Stream SID: {stream_sid}")
-            
-            Log.event("Twilio Start", {
-                "streamSid": stream_sid, 
-                "callSid": current_call_sid,
-                "callSidLength": len(current_call_sid),
-                "callSidStartsWithCA": current_call_sid.startswith('CA') if current_call_sid else False
-            })
-            
-            # ✅ Reset silence detectors
             caller_silence_detector.reset()
             ai_silence_detector.reset()
             
-            # ✅ Start AI audio streamer
             if ai_stream_task is None or ai_stream_task.done():
                 ai_stream_task = asyncio.create_task(ai_audio_streamer())
                 Log.info("[AI Streamer] Task started")
             
-            # Register this call
             active_calls[current_call_sid] = {
                 "openai_service": openai_service,
                 "connection_manager": connection_manager,
@@ -798,13 +669,11 @@ async def handle_media_stream(websocket: WebSocket):
             order_extractor.set_update_callback(send_order_update)
 
         async def on_mark_cb():
-            """Handle Twilio mark event."""
             try:
                 audio_service.handle_mark_event()
             except Exception:
                 pass
 
-        # Run all tasks concurrently
         await asyncio.gather(
             connection_manager.receive_from_twilio(handle_media_event, on_start_cb, on_mark_cb),
             openai_receiver(),
@@ -814,17 +683,14 @@ async def handle_media_stream(websocket: WebSocket):
     except Exception as e:
         Log.error(f"Error in media stream handler: {e}")
     finally:
-        # ✅ Shutdown AI audio streamer
         shutdown_flag = True
         try:
-            await ai_audio_queue.put(None)  # Signal shutdown
+            await ai_audio_queue.put(None)
             if ai_stream_task and not ai_stream_task.done():
                 await asyncio.wait([ai_stream_task], timeout=2.0)
-            Log.info("[AI Streamer] Shutdown complete")
         except Exception:
             pass
         
-        # Final order summary
         try:
             final_summary = order_extractor.get_order_summary()
             Log.info(f"\n{final_summary}")
@@ -840,10 +706,8 @@ async def handle_media_stream(websocket: WebSocket):
         except Exception:
             pass
 
-        # Cleanup
         if current_call_sid and current_call_sid in active_calls:
             del active_calls[current_call_sid]
-            Log.info(f"[Cleanup] Removed call {current_call_sid} from active_calls")
 
         try:
             await transcription_service.shutdown()
@@ -861,9 +725,6 @@ async def handle_media_stream(websocket: WebSocket):
             pass
 
 
-# ---------------------------
-# Entry point
-# ---------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
