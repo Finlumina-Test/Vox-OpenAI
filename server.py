@@ -60,6 +60,13 @@ async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None)
     text = json.dumps(payload)
     to_remove = []
     
+    # 🔥 DEBUG: Log broadcast attempts
+    message_type = payload.get("messageType", "unknown")
+    if message_type == "audio":
+        speaker = payload.get("speaker", "unknown")
+        Log.debug(f"[Broadcast] Sending {speaker} audio to {len(dashboard_clients)} clients")
+    
+    sent_count = 0
     for client in list(dashboard_clients):
         try:
             should_send = (
@@ -68,16 +75,25 @@ async def _do_broadcast(payload: Dict[str, Any], call_sid: Optional[str] = None)
             )
             if should_send:
                 await client.websocket.send_text(text)
+                sent_count += 1
         except Exception as e:
             Log.debug(f"Failed to send to client: {e}")
             to_remove.append(client)
+    
+    if message_type == "audio" and sent_count > 0:
+        Log.debug(f"[Broadcast] ✅ Sent to {sent_count} clients")
+    elif message_type == "audio" and sent_count == 0:
+        Log.warning(f"[Broadcast] ⚠️ No clients received audio!")
     
     for c in to_remove:
         dashboard_clients.discard(c)
 
 
 def broadcast_to_dashboards_nonblocking(payload: Dict[str, Any], call_sid: Optional[str] = None):
-    asyncio.create_task(_do_broadcast(payload, call_sid))
+    try:
+        asyncio.create_task(_do_broadcast(payload, call_sid))
+    except Exception as e:
+        Log.error(f"[Broadcast] Failed to create broadcast task: {e}")
 
 
 app = FastAPI()
@@ -458,6 +474,7 @@ async def handle_media_stream(websocket: WebSocket):
                 
                 # Send to dashboard using nonblocking broadcast
                 if current_call_sid:
+                    Log.debug(f"[Dashboard] 📤 Broadcasting AI audio chunk")
                     payload = {
                         "messageType": "audio",
                         "speaker": "AI",
@@ -537,8 +554,12 @@ async def handle_media_stream(websocket: WebSocket):
                 media = data.get("media") or {}
                 payload_b64 = media.get("payload")
                 if payload_b64:
-                    # ✅ Check if caller audio is silence
-                    should_send_to_dashboard = caller_silence_detector.should_transmit(payload_b64, "Caller")
+                    # 🔥 TEMPORARY DEBUG: Send ALL audio, ignore silence detection
+                    should_send_to_dashboard = True  # FORCE TRUE FOR TESTING
+                    # Original: should_send_to_dashboard = caller_silence_detector.should_transmit(payload_b64, "Caller")
+                    
+                    if not should_send_to_dashboard:
+                        Log.debug(f"[Debug] Silence detector blocked audio")
                     
                     # ✅ During takeover: route caller audio to human agent
                     if openai_service.is_human_in_control():
@@ -557,6 +578,7 @@ async def handle_media_stream(websocket: WebSocket):
                         
                         # Stream to dashboard ONLY if not silence
                         if should_send_to_dashboard:
+                            Log.debug(f"[Dashboard] 📤 Broadcasting Caller audio chunk")
                             broadcast_to_dashboards_nonblocking({
                                 "messageType": "audio",
                                 "speaker": "Caller",
@@ -564,6 +586,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 "timestamp": int(time.time() * 1000),
                                 "callSid": current_call_sid
                             }, current_call_sid)
+                        else:
+                            Log.debug(f"[Dashboard] 🔇 Caller audio filtered (silence)")
                     else:
                         # Normal mode: send to OpenAI (always)
                         if connection_manager.is_openai_connected():
@@ -576,6 +600,7 @@ async def handle_media_stream(websocket: WebSocket):
                         
                         # Stream caller audio to dashboard ONLY if not silence
                         if should_send_to_dashboard:
+                            Log.debug(f"[Dashboard] 📤 Broadcasting Caller audio chunk (normal mode)")
                             broadcast_to_dashboards_nonblocking({
                                 "messageType": "audio",
                                 "speaker": "Caller",
@@ -583,6 +608,8 @@ async def handle_media_stream(websocket: WebSocket):
                                 "timestamp": int(time.time() * 1000),
                                 "callSid": current_call_sid
                             }, current_call_sid)
+                        else:
+                            Log.debug(f"[Dashboard] 🔇 Caller audio filtered (silence, normal mode)")
 
         async def handle_audio_delta(response: dict):
             """Handle audio response from OpenAI."""
@@ -596,8 +623,9 @@ async def handle_media_stream(websocket: WebSocket):
                 delta = audio_data.get("delta")
                 
                 if delta:
-                    # ✅ Check if AI audio is silence
-                    should_send_to_dashboard = ai_silence_detector.should_transmit(delta, "AI")
+                    # 🔥 TEMPORARY DEBUG: Send ALL AI audio, ignore silence detection
+                    should_send_to_dashboard = True  # FORCE TRUE FOR TESTING
+                    # Original: should_send_to_dashboard = ai_silence_detector.should_transmit(delta, "AI")
                     
                     # Send to Twilio for phone call
                     if getattr(connection_manager.state, "stream_sid", None):
